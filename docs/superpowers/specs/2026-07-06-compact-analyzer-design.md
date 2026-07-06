@@ -100,7 +100,7 @@ The analyzer targets the latest language version (0.23 at time of writing; compi
 
 ## 7. VS Code extension and distribution
 
-- **Extension:** `vscode-languageclient` over stdio. Server acquisition order: user-configured path → PATH → download the platform binary for the extension's pinned server version from GitHub Releases (checksum-verified) into extension storage. Extension and server release in lockstep; mismatched major versions are refused.
+- **Extension:** `vscode-languageclient` over stdio. Server acquisition order: user-configured path → PATH → download the platform binary for the extension's pinned server version from GitHub Releases (checksum-verified) into extension storage. Extension and server release in lockstep; the extension refuses server versions outside its pinned compatible range (for 0.x releases, the minor version must match).
 - TextMate grammar, language-configuration, and snippets ship in the extension so highlighting works before/without the server (adapted from the official extension's Apache-2.0 assets, with attribution), progressively superseded by semantic tokens.
 - Published to VS Code Marketplace and Open VSX.
 - **Server distribution:** cargo-dist on GitHub Releases (macOS arm64/x64, Linux x64, Windows x64), shell/PowerShell installers, Homebrew tap — the same pipeline compactp uses. Workspace crates stay unpublished on crates.io until there is a concrete reason; the binary is the product.

@@ -36,10 +36,15 @@ impl LineIndex {
         Self { text, line_starts }
     }
 
-    /// Converts a byte offset into 0-based line + UTF-16 column, clamping
-    /// out-of-range offsets to the end of the text.
+    /// Converts a byte offset into 0-based line + UTF-16 column. Offsets
+    /// past the end of the text clamp to the end; offsets landing inside a
+    /// multi-byte character clamp down to the nearest char boundary.
     pub fn line_col(&self, offset: TextSize) -> LineCol {
-        let offset = u32::from(offset).min(self.text.len() as u32);
+        let mut offset = u32::from(offset).min(self.text.len() as u32) as usize;
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let offset = offset as u32;
         let line = self.line_starts.partition_point(|&start| start <= offset) - 1;
         let line_start = self.line_starts[line];
         let col = self.text[line_start as usize..offset as usize]
@@ -85,7 +90,6 @@ impl LineIndex {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use text_size::TextSize;
 
     fn index(text: &str) -> LineIndex {
         LineIndex::new(Arc::from(text))
@@ -150,5 +154,14 @@ mod tests {
         );
         // line past the last line is None
         assert_eq!(li.offset(LineCol { line: 9, col: 0 }), None);
+    }
+
+    #[test]
+    fn mid_character_offset_clamps_to_char_boundary() {
+        let li = index("\u{1F600}x");
+        // offset 2 is inside the emoji (bytes 0..4): clamps down to boundary 0
+        assert_eq!(li.line_col(TextSize::new(2)), LineCol { line: 0, col: 0 });
+        // offset 4 is the boundary after the emoji: 2 UTF-16 units
+        assert_eq!(li.line_col(TextSize::new(4)), LineCol { line: 0, col: 2 });
     }
 }

@@ -1,4 +1,5 @@
 mod lsp_utils;
+mod server;
 
 fn main() -> anyhow::Result<()> {
     if std::env::args().any(|arg| arg == "--version") {
@@ -6,8 +7,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     eprintln!(
-        "compact-analyzer {}: LSP server not implemented yet",
+        "compact-analyzer {}: starting LSP server on stdio",
         env!("CARGO_PKG_VERSION")
     );
-    Ok(())
+    server::run()
 }

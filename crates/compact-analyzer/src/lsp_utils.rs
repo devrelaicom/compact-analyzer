@@ -2,9 +2,6 @@
 //! UTF-16 protocol types. This module is the ONLY place lsp_types and
 //! analyzer_core types meet.
 
-// Consumed by the server module in the next task.
-#![allow(dead_code)]
-
 use analyzer_core::{Diagnostic, LineIndex, Severity, TextRange};
 use lsp_types::{
     DiagnosticRelatedInformation, DiagnosticSeverity, Location, NumberOrString, Position, Range,

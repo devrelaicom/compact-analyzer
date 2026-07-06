@@ -4,7 +4,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -93,8 +93,28 @@ impl Client {
     fn shutdown(mut self) {
         self.request("shutdown", Value::Null);
         self.notify("exit", Value::Null);
-        let status = self.child.wait().expect("server did not exit");
+        let status = self.wait_with_timeout(Duration::from_secs(10));
         assert!(status.success(), "server exited with failure: {status:?}");
+    }
+
+    /// Waits for the child to exit, killing it and failing the test if it
+    /// does not exit within `timeout` (prevents CI hangs on shutdown bugs).
+    fn wait_with_timeout(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .expect("failed to poll server process")
+            {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                panic!("server did not exit within {timeout:?} after shutdown/exit");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 

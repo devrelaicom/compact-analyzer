@@ -213,6 +213,9 @@ impl GlobalState {
         };
         self.host.vfs_mut().remove_overlay(file);
         self.pending_diagnostics.remove(&file);
+        if self.pending_diagnostics.is_empty() {
+            self.debounce_deadline = None;
+        }
         // Clear this document's diagnostics in the editor.
         self.publish(PublishDiagnosticsParams {
             uri: params.text_document.uri,
@@ -226,7 +229,23 @@ impl GlobalState {
         self.debounce_deadline = Some(Instant::now() + DEBOUNCE);
     }
 
+    /// Never-die wrapper around diagnostics publication: parsing and
+    /// position conversion run on arbitrary user text — a panic here must
+    /// not kill the server. The inner function clears the debounce deadline
+    /// first thing, so a panicking flush cannot spin the main loop.
     fn flush_pending_diagnostics(&mut self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.flush_pending_diagnostics_inner()
+        }));
+        if let Err(panic) = result {
+            eprintln!(
+                "compact-analyzer: panic while publishing diagnostics: {}",
+                panic_message(panic.as_ref())
+            );
+        }
+    }
+
+    fn flush_pending_diagnostics_inner(&mut self) {
         self.debounce_deadline = None;
         let files: Vec<FileId> = self.pending_diagnostics.drain().collect();
         for file in files {

@@ -70,10 +70,7 @@ pub(crate) fn diagnostic_to_lsp(
     lsp_types::Diagnostic {
         range: range_to_lsp(li, d.primary_span),
         severity: Some(severity),
-        code: Some(NumberOrString::String(format!(
-            "{}{}",
-            d.code.prefix, d.code.number
-        ))),
+        code: Some(NumberOrString::String(d.code.to_string())),
         source: Some("compact-analyzer".to_string()),
         message,
         related_information,
@@ -128,7 +125,7 @@ mod tests {
         assert_eq!(lsp.source.as_deref(), Some("compact-analyzer"));
         assert_eq!(
             lsp.code,
-            Some(lsp_types::NumberOrString::String("E1".to_string()))
+            Some(lsp_types::NumberOrString::String("E0001".to_string()))
         );
         assert_eq!(lsp.range.start, Position::new(0, 12));
         assert_eq!(

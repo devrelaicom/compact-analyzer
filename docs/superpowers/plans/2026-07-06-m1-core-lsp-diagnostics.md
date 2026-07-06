@@ -1042,7 +1042,7 @@ pub(crate) fn diagnostic_to_lsp(d: &Diagnostic, li: &LineIndex, uri: &Url) -> ls
 Run: `cargo test -p compact-analyzer`
 Expected: PASS — 5 tests
 
-Note: `accepts_file_uris` uses a Unix-style path; on Windows `to_file_path` yields `\tmp\x.compact` from that URI. If the Windows CI job fails on this assertion, gate that one test with `#[cfg(unix)]` and add a `#[cfg(windows)]` twin using `file:///C:/tmp/x.compact` → `C:\tmp\x.compact`.
+Note: `accepts_file_uris` uses a Unix-style path; on Windows `to_file_path` returns `Err` for a host-less `file:///tmp/...` URI (first segment is not a drive letter), so the test is gated `#[cfg(unix)]` with a `#[cfg(windows)]` twin using `file:///C:/tmp/x.compact` → `C:\tmp\x.compact` (applied at final review — see Errata).
 
 - [ ] **Step 5: Lint and commit**
 
@@ -1761,6 +1761,8 @@ git commit -m "docs: add license, README with build and Neovim attach instructio
 - **Task 6 reference `run()` had a shutdown deadlock** (caught by the clean-exit integration test): `io_threads.join()` blocks forever because `GlobalState`'s and `Connection`'s `Sender<Message>` clones outlive the main loop, so the writer thread never observes channel closure. Fixed in commit `bcff50e` with explicit `drop(state); drop(connection);` before `io_threads.join()`.
 
 - **Task 6 reference loop left diagnostics publication outside the never-die guard** (caught by task review): `flush_pending_diagnostics` — which runs the panic-prone parse/convert path — was called directly from the main loop's debounce branches, outside the `catch_unwind` in `dispatch`. Fixed in commit `60ae5fa`: the flush is now wrapped in its own `catch_unwind` (the inner function clears the debounce deadline first, so a panicking flush cannot spin the loop). Same commit: `did_close` clears a stale debounce deadline when no files remain pending, and the integration-test harness's shutdown wait is bounded (10 s, then kill + fail) instead of unbounded.
+
+- **Final whole-branch review fixes:** the Unix-path URI test was cfg-gated for Windows (the plan's original note incorrectly claimed Windows converts `file:///tmp/...` successfully — it errors); the diagnostics flush now guards each file individually so one file's panic cannot drop other files' pending diagnostics; `did_change` rejects incremental changes loudly; CI cargo invocations use `--locked`; README gained a trailing newline.
 
 ## Self-review notes (completed during planning)
 

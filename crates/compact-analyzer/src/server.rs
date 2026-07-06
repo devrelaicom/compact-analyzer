@@ -201,6 +201,12 @@ impl GlobalState {
         let Some(change) = params.content_changes.into_iter().next_back() else {
             return;
         };
+        if change.range.is_some() {
+            eprintln!(
+                "compact-analyzer: ignoring incremental didChange (server advertises full sync)"
+            );
+            return;
+        }
         self.host
             .vfs_mut()
             .set_overlay(file, change.text, params.text_document.version);
@@ -249,29 +255,41 @@ impl GlobalState {
         self.debounce_deadline = None;
         let files: Vec<FileId> = self.pending_diagnostics.drain().collect();
         for file in files {
-            let Some(uri) = self
-                .open_files
-                .iter()
-                .find(|&(_, &f)| f == file)
-                .map(|(uri, _)| uri.clone())
-            else {
-                continue; // closed before the debounce fired
-            };
-            let Some(analysis) = self.host.analyze(file) else {
-                continue;
-            };
-            let version = self.host.vfs().overlay_version(file);
-            let diagnostics = analysis
-                .diagnostics
-                .iter()
-                .map(|d| lsp_utils::diagnostic_to_lsp(d, &analysis.line_index, &uri))
-                .collect();
-            self.publish(PublishDiagnosticsParams {
-                uri,
-                diagnostics,
-                version,
-            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.publish_file_diagnostics(file)
+            }));
+            if let Err(panic) = result {
+                eprintln!(
+                    "compact-analyzer: panic while publishing diagnostics for one file: {}",
+                    panic_message(panic.as_ref())
+                );
+            }
         }
+    }
+
+    fn publish_file_diagnostics(&mut self, file: FileId) {
+        let Some(uri) = self
+            .open_files
+            .iter()
+            .find(|&(_, &f)| f == file)
+            .map(|(uri, _)| uri.clone())
+        else {
+            return; // closed before the debounce fired
+        };
+        let Some(analysis) = self.host.analyze(file) else {
+            return;
+        };
+        let version = self.host.vfs().overlay_version(file);
+        let diagnostics = analysis
+            .diagnostics
+            .iter()
+            .map(|d| lsp_utils::diagnostic_to_lsp(d, &analysis.line_index, &uri))
+            .collect();
+        self.publish(PublishDiagnosticsParams {
+            uri,
+            diagnostics,
+            version,
+        });
     }
 
     fn publish(&self, params: PublishDiagnosticsParams) {

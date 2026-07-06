@@ -88,12 +88,23 @@ mod tests {
         assert!(abs_path_from_uri(&uri).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn accepts_file_uris() {
         let uri = lsp_types::Url::parse("file:///tmp/x.compact").unwrap();
         assert_eq!(
             abs_path_from_uri(&uri),
             Some(std::path::PathBuf::from("/tmp/x.compact"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_file_uris() {
+        let uri = lsp_types::Url::parse("file:///C:/tmp/x.compact").unwrap();
+        assert_eq!(
+            abs_path_from_uri(&uri),
+            Some(std::path::PathBuf::from(r"C:\tmp\x.compact"))
         );
     }
 

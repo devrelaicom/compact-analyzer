@@ -1752,6 +1752,10 @@ git commit -m "docs: add license, README with build and Neovim attach instructio
 
 ---
 
+## Errata (discovered during execution)
+
+- **Task 3 reference implementation had a panic bug** (caught by task review): `line_col` sliced `self.text[line_start..offset]` without checking that `offset` lies on a UTF-8 char boundary — an in-range offset inside a multi-byte character panicked, violating the never-die contract. Fixed in commit `699a4b2`: the offset now clamps down to the nearest char boundary (`while !self.text.is_char_boundary(offset) { offset -= 1; }`), with a covering test `mid_character_offset_clamps_to_char_boundary`. Test counts from Task 3 onward are +1 versus the figures printed in the task steps (analyzer-core has 10 tests after Task 3, not 9).
+
 ## Self-review notes (completed during planning)
 
 - **Spec coverage (M1 slice):** VFS overlay (§3.2) → Task 2; UTF-16 line index (§3.2, binary-only conversion §3.4-layering) → Tasks 3/5; memoized parse cache (§2 Approach A) → Task 4; lsp-server stack, debounce, never-die catch_unwind, stale-version fields (§3.2/§5) → Task 6; black-box LSP tests incl. multibyte fixtures (§8) → Task 6. Deliberately deferred per milestone map: item index/name resolution (M2), all navigation/completion features (M2/M3), toolchain (M4), extension/distribution (M5), corpus smoke (M2, when the corpus-consuming features exist), file watching (later milestone, documented in Task 2's module docs).

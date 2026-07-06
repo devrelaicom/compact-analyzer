@@ -1,3 +1,5 @@
+mod lsp_utils;
+
 fn main() -> anyhow::Result<()> {
     if std::env::args().any(|arg| arg == "--version") {
         println!("compact-analyzer {}", env!("CARGO_PKG_VERSION"));

@@ -29,7 +29,7 @@ This is Plan 1 of 5 for the approved spec (`docs/superpowers/specs/2026-07-06-co
 - `analyzer-core` speaks byte offsets (`text_size::TextSize`/`TextRange`) and has zero `lsp-types` knowledge. UTF-16 conversion happens only in the binary.
 - LSP `Position.character` is in UTF-16 code units (verified fixtures below encode this).
 - Diagnostics debounce: **150 ms**. Diagnostics `source` field: `"compact-analyzer"`.
-- compactp API facts (verified against the 0.1.0-beta.1 public-api baselines and local source): `compactp_parser::parse(&str) -> ParseResult`; `ParseResult { green: rowan::GreenNode, errors: Vec<compactp_diagnostics::Diagnostic> }` (public fields, no methods, no Clone); `Diagnostic { severity: Severity, code: DiagnosticCode, message: String, primary_span: TextRange, secondary_spans: Vec<LabeledSpan>, notes: Vec<String> }`; `Severity::{Error, Warning, Note}`; `DiagnosticCode` implements `Display` (renders e.g. `E1`); build a syntax tree with `compactp_syntax::SyntaxNode::new_root(green)`. `SyntaxNode` is `!Send` — store `GreenNode` (Send+Sync), never `SyntaxNode`.
+- compactp API facts (verified against the 0.1.0-beta.1 public-api baselines and local source): `compactp_parser::parse(&str) -> ParseResult`; `ParseResult { green: rowan::GreenNode, errors: Vec<compactp_diagnostics::Diagnostic> }` (public fields, no methods, no Clone); `Diagnostic { severity: Severity, code: DiagnosticCode, message: String, primary_span: TextRange, secondary_spans: Vec<LabeledSpan>, notes: Vec<String> }`; `Severity::{Error, Warning, Note}`; `DiagnosticCode` implements `Display` (renders zero-padded, e.g. `E0001` — verified in compactp source: `write!(f, "{}{:04}", prefix, number)`); build a syntax tree with `compactp_syntax::SyntaxNode::new_root(green)`. `SyntaxNode` is `!Send` — store `GreenNode` (Send+Sync), never `SyntaxNode`.
 - Verified parser fixtures (ground truth from compactp 0.1.0-beta.1, do not "fix" the tests to different values):
   - `ledger count: Field;` → 0 diagnostics
   - `ledger count Field;` → 1 error `expected COLON` (E1), zero-width span at offset 12..12
@@ -915,7 +915,7 @@ mod tests {
         assert_eq!(lsp.source.as_deref(), Some("compact-analyzer"));
         assert_eq!(
             lsp.code,
-            Some(lsp_types::NumberOrString::String("E1".to_string()))
+            Some(lsp_types::NumberOrString::String("E0001".to_string()))
         );
         assert_eq!(lsp.range.start, Position::new(0, 12));
         assert_eq!(
@@ -1227,7 +1227,7 @@ fn publishes_diagnostics_then_clears_after_fix() {
     assert_eq!(diags[0]["message"], "expected COLON");
     assert_eq!(diags[0]["source"], "compact-analyzer");
     assert_eq!(diags[0]["severity"], 1); // Error
-    assert_eq!(diags[0]["code"], "E1");
+    assert_eq!(diags[0]["code"], "E0001");
     assert_eq!(diags[0]["range"]["start"], json!({"line": 0, "character": 12}));
 
     client.notify(
@@ -1753,6 +1753,8 @@ git commit -m "docs: add license, README with build and Neovim attach instructio
 ---
 
 ## Errata (discovered during execution)
+
+- **Diagnostic code strings are zero-padded** (caught during Task 5): `DiagnosticCode::Display` renders `E0001`, not `E1` as originally planned (verified in compactp source). The LSP `code` field uses `d.code.to_string()` — canonical upstream rendering — and the `"E1"` test expectations in Tasks 5/6 were corrected to `"E0001"`.
 
 - **Task 3 reference implementation had a panic bug** (caught by task review): `line_col` sliced `self.text[line_start..offset]` without checking that `offset` lies on a UTF-8 char boundary — an in-range offset inside a multi-byte character panicked, violating the never-die contract. Fixed in commit `699a4b2`: the offset now clamps down to the nearest char boundary (`while !self.text.is_char_boundary(offset) { offset -= 1; }`), with a covering test `mid_character_offset_clamps_to_char_boundary`. Test counts from Task 3 onward are +1 versus the figures printed in the task steps (analyzer-core has 10 tests after Task 3, not 9).
 

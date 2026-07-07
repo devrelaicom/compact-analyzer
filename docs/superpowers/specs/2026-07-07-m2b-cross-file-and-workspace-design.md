@@ -101,11 +101,13 @@ cycles are detected along the active include path only; duplicate includes are
 not deduplicated. `SourceFile::includes()` / `Include::path()` (a `STRING_LIT`)
 are the AST touchpoints.
 
-Note an asymmetry to resolve at plan time: verified include paths carry the
-`.compact` extension (`include "std/lib.compact";`) whereas imports omit it. The
-exact include-path mechanics — extension handling, the relative base, and the
-order-dependent visibility of a textual splice — are **plan-time verification
-items** (§8), not assumptions.
+**Verified empirically** (compiler `--trace-search`, 2026-07-07): `.compact` is
+appended to include paths exactly as it is to imports — the extension is omitted
+in source (`include "inc";` resolves `inc.compact`; `include "inc.compact";`
+wrongly resolves `inc.compact.compact` and fails). There is no
+import/include extension asymmetry; the earlier concern was a misread of a
+compactp *parser* test fixture. Unlike imports, an included file splices raw
+top-level content and carries **no** single-module requirement.
 
 ## 4. Features
 
@@ -187,20 +189,30 @@ only observed after the operation has already decided to stop.
 
 Precedent: the M1 plan carried 5 real bugs and the M2a plan 3, all caught only by
 empirical checks. Every fixture and API fact in the plan must be pre-verified.
-Specific items:
+The following were **discharged during planning (2026-07-07)** and are recorded
+here for provenance; their verified forms live in the plan's Global Constraints:
 
-- Exact `include` resolution mechanics: extension handling (include paths carry
-  `.compact`, imports do not), the relative base, and textual-splice visibility
-  ordering — verified against the compiler, not assumed.
-- Re-confirm the `find-source-pathname` search order and the
-  "exactly one `module Foo`" rule against the `../compactp` / compiler source
-  before relying on them.
-- The precise compactp AST accessors for every new touchpoint (`Include::path`,
-  import specifier original-vs-alias, any node the dependency builder reads).
-- That the `ignore` crate is acceptable as a new workspace dependency (widely
-  used, MIT/Apache dual-licensed, builds under `--locked` on all three CI OSes).
-- Whether `didChangeWatchedFiles` dynamic registration requires a specific client
-  capability check, and the exact registration payload.
+- `find-source-pathname` behavior — verified with the real compiler via
+  `--trace-search`: `.compact` is always appended (imports, string-path imports,
+  and includes alike); search order is the importing/including file's directory
+  first, then each `--compact-path` (default `COMPACT_PATH`) entry left-to-right;
+  each file's imports resolve relative to *that* file's directory; identifier
+  `import Foo;` requires the target to contain exactly one `module Foo`
+  (`X.compact defines module Y rather than expected module X` /
+  `does not contain a (single) module defintion`); string-path imports derive the
+  expected module name from the last path component; includes splice raw
+  top-level content with no module requirement.
+- compactp AST accessors confirmed against `../compactp` @ `0.1.0-beta.1`:
+  `SourceFile::imports()/includes()`, `Import::{name,path,prefix,generic_args}`,
+  `ImportSpecifier::name`, `PrefixDecl::name`, `Include::path`.
+- `ignore` crate resolves to `v0.4.27` and will be added to `analyzer-core`.
+- lsp-types `0.95.1` carries every needed type (`DidChangeWatchedFilesParams`,
+  `FileSystemWatcher`, `Registration`/`RegistrationParams`,
+  `DidChangeWatchedFilesRegistrationOptions`, `WorkspaceSymbolParams`,
+  `SymbolInformation`/`WorkspaceSymbol`, `GlobPattern`, `FileChangeType`).
+
+Any further fixture or API fact introduced by the plan is still verified at
+implementation time per the per-task NOTES, as in M1/M2a.
 
 ## 9. Testing
 

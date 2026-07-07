@@ -2,7 +2,7 @@
 mod support;
 
 use serde_json::json;
-use support::{Client, did_open};
+use support::{Client, did_open, lsp_position};
 
 #[test]
 fn workspace_symbol_finds_indexed_declarations() {
@@ -90,5 +90,37 @@ fn unresolved_import_publishes_an_error_diagnostic() {
             .contains("cannot resolve import")),
         "expected an unresolved-import diagnostic in {diags:?}"
     );
+    client.shutdown();
+}
+
+#[test]
+fn references_are_workspace_wide_over_lsp() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Foo.compact"),
+        "module Foo { export circuit ff(): Field { return 0; } }",
+    )
+    .unwrap();
+    let main = dir.path().join("main.compact");
+    let main_text = "import Foo;\ncircuit m(): Field { return ff() + ff(); }";
+    std::fs::write(&main, main_text).unwrap();
+    let root = lsp_types::Url::from_file_path(dir.path()).unwrap();
+
+    let mut client = Client::start();
+    client.initialize_root(&root, json!({}));
+    let uri = lsp_types::Url::from_file_path(&main).unwrap();
+    did_open(&mut client, &uri, 1, main_text);
+
+    let (line, col) = lsp_position(main_text, "ff");
+    let resp = client.request(
+        "textDocument/references",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": col },
+            "context": { "includeDeclaration": true }
+        }),
+    );
+    let locs = resp["result"].as_array().expect("array result");
+    assert_eq!(locs.len(), 3); // declaration in Foo + two uses in main
     client.shutdown();
 }

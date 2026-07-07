@@ -214,6 +214,8 @@ impl GlobalState {
                 self.respond_ok(req.id, result);
             }
             "textDocument/references" => {
+                let recv = self.cancel_receiver.clone();
+                let should_continue = || recv.is_empty();
                 let result = serde_json::from_value::<lsp_types::ReferenceParams>(req.params)
                     .ok()
                     .and_then(|params| {
@@ -222,7 +224,12 @@ impl GlobalState {
                             &params.text_document_position.text_document.uri,
                             params.text_document_position.position,
                         )?;
-                        analyzer_ide::find_references(&mut self.host, pos, include_decl)
+                        analyzer_ide::find_references_cancellable(
+                            &mut self.host,
+                            pos,
+                            include_decl,
+                            &should_continue,
+                        )
                     })
                     .map(|targets| {
                         targets
@@ -287,7 +294,14 @@ impl GlobalState {
                     self.respond_ok(req.id, Option::<lsp_types::WorkspaceEdit>::None);
                     return;
                 };
-                match analyzer_ide::rename(&mut self.host, pos, &params.new_name) {
+                let recv = self.cancel_receiver.clone();
+                let should_continue = || recv.is_empty();
+                match analyzer_ide::rename_cancellable(
+                    &mut self.host,
+                    pos,
+                    &params.new_name,
+                    &should_continue,
+                ) {
                     Ok(edits) => {
                         let mut changes: HashMap<Url, Vec<lsp_types::TextEdit>> = HashMap::new();
                         for edit in edits {

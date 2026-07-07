@@ -29,6 +29,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
     let (initialize_id, _initialize_params) = connection.initialize_start()?;
     let capabilities = ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        definition_provider: Some(lsp_types::OneOf::Left(true)),
         ..Default::default()
     };
     let initialize_result = serde_json::json!({
@@ -42,6 +43,19 @@ pub(crate) fn run() -> anyhow::Result<()> {
     eprintln!("compact-analyzer: initialized");
 
     let mut state = GlobalState::new(connection.sender.clone());
+    let stdlib_dir = std::env::temp_dir().join(format!(
+        "compact-analyzer-stdlib-{}",
+        env!("CARGO_PKG_VERSION")
+    ));
+    match analyzer_core::stdlib::materialize(&stdlib_dir) {
+        Ok(path) => {
+            state.host.register_stdlib(&path);
+            eprintln!("compact-analyzer: stdlib stub at {}", path.display());
+        }
+        Err(err) => {
+            eprintln!("compact-analyzer: stdlib unavailable ({err}); continuing without it")
+        }
+    }
 
     loop {
         // When diagnostics are pending, wait only until the debounce
@@ -141,13 +155,48 @@ impl GlobalState {
     }
 
     fn handle_request(&mut self, req: Request) {
-        // shutdown is intercepted in the main loop; nothing else is
-        // supported in M1.
-        self.respond(Response::new_err(
-            req.id,
-            METHOD_NOT_FOUND,
-            format!("method not supported: {}", req.method),
-        ));
+        match req.method.as_str() {
+            "textDocument/definition" => {
+                let result = serde_json::from_value::<lsp_types::GotoDefinitionParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let doc = params.text_document_position_params;
+                        self.position_to_file_position(&doc.text_document.uri, doc.position)
+                    })
+                    .and_then(|pos| analyzer_ide::goto_definition(&mut self.host, pos))
+                    .and_then(|target| lsp_utils::nav_target_to_location(&mut self.host, &target));
+                self.respond_ok(req.id, result);
+            }
+            _ => self.respond(Response::new_err(
+                req.id,
+                METHOD_NOT_FOUND,
+                format!("method not supported: {}", req.method),
+            )),
+        }
+    }
+
+    /// (uri, Position) → FilePosition for an OPEN document. Unknown or
+    /// unopened documents return None (the request answers null).
+    fn position_to_file_position(
+        &mut self,
+        uri: &Url,
+        position: lsp_types::Position,
+    ) -> Option<analyzer_core::FilePosition> {
+        let file = *self.open_files.get(uri)?;
+        let analysis = self.host.analyze(file)?;
+        let offset = lsp_utils::offset_from_position(&analysis.line_index, position)?;
+        Some(analyzer_core::FilePosition { file, offset })
+    }
+
+    fn respond_ok<T: serde::Serialize>(&self, id: lsp_server::RequestId, result: T) {
+        match serde_json::to_value(result) {
+            Ok(value) => self.respond(Response::new_ok(id, value)),
+            Err(err) => self.respond(Response::new_err(
+                id,
+                INTERNAL_ERROR,
+                format!("failed to serialize response: {err}"),
+            )),
+        }
     }
 
     fn handle_notification(&mut self, not: Notification) {

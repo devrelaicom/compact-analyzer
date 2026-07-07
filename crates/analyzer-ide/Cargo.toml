@@ -1,0 +1,17 @@
+[package]
+name = "analyzer-ide"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+analyzer-core.workspace = true
+compactp_syntax.workspace = true
+rowan.workspace = true
+text-size.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

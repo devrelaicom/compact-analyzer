@@ -27,6 +27,28 @@ pub(crate) fn range_to_lsp(li: &LineIndex, range: TextRange) -> Range {
     )
 }
 
+pub(crate) fn offset_from_position(
+    li: &analyzer_core::LineIndex,
+    pos: Position,
+) -> Option<analyzer_core::TextSize> {
+    li.offset(analyzer_core::LineCol {
+        line: pos.line,
+        col: pos.character,
+    })
+}
+
+pub(crate) fn nav_target_to_location(
+    host: &mut analyzer_core::AnalysisHost,
+    target: &analyzer_ide::NavTarget,
+) -> Option<Location> {
+    let uri = Url::from_file_path(host.vfs().path(target.file)).ok()?;
+    let analysis = host.analyze(target.file)?;
+    Some(Location {
+        uri,
+        range: range_to_lsp(&analysis.line_index, target.name_range),
+    })
+}
+
 pub(crate) fn diagnostic_to_lsp(
     d: &Diagnostic,
     li: &LineIndex,

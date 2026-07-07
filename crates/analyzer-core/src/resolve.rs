@@ -3,7 +3,10 @@
 //! verified against compactp), then resolved through lexical scopes
 //! (this task) and file scope / imports (Task 4).
 
+use std::path::{Path, PathBuf};
+
 use compactp_ast::{AstNode, Pat};
+use compactp_diagnostics::{Diagnostic, DiagnosticCode};
 use compactp_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::TokenAtOffset;
 use text_size::{TextRange, TextSize};
@@ -483,17 +486,157 @@ impl crate::AnalysisHost {
             index: index as u32,
         })
     }
+
+    /// Error diagnostics for imports/includes in `file` that fail resolution.
+    /// A cross-file derived fact — recomputed on demand, not cached with the
+    /// per-file parse.
+    pub fn resolution_diagnostics(&mut self, file: FileId) -> Vec<Diagnostic> {
+        let Some(analysis) = self.analyze(file) else {
+            return Vec::new();
+        };
+        let tree = analysis.item_tree.clone();
+        let root = SyntaxNode::new_root(analysis.green.clone());
+        let Some(sf) = compactp_ast::SourceFile::cast(root) else {
+            return Vec::new();
+        };
+        let Some(from_dir) = self.vfs().path(file).parent().map(Path::to_path_buf) else {
+            return Vec::new();
+        };
+        let search = self.import_search_path();
+        let mut diags = Vec::new();
+        for import in sf.imports() {
+            if let Some(name) = import.name() {
+                let nm = name.text().to_string();
+                if nm == "CompactStandardLibrary" {
+                    continue;
+                }
+                if tree
+                    .top_level()
+                    .any(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == nm)
+                {
+                    continue; // satisfied by an in-scope module
+                }
+                match crate::find_source_pathname(&from_dir, &search, &nm) {
+                    None => diags.push(unresolved_import_diag(
+                        &nm,
+                        &from_dir,
+                        &search,
+                        name.text_range(),
+                    )),
+                    Some(path) => {
+                        let target = self.vfs_mut().file_id(&path);
+                        if let Some(d) = self.module_mismatch_diag(target, &nm, name.text_range()) {
+                            diags.push(d);
+                        }
+                    }
+                }
+            } else if let Some(ptok) = import.path() {
+                let raw = crate::string_lit_text(ptok.text());
+                let span = ptok.text_range();
+                let Some(expected) = crate::path_module_name(&raw) else {
+                    continue;
+                };
+                match crate::find_source_pathname(&from_dir, &search, &raw) {
+                    None => diags.push(unresolved_import_diag(&raw, &from_dir, &search, span)),
+                    Some(path) => {
+                        let target = self.vfs_mut().file_id(&path);
+                        if let Some(d) = self.module_mismatch_diag(target, &expected, span) {
+                            diags.push(d);
+                        }
+                    }
+                }
+            }
+        }
+        for inc in sf.includes() {
+            if let Some(tok) = inc.path() {
+                let raw = crate::string_lit_text(tok.text());
+                if crate::find_source_pathname(&from_dir, &search, &raw).is_none() {
+                    diags.push(unresolved_include_diag(
+                        &raw,
+                        &from_dir,
+                        &search,
+                        tok.text_range(),
+                    ));
+                }
+            }
+        }
+        diags
+    }
+
+    /// Error iff `target`'s single module does not match `expected`.
+    fn module_mismatch_diag(
+        &mut self,
+        target: FileId,
+        expected: &str,
+        span: TextRange,
+    ) -> Option<Diagnostic> {
+        let tree = self.analyze(target)?.item_tree.clone();
+        match single_top_level_module(&tree) {
+            None => Some(Diagnostic::error(
+                DiagnosticCode::new("E", 9003),
+                format!("imported file does not contain a single `module {expected}`"),
+                span,
+            )),
+            Some((_, sym)) if sym.name != expected => Some(Diagnostic::error(
+                DiagnosticCode::new("E", 9002),
+                format!(
+                    "imported file defines module `{}` rather than expected `{expected}`",
+                    sym.name
+                ),
+                span,
+            )),
+            Some(_) => None,
+        }
+    }
 }
 
 /// The sole top-level symbol iff it is exactly one and a module. Mirrors the
 /// compiler's "must contain a (single) module definition" rule.
-fn single_top_level_module(tree: &crate::ItemTree) -> Option<(u32, &crate::Symbol)> {
+pub(crate) fn single_top_level_module(tree: &crate::ItemTree) -> Option<(u32, &crate::Symbol)> {
     let mut tops = tree.top_level();
     let first = tops.next()?;
     if tops.next().is_some() {
         return None; // more than one top-level declaration
     }
     (first.1.kind == crate::SymbolKind::Module).then_some(first)
+}
+
+fn searched_list(from_dir: &Path, search: &[PathBuf]) -> String {
+    let mut parts = vec![from_dir.display().to_string()];
+    parts.extend(search.iter().map(|p| p.display().to_string()));
+    parts.join(", ")
+}
+
+fn unresolved_import_diag(
+    raw: &str,
+    from_dir: &Path,
+    search: &[PathBuf],
+    span: TextRange,
+) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticCode::new("E", 9001),
+        format!(
+            "cannot resolve import `{raw}` (searched: {})",
+            searched_list(from_dir, search)
+        ),
+        span,
+    )
+}
+
+fn unresolved_include_diag(
+    raw: &str,
+    from_dir: &Path,
+    search: &[PathBuf],
+    span: TextRange,
+) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticCode::new("E", 9004),
+        format!(
+            "cannot resolve include `{raw}` (searched: {})",
+            searched_list(from_dir, search)
+        ),
+        span,
+    )
 }
 
 /// Index of the module symbol whose range contains `offset`, if any.
@@ -1279,5 +1422,90 @@ mod tests {
         );
         // Must terminate (no hang, no panic) and resolve to None.
         assert!(host.resolve(pos).is_none());
+    }
+
+    // ---- Task 6: unresolvable-import/include diagnostics ----
+
+    fn diag_host(
+        files: &[(&str, &str)],
+        open_rel: &str,
+    ) -> (crate::AnalysisHost, tempfile::TempDir, FileId) {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, contents) in files {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, contents).unwrap();
+        }
+        let mut host = crate::AnalysisHost::new();
+        let file = host.vfs_mut().file_id(&dir.path().join(open_rel));
+        (host, dir, file)
+    }
+
+    #[test]
+    fn unresolved_import_is_an_error() {
+        let (mut host, _dir, file) = diag_host(
+            &[(
+                "main.compact",
+                "import Missing;\ncircuit m(): Field { return 0; }",
+            )],
+            "main.compact",
+        );
+        let diags = host.resolution_diagnostics(file);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, crate::Severity::Error);
+        assert!(diags[0].message.contains("cannot resolve import"));
+        assert!(diags[0].message.contains("Missing"));
+    }
+
+    #[test]
+    fn resolvable_import_has_no_diagnostic() {
+        let (mut host, _dir, file) = diag_host(
+            &[
+                (
+                    "Foo.compact",
+                    "module Foo { export circuit f(): Field { return 0; } }",
+                ),
+                (
+                    "main.compact",
+                    "import Foo;\ncircuit m(): Field { return 0; }",
+                ),
+            ],
+            "main.compact",
+        );
+        assert!(host.resolution_diagnostics(file).is_empty());
+    }
+
+    #[test]
+    fn module_name_mismatch_is_an_error() {
+        let (mut host, _dir, file) = diag_host(
+            &[
+                (
+                    "Foo.compact",
+                    "module NotFoo { export circuit f(): Field { return 0; } }",
+                ),
+                (
+                    "main.compact",
+                    "import Foo;\ncircuit m(): Field { return 0; }",
+                ),
+            ],
+            "main.compact",
+        );
+        let diags = host.resolution_diagnostics(file);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("rather than expected"));
+    }
+
+    #[test]
+    fn unresolved_include_is_an_error() {
+        let (mut host, _dir, file) = diag_host(
+            &[(
+                "main.compact",
+                "include \"nope\";\ncircuit m(): Field { return 0; }",
+            )],
+            "main.compact",
+        );
+        let diags = host.resolution_diagnostics(file);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("cannot resolve include"));
     }
 }

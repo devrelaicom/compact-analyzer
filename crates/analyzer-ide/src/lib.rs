@@ -11,7 +11,7 @@ pub use document_symbols::{DocSymbol, document_symbols};
 pub use goto_definition::goto_definition;
 pub use hover::{HoverResult, hover};
 pub use references::{find_references, find_references_cancellable};
-pub use rename::{RenameError, SourceEdit, rename};
+pub use rename::{RenameError, SourceEdit, rename, rename_cancellable};
 
 use analyzer_core::{FileId, TextRange};
 

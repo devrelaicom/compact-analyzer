@@ -1,13 +1,11 @@
-//! Rename: validate the new name, then reuse `find_references` to build
-//! the edit set. The conflict check is a single scope-resolution probe
-//! anchored at the definition's *last* reference (not its declaration
-//! site), because an earlier anchor can miss a sibling binding declared
-//! later in the same scope. It is still one check, not a per-use-site
-//! scan; full per-use-site conflict detection is deferred to M2b.
+//! Rename: validate the new name, gather all references workspace-wide via
+//! `find_references_cancellable`, then run a per-use-site conflict check — at
+//! every reference site the new name must resolve to nothing or to the same
+//! definition. Edits span every file that references the symbol.
 
 use analyzer_core::{AnalysisHost, FilePosition, TextRange};
 
-use crate::find_references;
+use crate::find_references_cancellable;
 
 /// Active Compact keywords at language 0.23 (from the language reference).
 const KEYWORDS: &[&str] = &[
@@ -83,10 +81,11 @@ impl std::fmt::Display for RenameError {
     }
 }
 
-pub fn rename(
+pub fn rename_cancellable(
     host: &mut AnalysisHost,
     pos: FilePosition,
     new_name: &str,
+    should_continue: &dyn Fn() -> bool,
 ) -> Result<Vec<SourceEdit>, RenameError> {
     if !is_valid_identifier(new_name) {
         return Err(RenameError::InvalidName(new_name.to_string()));
@@ -95,39 +94,29 @@ pub fn rename(
         return Err(RenameError::Keyword(new_name.to_string()));
     }
     let def = host.resolve(pos).ok_or(RenameError::NotFound)?;
-    let (def_file, def_name_range, _) = host.nav_info(&def).ok_or(RenameError::NotFound)?;
+    let (def_file, _, _) = host.nav_info(&def).ok_or(RenameError::NotFound)?;
     if Some(def_file) == host.stdlib_file() {
         return Err(RenameError::BuiltinTarget);
     }
-    let refs = find_references(host, pos, true).ok_or(RenameError::NotFound)?;
-    // Conservative conflict check: the new name must not already resolve
-    // within the definition's own scope. Anchored at the *last* reference
-    // rather than the definition's own name-range start: `resolve_name_at`'s
-    // local-scope scan is sequential/shadowing-aware (a later `const` in the
-    // same block shadows an earlier one only from its own declaration
-    // onward), so a check anchored at the very start of a binding's
-    // declaration can never see a sibling declared later in the same block
-    // — even though that sibling is genuinely in scope by the time the
-    // rename's uses are reached. This is still a single check (not a
-    // per-use-site scan); per-use-site conflicts remain a known M2b
-    // refinement.
-    let check_pos = refs
-        .iter()
-        .map(|t| t.name_range.start())
-        .max()
-        .unwrap_or_else(|| def_name_range.start());
-    if host
-        .resolve_name_at(
+    let refs = find_references_cancellable(host, pos, true, should_continue)
+        .ok_or(RenameError::NotFound)?;
+
+    // Per-use-site conflict detection: at each reference site, the new name
+    // must not already resolve to a *different* definition (which the rename
+    // would shadow or collide with). Works across files.
+    for r in &refs {
+        if let Some(existing) = host.resolve_name_at(
             FilePosition {
-                file: def_file,
-                offset: check_pos,
+                file: r.file,
+                offset: r.name_range.start(),
             },
             new_name,
-        )
-        .is_some()
-    {
-        return Err(RenameError::Conflict(new_name.to_string()));
+        ) && existing != def
+        {
+            return Err(RenameError::Conflict(new_name.to_string()));
+        }
     }
+
     Ok(refs
         .into_iter()
         .map(|t| SourceEdit {
@@ -136,6 +125,15 @@ pub fn rename(
             new_text: new_name.to_string(),
         })
         .collect())
+}
+
+/// Non-cancellable convenience wrapper (used by tests and simple callers).
+pub fn rename(
+    host: &mut AnalysisHost,
+    pos: FilePosition,
+    new_name: &str,
+) -> Result<Vec<SourceEdit>, RenameError> {
+    rename_cancellable(host, pos, new_name, &|| true)
 }
 
 fn is_valid_identifier(name: &str) -> bool {
@@ -209,6 +207,39 @@ mod tests {
             try_rename(src, "b"),
             Err(RenameError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn renames_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Foo.compact"),
+            "module Foo { export circuit ff(): Field { return 0; } }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("main.compact"),
+            "import Foo;\ncircuit m(): Field { return ff() + ff(); }",
+        )
+        .unwrap();
+        let mut host = AnalysisHost::new();
+        host.discover_and_index(&[dir.path().to_path_buf()], &|| true);
+        let foo = host.vfs_mut().file_id(&dir.path().join("Foo.compact"));
+        let main = host.vfs_mut().file_id(&dir.path().join("main.compact"));
+        let foo_text = host.vfs_mut().read(foo).unwrap();
+        let off = foo_text.find("ff(").unwrap() as u32;
+
+        let edits = rename(
+            &mut host,
+            FilePosition {
+                file: foo,
+                offset: analyzer_core::TextSize::new(off),
+            },
+            "gg",
+        )
+        .unwrap();
+        assert_eq!(edits.len(), 3); // declaration + two cross-file uses
+        assert_eq!(edits.iter().filter(|e| e.file == main).count(), 2);
     }
 
     #[test]

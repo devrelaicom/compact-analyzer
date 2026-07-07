@@ -11,9 +11,9 @@ use analyzer_core::{AnalysisHost, FileId};
 use crossbeam_channel::RecvTimeoutError;
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    PublishDiagnosticsParams, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-    Url,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, PublishDiagnosticsParams, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 
 use crate::lsp_utils;
@@ -76,6 +76,9 @@ pub(crate) fn run() -> anyhow::Result<()> {
     );
     let roots = state.workspace_roots.clone();
     state.host.discover_and_index(&roots, &|| true);
+    if state.watch_supported {
+        state.register_file_watcher();
+    }
 
     loop {
         // When diagnostics are pending, wait only until the debounce
@@ -190,7 +193,10 @@ impl GlobalState {
         match msg {
             Message::Request(req) => self.handle_request(req),
             Message::Notification(not) => self.handle_notification(not),
-            Message::Response(_) => {} // we never send server-to-client requests in M1
+            // We do send server→client requests now (e.g. `registerCapability`
+            // for file watching); their responses carry no data we need, so
+            // drop them here.
+            Message::Response(_) => {}
         }
     }
 
@@ -402,6 +408,13 @@ impl GlobalState {
                     self.did_close(params);
                 }
             }
+            "workspace/didChangeWatchedFiles" => {
+                if let Ok(params) =
+                    serde_json::from_value::<DidChangeWatchedFilesParams>(not.params)
+                {
+                    self.did_change_watched_files(params);
+                }
+            }
             // Recognized but irrelevant in M1.
             "textDocument/didSave" | "initialized" | "$/setTrace" | "$/cancelRequest" => {}
             other => eprintln!("compact-analyzer: ignoring notification {other}"),
@@ -534,6 +547,69 @@ impl GlobalState {
 
     fn respond(&self, response: Response) {
         let _ = self.sender.send(Message::Response(response));
+    }
+
+    /// Registers a `**/*.compact` file watcher via `client/registerCapability`.
+    fn register_file_watcher(&mut self) {
+        let registration = lsp_types::Registration {
+            id: "watch-compact".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: serde_json::to_value(
+                lsp_types::DidChangeWatchedFilesRegistrationOptions {
+                    watchers: vec![lsp_types::FileSystemWatcher {
+                        glob_pattern: lsp_types::GlobPattern::String("**/*.compact".to_string()),
+                        kind: None,
+                    }],
+                },
+            )
+            .ok(),
+        };
+        self.send_request::<lsp_types::request::RegisterCapability>(
+            lsp_types::RegistrationParams {
+                registrations: vec![registration],
+            },
+        );
+    }
+
+    /// Sends a server→client request. The client's response is ignored (the
+    /// main loop drops `Message::Response`).
+    fn send_request<R: lsp_types::request::Request>(&mut self, params: R::Params) {
+        self.next_request_id += 1;
+        let req = Request::new(
+            lsp_server::RequestId::from(self.next_request_id),
+            R::METHOD.to_string(),
+            params,
+        );
+        let _ = self.sender.send(Message::Request(req));
+    }
+
+    fn did_change_watched_files(&mut self, params: DidChangeWatchedFilesParams) {
+        for change in params.changes {
+            let Some(path) = lsp_utils::abs_path_from_uri(&change.uri) else {
+                continue;
+            };
+            let file = self.host.vfs_mut().file_id(&path);
+            if change.typ == lsp_types::FileChangeType::DELETED {
+                self.host.remove_workspace_file(file);
+            } else {
+                self.host.vfs_mut().invalidate_disk(file);
+                self.host.index_file(file);
+            }
+        }
+        self.republish_open_diagnostics();
+    }
+
+    /// Re-schedules diagnostics for every open file (a cross-file change may
+    /// have altered their resolution results).
+    fn republish_open_diagnostics(&mut self) {
+        let open: Vec<FileId> = self.open_files.values().copied().collect();
+        if open.is_empty() {
+            return;
+        }
+        for f in open {
+            self.pending_diagnostics.insert(f);
+        }
+        self.debounce_deadline = Some(Instant::now() + DEBOUNCE);
     }
 }
 

@@ -6,6 +6,7 @@ version = 4
 name = "analyzer-core"
 version = "0.1.0"
 dependencies = [
+ "compactp_ast",
  "compactp_diagnostics",
  "compactp_parser",
  "compactp_syntax",
@@ -49,6 +50,16 @@ dependencies = [
  "lsp-types",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "compactp_ast"
+version = "0.1.0-beta.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0d8795de9d689cdad7f5167103b5c8e94dcdf5e7bb30172c54db885b0577c1c"
+dependencies = [
+ "compactp_syntax",
+ "rowan",
 ]
 
 [[package]]

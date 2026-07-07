@@ -14,6 +14,7 @@ use std::sync::Arc;
 use compactp_diagnostics::Diagnostic;
 use rowan::GreenNode;
 
+use crate::item_tree::ItemTree;
 use crate::line_index::LineIndex;
 use crate::vfs::{FileId, Vfs};
 
@@ -23,6 +24,7 @@ pub struct FileAnalysis {
     pub green: GreenNode,
     pub diagnostics: Arc<Vec<Diagnostic>>,
     pub line_index: Arc<LineIndex>,
+    pub item_tree: Arc<ItemTree>,
 }
 
 pub struct AnalysisHost {
@@ -56,10 +58,12 @@ impl AnalysisHost {
             return Some(analysis.clone());
         }
         let result = compactp_parser::parse(&text);
+        let root = compactp_syntax::SyntaxNode::new_root(result.green.clone());
         let analysis = FileAnalysis {
             green: result.green,
             diagnostics: Arc::new(result.errors),
             line_index: Arc::new(LineIndex::new(text)),
+            item_tree: Arc::new(ItemTree::extract(&root)),
         };
         self.cache.insert(file, (hash, analysis.clone()));
         Some(analysis)

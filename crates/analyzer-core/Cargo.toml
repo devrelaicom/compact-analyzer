@@ -8,11 +8,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+compactp_ast.workspace = true
 compactp_parser.workspace = true
+compactp_syntax.workspace = true
 compactp_diagnostics.workspace = true
 rowan.workspace = true
 text-size.workspace = true
 
 [dev-dependencies]
-compactp_syntax.workspace = true
 tempfile.workspace = true

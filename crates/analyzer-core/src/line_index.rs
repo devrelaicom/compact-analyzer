@@ -164,4 +164,39 @@ mod tests {
         // offset 4 is the boundary after the emoji: 2 UTF-16 units
         assert_eq!(li.line_col(TextSize::new(4)), LineCol { line: 0, col: 2 });
     }
+
+    #[test]
+    fn offset_col_inside_surrogate_pair_advances_to_next_char() {
+        let li = index("\u{1F600}x"); // emoji (2 UTF-16 units), then x
+        // Column 1 lands inside the emoji's surrogate pair → the scan clamps up
+        // to the next char boundary (the `x` at byte 4).
+        assert_eq!(
+            li.offset(LineCol { line: 0, col: 1 }),
+            Some(TextSize::new(4))
+        );
+    }
+
+    #[test]
+    fn offset_and_line_col_handle_empty_text() {
+        let li = index("");
+        assert_eq!(li.line_col(TextSize::new(0)), LineCol { line: 0, col: 0 });
+        assert_eq!(
+            li.offset(LineCol { line: 0, col: 0 }),
+            Some(TextSize::new(0))
+        );
+        assert_eq!(
+            li.offset(LineCol { line: 0, col: 5 }),
+            Some(TextSize::new(0))
+        );
+        assert_eq!(li.offset(LineCol { line: 1, col: 0 }), None);
+    }
+
+    #[test]
+    fn offset_on_last_line_without_newline_clamps_to_content_end() {
+        let li = index("ab\ncde");
+        assert_eq!(
+            li.offset(LineCol { line: 1, col: 99 }),
+            Some(TextSize::new(6))
+        );
+    }
 }

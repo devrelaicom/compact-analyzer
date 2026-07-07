@@ -194,4 +194,18 @@ mod tests {
         vfs.invalidate_disk(f);
         assert_eq!(vfs.read(f).unwrap().as_ref(), "edit"); // overlay is untouched
     }
+
+    #[test]
+    #[should_panic]
+    fn path_panics_on_foreign_file_id() {
+        // `path` indexes by FileId; an id minted by a different Vfs is out of
+        // range and panics (documented precondition — callers pass ids from
+        // the same Vfs).
+        let mut a = Vfs::new();
+        let _ = a.file_id(std::path::Path::new("/t/only.compact")); // a has id 0
+        let mut b = Vfs::new();
+        let _ = b.file_id(std::path::Path::new("/t/x.compact"));
+        let foreign = b.file_id(std::path::Path::new("/t/y.compact")); // id 1 in b
+        let _ = a.path(foreign); // id 1 is out of range for `a`
+    }
 }

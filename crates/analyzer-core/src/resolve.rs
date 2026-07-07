@@ -182,18 +182,62 @@ impl crate::AnalysisHost {
                 })
             }
             Some(module_token) => {
-                // In-file module import (filesystem fallback is M2b).
-                let (module_idx, _) = tree.top_level().find(|(_, s)| {
-                    s.kind == crate::SymbolKind::Module && s.name == module_token.text()
-                })?;
-                let (idx, _) = tree
-                    .children_of(module_idx)
-                    .find(|(_, s)| s.exported && s.name == target_name)?;
-                Some(Definition::Item { file, index: idx })
+                let module_name = module_token.text().to_string();
+                // In-scope module first (verified: in-scope FIRST, filesystem
+                // second). An in-scope module wins even if the member is absent.
+                if let Some((module_idx, _)) = tree
+                    .top_level()
+                    .find(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == module_name)
+                {
+                    return tree
+                        .children_of(module_idx)
+                        .find(|(_, s)| s.exported && s.name == target_name)
+                        .map(|(idx, _)| Definition::Item { file, index: idx });
+                }
+                // No in-scope module → filesystem: `<module_name>.compact`
+                // containing exactly `module <module_name>`.
+                let from_dir = self.vfs().path(file).parent()?.to_path_buf();
+                self.resolve_external_module_member(
+                    &from_dir,
+                    &module_name,
+                    &module_name,
+                    &target_name,
+                )
             }
-            // String-path import: M2b.
-            None => None,
+            // String-path import: never consults in-scope modules; expected
+            // module name is the last path component.
+            None => {
+                let raw = crate::string_lit_text(import.path()?.text());
+                let expected = crate::path_module_name(&raw)?;
+                let from_dir = self.vfs().path(file).parent()?.to_path_buf();
+                self.resolve_external_module_member(&from_dir, &raw, &expected, &target_name)
+            }
         }
+    }
+
+    /// Resolves `target_name` as an exported member of the single module in the
+    /// file that `raw` resolves to, requiring that module's name to equal
+    /// `expected_module` (compiler rule). Used by both the identifier and
+    /// string-path import arms.
+    fn resolve_external_module_member(
+        &mut self,
+        from_dir: &std::path::Path,
+        raw: &str,
+        expected_module: &str,
+        target_name: &str,
+    ) -> Option<Definition> {
+        let search = self.import_search_path();
+        let path = crate::find_source_pathname(from_dir, &search, raw)?;
+        let file = self.vfs_mut().file_id(&path);
+        let tree = self.analyze(file)?.item_tree.clone();
+        let (module_idx, module_sym) = single_top_level_module(&tree)?;
+        if module_sym.name != expected_module {
+            return None;
+        }
+        let (idx, _) = tree
+            .children_of(module_idx)
+            .find(|(_, s)| s.exported && s.name == target_name)?;
+        Some(Definition::Item { file, index: idx })
     }
 
     fn resolve_struct_literal_field(
@@ -386,6 +430,17 @@ impl crate::AnalysisHost {
             index: index as u32,
         })
     }
+}
+
+/// The sole top-level symbol iff it is exactly one and a module. Mirrors the
+/// compiler's "must contain a (single) module definition" rule.
+fn single_top_level_module(tree: &crate::ItemTree) -> Option<(u32, &crate::Symbol)> {
+    let mut tops = tree.top_level();
+    let first = tops.next()?;
+    if tops.next().is_some() {
+        return None; // more than one top-level declaration
+    }
+    (first.1.kind == crate::SymbolKind::Module).then_some(first)
 }
 
 /// Index of the module symbol whose range contains `offset`, if any.
@@ -1040,5 +1095,90 @@ mod tests {
              circuit main(): Field { return U_help$0er(); }",
         );
         assert_eq!(host.resolve(pos), None);
+    }
+
+    // ---- M2b: cross-file filesystem resolution ----
+
+    /// Writes `others` (relative path, contents) to a tempdir, writes the
+    /// `$0`-marked `open` file (extension implied by `open_rel`) there too as
+    /// an overlay, and returns (host, tempdir-guard, cursor position).
+    fn cross_file(
+        marked_open: &str,
+        open_rel: &str,
+        others: &[(&str, &str)],
+    ) -> (crate::AnalysisHost, tempfile::TempDir, FilePosition) {
+        let (clean, offset) = crate::fixture::extract(marked_open);
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, contents) in others {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, contents).unwrap();
+        }
+        let open_path = dir.path().join(open_rel);
+        std::fs::create_dir_all(open_path.parent().unwrap()).unwrap();
+        std::fs::write(&open_path, &clean).unwrap();
+        let mut host = crate::AnalysisHost::new();
+        let file = host.vfs_mut().file_id(&open_path);
+        host.vfs_mut().set_overlay(file, clean, 1);
+        (host, dir, FilePosition { file, offset })
+    }
+
+    #[test]
+    fn identifier_import_resolves_across_files() {
+        let (mut host, _dir, pos) = cross_file(
+            "import Foo;\ncircuit m(): Field { return f$0(); }",
+            "main.compact",
+            &[(
+                "Foo.compact",
+                "module Foo { export circuit f(): Field { return 0; } }",
+            )],
+        );
+        let pos_file = pos.file;
+        let def = host
+            .resolve(pos)
+            .expect("resolves through identifier import");
+        assert_eq!(host.def_name(&def).unwrap(), "f");
+        assert_ne!(host.nav_info(&def).unwrap().0, pos_file); // lands in Foo.compact
+    }
+
+    #[test]
+    fn string_path_import_resolves_across_files() {
+        let (mut host, _dir, pos) = cross_file(
+            "import \"sub/Bar\";\ncircuit m(): Field { return g$0(); }",
+            "main.compact",
+            &[(
+                "sub/Bar.compact",
+                "module Bar { export circuit g(): Field { return 0; } }",
+            )],
+        );
+        let pos_file = pos.file;
+        let def = host
+            .resolve(pos)
+            .expect("resolves through string-path import");
+        assert_eq!(host.def_name(&def).unwrap(), "g");
+        assert_ne!(host.nav_info(&def).unwrap().0, pos_file);
+    }
+
+    #[test]
+    fn import_with_wrong_module_name_is_unresolved() {
+        let (mut host, _dir, pos) = cross_file(
+            "import Foo;\ncircuit m(): Field { return f$0(); }",
+            "main.compact",
+            &[(
+                "Foo.compact",
+                "module NotFoo { export circuit f(): Field { return 0; } }",
+            )],
+        );
+        assert!(host.resolve(pos).is_none());
+    }
+
+    #[test]
+    fn missing_import_file_is_unresolved() {
+        let (mut host, _dir, pos) = cross_file(
+            "import Missing;\ncircuit m(): Field { return f$0(); }",
+            "main.compact",
+            &[],
+        );
+        assert!(host.resolve(pos).is_none());
     }
 }

@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use compactp_diagnostics::Diagnostic;
@@ -31,6 +32,7 @@ pub struct AnalysisHost {
     vfs: Vfs,
     cache: HashMap<FileId, (u64, FileAnalysis)>,
     stdlib: Option<FileId>,
+    import_search_path: Vec<PathBuf>,
 }
 
 impl AnalysisHost {
@@ -39,6 +41,7 @@ impl AnalysisHost {
             vfs: Vfs::new(),
             cache: HashMap::new(),
             stdlib: None,
+            import_search_path: Vec::new(),
         }
     }
 
@@ -59,6 +62,16 @@ impl AnalysisHost {
 
     pub fn stdlib_file(&self) -> Option<FileId> {
         self.stdlib
+    }
+
+    /// Directories consulted (after the importing file's own directory) when
+    /// resolving non-absolute imports/includes. Mirrors `--compact-path`.
+    pub fn set_import_search_path(&mut self, path: Vec<PathBuf>) {
+        self.import_search_path = path;
+    }
+
+    pub fn import_search_path(&self) -> Vec<PathBuf> {
+        self.import_search_path.clone()
     }
 
     /// Parses `file`, memoized on content. `None` if the file is unreadable.

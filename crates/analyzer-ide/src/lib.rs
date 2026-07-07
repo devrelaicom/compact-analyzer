@@ -6,12 +6,14 @@ mod goto_definition;
 mod hover;
 mod references;
 mod rename;
+mod workspace_symbols;
 
 pub use document_symbols::{DocSymbol, document_symbols};
 pub use goto_definition::goto_definition;
 pub use hover::{HoverResult, hover};
 pub use references::{find_references, find_references_cancellable};
 pub use rename::{RenameError, SourceEdit, rename, rename_cancellable};
+pub use workspace_symbols::{WorkspaceSymbolItem, workspace_symbols};
 
 use analyzer_core::{FileId, TextRange};
 

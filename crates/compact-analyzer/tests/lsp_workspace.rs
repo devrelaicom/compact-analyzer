@@ -35,7 +35,19 @@ fn watched_file_creation_updates_the_index() {
         json!({ "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": true } } }),
     );
 
-    // Create a file after initialize, then notify the server of the change.
+    // Barrier: a served `workspace/symbol` response proves the server has
+    // reached its main loop, which only happens after the synchronous
+    // startup crawl (and file-watcher registration) complete in `run()`.
+    // An empty result here proves the crawl already ran and genuinely found
+    // nothing — `added.compact` doesn't exist on disk yet.
+    let before = client.request("workspace/symbol", json!({ "query": "addedThing" }));
+    let before_syms = before["result"].as_array().expect("array result");
+    assert!(
+        before_syms.is_empty(),
+        "expected no addedThing before file creation, got {before_syms:?}"
+    );
+
+    // Create a file after the barrier, then notify the server of the change.
     let added = dir.path().join("added.compact");
     std::fs::write(&added, "circuit addedThing(): Field { return 0; }").unwrap();
     let added_uri = lsp_types::Url::from_file_path(&added).unwrap();
@@ -44,8 +56,11 @@ fn watched_file_creation_updates_the_index() {
         json!({ "changes": [{ "uri": added_uri, "type": 1 }] }), // 1 = CREATED
     );
 
-    let resp = client.request("workspace/symbol", json!({ "query": "addedThing" }));
-    let syms = resp["result"].as_array().unwrap();
-    assert!(syms.iter().any(|s| s["name"] == "addedThing"));
+    // Because the barrier proved the crawl already ran and found nothing,
+    // any positive result here is attributable only to the
+    // `didChangeWatchedFiles` handler.
+    let after = client.request("workspace/symbol", json!({ "query": "addedThing" }));
+    let after_syms = after["result"].as_array().unwrap();
+    assert!(after_syms.iter().any(|s| s["name"] == "addedThing"));
     client.shutdown();
 }

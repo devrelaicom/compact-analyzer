@@ -94,6 +94,33 @@ fn unresolved_import_publishes_an_error_diagnostic() {
 }
 
 #[test]
+fn two_open_files_each_receive_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = lsp_types::Url::from_file_path(dir.path()).unwrap();
+    let mut client = Client::start();
+    client.initialize_root(&root, json!({}));
+
+    let ua = lsp_types::Url::from_file_path(dir.path().join("a.compact")).unwrap();
+    let ub = lsp_types::Url::from_file_path(dir.path().join("b.compact")).unwrap();
+    did_open(&mut client, &ua, 1, "ledger x Field;"); // missing colon → parse error
+    did_open(&mut client, &ub, 1, "ledger y Field;");
+
+    let mut seen = std::collections::HashSet::new();
+    while seen.len() < 2 {
+        let params = client.wait_for_notification("textDocument/publishDiagnostics");
+        let uri = params["uri"].as_str().unwrap().to_string();
+        let has_diags = params["diagnostics"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if has_diags {
+            seen.insert(uri);
+        }
+    }
+    client.shutdown();
+}
+
+#[test]
 fn references_are_workspace_wide_over_lsp() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(

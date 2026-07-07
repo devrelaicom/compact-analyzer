@@ -3,7 +3,7 @@
 //! Never-die contract: every message dispatch runs under catch_unwind; a
 //! panicked request gets an InternalError response and the loop continues.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -83,7 +83,8 @@ pub(crate) fn run() -> anyhow::Result<()> {
     loop {
         // When diagnostics are pending, wait only until the debounce
         // deadline; otherwise block until the next message.
-        let msg = if let Some(deadline) = state.debounce_deadline {
+        let next_deadline = state.pending_diagnostics.values().min().copied();
+        let msg = if let Some(deadline) = next_deadline {
             let now = Instant::now();
             if deadline <= now {
                 state.flush_pending_diagnostics();
@@ -129,10 +130,8 @@ struct GlobalState {
     host: AnalysisHost,
     /// Documents currently open in the editor, by URI.
     open_files: HashMap<Url, FileId>,
-    /// Files with not-yet-published diagnostics.
-    pending_diagnostics: HashSet<FileId>,
-    /// When set, diagnostics are published once this instant passes.
-    debounce_deadline: Option<Instant>,
+    /// Files with not-yet-published diagnostics, each with its own deadline.
+    pending_diagnostics: HashMap<FileId, Instant>,
     /// Roots to (re)crawl for `.compact` files.
     workspace_roots: Vec<PathBuf>,
     /// The client supports dynamic `didChangeWatchedFiles` registration.
@@ -157,8 +156,7 @@ impl GlobalState {
             sender,
             host: AnalysisHost::new(),
             open_files: HashMap::new(),
-            pending_diagnostics: HashSet::new(),
-            debounce_deadline: None,
+            pending_diagnostics: HashMap::new(),
             workspace_roots: Vec::new(),
             watch_supported: false,
             cancel_receiver,
@@ -479,9 +477,6 @@ impl GlobalState {
         };
         self.host.vfs_mut().remove_overlay(file);
         self.pending_diagnostics.remove(&file);
-        if self.pending_diagnostics.is_empty() {
-            self.debounce_deadline = None;
-        }
         // Clear this document's diagnostics in the editor.
         self.publish(PublishDiagnosticsParams {
             uri: params.text_document.uri,
@@ -492,8 +487,9 @@ impl GlobalState {
 
     /// Never-die wrapper around diagnostics publication: parsing and
     /// position conversion run on arbitrary user text — a panic here must
-    /// not kill the server. The inner function clears the debounce deadline
-    /// first thing, so a panicking flush cannot spin the main loop.
+    /// not kill the server. The inner function removes each file's pending
+    /// deadline before publishing it, so a panicking flush cannot spin the
+    /// main loop.
     fn flush_pending_diagnostics(&mut self) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.flush_pending_diagnostics_inner()
@@ -507,9 +503,15 @@ impl GlobalState {
     }
 
     fn flush_pending_diagnostics_inner(&mut self) {
-        self.debounce_deadline = None;
-        let files: Vec<FileId> = self.pending_diagnostics.drain().collect();
-        for file in files {
+        let now = Instant::now();
+        let due: Vec<FileId> = self
+            .pending_diagnostics
+            .iter()
+            .filter(|&(_, &deadline)| deadline <= now)
+            .map(|(&f, _)| f)
+            .collect();
+        for file in due {
+            self.pending_diagnostics.remove(&file);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.publish_file_diagnostics(file)
             }));
@@ -616,14 +618,11 @@ impl GlobalState {
     /// Re-schedules diagnostics for every open file (a cross-file change may
     /// have altered their resolution results).
     fn republish_open_diagnostics(&mut self) {
+        let deadline = Instant::now() + DEBOUNCE;
         let open: Vec<FileId> = self.open_files.values().copied().collect();
-        if open.is_empty() {
-            return;
-        }
         for f in open {
-            self.pending_diagnostics.insert(f);
+            self.pending_diagnostics.insert(f, deadline);
         }
-        self.debounce_deadline = Some(Instant::now() + DEBOUNCE);
     }
 }
 

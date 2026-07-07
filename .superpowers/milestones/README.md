@@ -18,6 +18,7 @@ that plan supersedes the file here; update the status line and treat the plan as
 | M3 — completion + CST-derived features | Future | [m3-completion-and-cst-features.md](m3-completion-and-cst-features.md) |
 | M4 — toolchain integration | Future | [m4-toolchain-integration.md](m4-toolchain-integration.md) |
 | M5 — VS Code extension + distribution | Future | [m5-vscode-extension-and-distribution.md](m5-vscode-extension-and-distribution.md) |
+| M6 — upstream automation (version watch, drift detection, agent-driven updates) | Future (version-watch CI can land any time) | [m6-upstream-automation.md](m6-upstream-automation.md) |
 | v2 — native type checking | Post-v1 direction | [v2-native-type-checking.md](v2-native-type-checking.md) |
 | v3 — native disclosure analysis | Post-v1 direction (flagship) | [v3-disclosure-analysis.md](v3-disclosure-analysis.md) |
 
@@ -31,8 +32,10 @@ project is comfortably developed in VS Code with compact-analyzer every day
 - **Language-version policy:** track the latest Compact language version (0.23 at
   design time; compiler 0.31.x). Parse `pragma language_version`; unsupported versions
   still get parsing + navigation plus an info diagnostic. One grammar per release.
-  Stdlib stubs are versioned per language release and need a refresh procedure each
-  upstream release (curation notes live alongside the stub asset).
+  Stdlib stubs are versioned per language release; keeping them (and every other
+  upstream-mirroring asset) current is M6's job — see
+  [m6-upstream-automation.md](m6-upstream-automation.md). Until M6 lands, each
+  milestone records the exact regeneration procedure next to any asset it creates.
 - **Upstream compactp work** (land in compactp, not here): incremental reparse and
   expression-position recovery hardening when dogfooding surfaces them; accessor gaps
   found during M2a research (ModuleDef members, ImportSpecifier `as` alias,

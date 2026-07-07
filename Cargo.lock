@@ -20,10 +20,7 @@ name = "analyzer-ide"
 version = "0.1.0"
 dependencies = [
  "analyzer-core",
- "compactp_syntax",
- "rowan",
  "tempfile",
- "text-size",
 ]
 
 [[package]]

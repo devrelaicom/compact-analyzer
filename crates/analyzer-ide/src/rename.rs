@@ -1,6 +1,9 @@
 //! Rename: validate the new name, then reuse `find_references` to build
-//! the edit set. The conflict check is deliberately definition-site-only
-//! (a recorded M2a simplification; per-use-site conflicts are M2b).
+//! the edit set. The conflict check is a single scope-resolution probe
+//! anchored at the definition's *last* reference (not its declaration
+//! site), because an earlier anchor can miss a sibling binding declared
+//! later in the same scope. It is still one check, not a per-use-site
+//! scan; full per-use-site conflict detection is deferred to M2b.
 
 use analyzer_core::{AnalysisHost, FilePosition, TextRange};
 

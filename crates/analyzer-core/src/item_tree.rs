@@ -239,8 +239,11 @@ impl ItemTree {
     ) -> u32 {
         let (name_text, name_range) = match &name {
             Some(token) => (token.text().to_string(), token.text_range()),
-            // Error-recovered item without a name: skip silently but still
-            // return a valid parent index by pushing a placeholder-free path.
+            // Error-recovered item without a name: push an empty-name
+            // `Symbol` as a placeholder so the caller still gets a valid
+            // parent index. The placeholder is inert downstream —
+            // `document_symbols` drops empty-name symbols and the resolver
+            // never matches an empty name.
             None => (String::new(), node.text_range()),
         };
         self.push(Symbol {

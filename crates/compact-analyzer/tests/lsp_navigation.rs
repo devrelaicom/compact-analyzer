@@ -51,7 +51,7 @@ fn definition_of_local_call_and_stdlib() {
     assert_ne!(target_uri, uri.as_str());
     assert!(target_uri.ends_with("CompactStandardLibrary.compact"));
 
-    // On whitespace → null.
+    // On a keyword token (`import`, non-IDENT) → null.
     let result = definition_at(&mut client, &uri, 0, 0);
     assert!(result.is_null());
 

@@ -9,6 +9,7 @@ pub mod fixture;
 mod item_tree;
 mod line_index;
 mod resolve;
+mod source_path;
 pub mod stdlib;
 mod vfs;
 
@@ -18,5 +19,6 @@ pub use compactp_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 pub use item_tree::{ItemTree, Symbol, SymbolKind};
 pub use line_index::{LineCol, LineIndex};
 pub use resolve::{Definition, FilePosition};
+pub use source_path::{find_source_pathname, path_module_name, string_lit_text};
 pub use text_size::{TextRange, TextSize};
 pub use vfs::{FileId, Vfs};

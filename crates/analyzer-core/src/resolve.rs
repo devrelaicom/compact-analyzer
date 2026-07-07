@@ -90,37 +90,263 @@ impl crate::AnalysisHost {
         self.resolve_in_file_scope(pos, name)
     }
 
-    /// Task 4 replaces this stub with file-scope + import resolution.
-    fn resolve_in_file_scope(&mut self, _pos: FilePosition, _name: &str) -> Option<Definition> {
+    /// File scope: enclosing-module members, then top-level items, then
+    /// imports in declaration order (stdlib and in-file modules only —
+    /// filesystem imports are M2b).
+    fn resolve_in_file_scope(&mut self, pos: FilePosition, name: &str) -> Option<Definition> {
+        let analysis = self.analyze(pos.file)?;
+        let tree = analysis.item_tree.clone();
+        let root = SyntaxNode::new_root(analysis.green.clone());
+
+        // Inside a module, siblings are visible first.
+        if let Some(module_idx) = enclosing_module(&tree, pos.offset)
+            && let Some((idx, _)) = tree.children_of(module_idx).find(|(_, s)| s.name == name)
+        {
+            return Some(Definition::Item {
+                file: pos.file,
+                index: idx,
+            });
+        }
+
+        // Top-level items.
+        if let Some((idx, _)) = tree.top_level().find(|(_, s)| s.name == name) {
+            return Some(Definition::Item {
+                file: pos.file,
+                index: idx,
+            });
+        }
+
+        // Imports, in order.
+        let source_file = compactp_ast::SourceFile::cast(root)?;
+        for import in source_file.imports() {
+            if let Some(def) = self.resolve_through_import(pos.file, &tree, &import, name) {
+                return Some(def);
+            }
+        }
         None
     }
 
-    /// Task 4 implements these; stubs keep this task compiling.
+    /// One import's contribution to the namespace, honoring prefix and
+    /// selective specifier lists (with aliases).
+    fn resolve_through_import(
+        &mut self,
+        file: FileId,
+        tree: &crate::ItemTree,
+        import: &compactp_ast::Import,
+        name: &str,
+    ) -> Option<Definition> {
+        // Determine the effective name to look up in the import's exports.
+        let mut lookup: &str = name;
+        let stripped;
+        if let Some(prefix) = import.prefix().and_then(|p| p.name()) {
+            // Prefix applies to every name from this import: unprefixed
+            // names never resolve through it.
+            stripped = name.strip_prefix(prefix.text())?.to_string();
+            lookup = &stripped;
+        }
+
+        // Selective list: only listed names are visible; `as` aliases
+        // rename them. (No typed accessor: walk descendants — verified
+        // compactp pattern.)
+        let specifiers: Vec<(String, String)> = import
+            .syntax()
+            .descendants()
+            .filter_map(compactp_ast::ImportSpecifier::cast)
+            .filter_map(|spec| {
+                let original = spec.name()?.text().to_string();
+                let alias = import_specifier_alias(&spec).unwrap_or_else(|| original.clone());
+                Some((alias, original))
+            })
+            .collect();
+        let target_name: String = if specifiers.is_empty() {
+            lookup.to_string()
+        } else {
+            specifiers
+                .iter()
+                .find(|(alias, _)| alias == lookup)?
+                .1
+                .clone()
+        };
+
+        // Where do this import's exports live?
+        match import.name() {
+            Some(module_token) if module_token.text() == "CompactStandardLibrary" => {
+                let std_file = self.stdlib_file()?;
+                let std_tree = self.analyze(std_file)?.item_tree.clone();
+                let (idx, _) = std_tree
+                    .top_level()
+                    .find(|(_, s)| s.exported && s.name == target_name)?;
+                Some(Definition::Item {
+                    file: std_file,
+                    index: idx,
+                })
+            }
+            Some(module_token) => {
+                // In-file module import (filesystem fallback is M2b).
+                let (module_idx, _) = tree.top_level().find(|(_, s)| {
+                    s.kind == crate::SymbolKind::Module && s.name == module_token.text()
+                })?;
+                let (idx, _) = tree
+                    .children_of(module_idx)
+                    .find(|(_, s)| s.exported && s.name == target_name)?;
+                Some(Definition::Item { file, index: idx })
+            }
+            // String-path import: M2b.
+            None => None,
+        }
+    }
+
     fn resolve_struct_literal_field(
         &mut self,
-        _pos: FilePosition,
-        _parent: &SyntaxNode,
-        _name: &str,
+        pos: FilePosition,
+        field_init: &SyntaxNode,
+        name: &str,
     ) -> Option<Definition> {
-        None
+        let struct_expr = field_init
+            .ancestors()
+            .find(|n| n.kind() == SyntaxKind::STRUCT_EXPR)
+            .and_then(compactp_ast::expr::StructExpr::cast)?;
+        let struct_name = struct_expr.name()?.text().to_string();
+        let struct_def = self.resolve_name_at(
+            FilePosition {
+                file: pos.file,
+                offset: struct_expr.syntax().text_range().start(),
+            },
+            &struct_name,
+        )?;
+        self.field_of(&struct_def, crate::SymbolKind::StructField, name)
     }
 
     fn resolve_member(
         &mut self,
-        _pos: FilePosition,
-        _parent: &SyntaxNode,
-        _name: &str,
+        pos: FilePosition,
+        member: &SyntaxNode,
+        name: &str,
     ) -> Option<Definition> {
-        None
+        // Only the syntactically decidable case: receiver is a NAME_EXPR
+        // resolving to an enum → the member is a variant. Everything else
+        // (ledger ADT methods, struct field access) needs types → None.
+        let receiver = member
+            .children()
+            .find(|n| n.kind() == SyntaxKind::NAME_EXPR)
+            .and_then(compactp_ast::expr::NameExpr::cast)?;
+        let receiver_name = receiver.ident()?.text().to_string();
+        let receiver_def = self.resolve_name_at(
+            FilePosition {
+                file: pos.file,
+                offset: receiver.syntax().text_range().start(),
+            },
+            &receiver_name,
+        )?;
+        let Definition::Item { file, index } = &receiver_def else {
+            return None;
+        };
+        let tree = self.analyze(*file)?.item_tree.clone();
+        if tree.symbols[*index as usize].kind != crate::SymbolKind::Enum {
+            return None;
+        }
+        self.field_of(&receiver_def, crate::SymbolKind::EnumVariant, name)
     }
 
     fn resolve_import_specifier(
         &mut self,
-        _pos: FilePosition,
-        _parent: &SyntaxNode,
-        _name: &str,
+        pos: FilePosition,
+        specifier: &SyntaxNode,
+        name: &str,
     ) -> Option<Definition> {
-        None
+        // Only the ORIGINAL name in `import { orig as alias }` is a
+        // reference into the imported module; the alias is a binding.
+        let spec = compactp_ast::ImportSpecifier::cast(specifier.clone())?;
+        let original = spec.name()?;
+        if original.text() != name {
+            return None;
+        }
+        let import = specifier
+            .ancestors()
+            .find(|n| n.kind() == SyntaxKind::IMPORT)
+            .and_then(compactp_ast::Import::cast)?;
+        let tree = self.analyze(pos.file)?.item_tree.clone();
+        // Resolve the original name through this import, bypassing the
+        // specifier's own alias filtering by looking up directly.
+        match import.name() {
+            Some(t) if t.text() == "CompactStandardLibrary" => {
+                let std_file = self.stdlib_file()?;
+                let std_tree = self.analyze(std_file)?.item_tree.clone();
+                let (idx, _) = std_tree
+                    .top_level()
+                    .find(|(_, s)| s.exported && s.name == name)?;
+                Some(Definition::Item {
+                    file: std_file,
+                    index: idx,
+                })
+            }
+            Some(t) => {
+                let (module_idx, _) = tree
+                    .top_level()
+                    .find(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == t.text())?;
+                let (idx, _) = tree
+                    .children_of(module_idx)
+                    .find(|(_, s)| s.exported && s.name == name)?;
+                Some(Definition::Item {
+                    file: pos.file,
+                    index: idx,
+                })
+            }
+            None => None,
+        }
+    }
+
+    /// Child symbol of `parent_def` with the given kind and name.
+    fn field_of(
+        &mut self,
+        parent_def: &Definition,
+        kind: crate::SymbolKind,
+        name: &str,
+    ) -> Option<Definition> {
+        let Definition::Item { file, index } = parent_def else {
+            return None;
+        };
+        let tree = self.analyze(*file)?.item_tree.clone();
+        let (idx, _) = tree
+            .children_of(*index)
+            .find(|(_, s)| s.kind == kind && s.name == name)?;
+        Some(Definition::Item {
+            file: *file,
+            index: idx,
+        })
+    }
+
+    /// The definition's name (for reference search and rename).
+    pub fn def_name(&mut self, def: &Definition) -> Option<String> {
+        match def {
+            Definition::Item { file, index } => Some(
+                self.analyze(*file)?
+                    .item_tree
+                    .symbols
+                    .get(*index as usize)?
+                    .name
+                    .clone(),
+            ),
+            Definition::Local { name, .. } => Some(name.clone()),
+        }
+    }
+
+    /// (file, name_range, full_range) for navigation.
+    pub fn nav_info(&mut self, def: &Definition) -> Option<(FileId, TextRange, TextRange)> {
+        match def {
+            Definition::Item { file, index } => {
+                let sym = self
+                    .analyze(*file)?
+                    .item_tree
+                    .symbols
+                    .get(*index as usize)?
+                    .clone();
+                Some((*file, sym.name_range, sym.full_range))
+            }
+            Definition::Local {
+                file, name_range, ..
+            } => Some((*file, *name_range, *name_range)),
+        }
     }
 
     /// If `token` is the name of an item declaration, return that item.
@@ -160,6 +386,32 @@ impl crate::AnalysisHost {
             index: index as u32,
         })
     }
+}
+
+/// Index of the module symbol whose range contains `offset`, if any.
+fn enclosing_module(tree: &crate::ItemTree, offset: TextSize) -> Option<u32> {
+    tree.symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.kind == crate::SymbolKind::Module && s.full_range.contains(offset))
+        .map(|(i, _)| i as u32)
+        .next_back() // innermost (modules nest in document order)
+}
+
+/// The `as` alias of an import specifier (no typed accessor: read the IDENT
+/// following AS_KW — verified compactp pattern).
+fn import_specifier_alias(spec: &compactp_ast::ImportSpecifier) -> Option<String> {
+    let mut saw_as = false;
+    for element in spec.syntax().children_with_tokens() {
+        if let Some(token) = element.into_token() {
+            if token.kind() == SyntaxKind::AS_KW {
+                saw_as = true;
+            } else if saw_as && token.kind() == SyntaxKind::IDENT {
+                return Some(token.text().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Finds the IDENT token at/beside `offset`. Between two tokens, prefers
@@ -597,5 +849,178 @@ mod tests {
     #[test]
     fn unknown_name_resolves_to_none_gracefully() {
         assert!(resolve_local("circuit f(): Field { return mystery$0; }").is_none());
+    }
+
+    // ---- Task 4: file scope + imports ----
+
+    /// Fixture: verified to parse with zero errors (see plan Global
+    /// Constraints). Registers the stdlib stub in a tempdir.
+    fn full_host(source: &str) -> (crate::AnalysisHost, FilePosition, tempfile::TempDir) {
+        let (clean, offset) = fixture::extract(source);
+        let dir = tempfile::tempdir().unwrap();
+        let std_path = crate::stdlib::materialize(dir.path()).unwrap();
+        let mut host = crate::AnalysisHost::new();
+        host.register_stdlib(&std_path);
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/test/main.compact"));
+        host.vfs_mut().set_overlay(file, clean, 1);
+        (host, FilePosition { file, offset }, dir)
+    }
+
+    fn resolve_item(source: &str) -> Option<(crate::FileId, String, crate::SymbolKind)> {
+        let (mut host, pos, _dir) = full_host(source);
+        match host.resolve(pos)? {
+            Definition::Item { file, index } => {
+                let sym = host.analyze(file).unwrap().item_tree.symbols[index as usize].clone();
+                Some((file, sym.name, sym.kind))
+            }
+            Definition::Local { .. } => panic!("expected an item"),
+        }
+    }
+
+    #[test]
+    fn resolves_top_level_circuit_call() {
+        let (_, name, kind) = resolve_item(
+            "circuit helper(): Field { return 1; }\ncircuit main(): Field { return hel$0per(); }",
+        )
+        .unwrap();
+        assert_eq!(name, "helper");
+        assert_eq!(kind, crate::SymbolKind::Circuit);
+    }
+
+    #[test]
+    fn resolves_type_reference_to_struct() {
+        let (_, name, kind) =
+            resolve_item("struct Point { x: Field; }\ncircuit f(p: Po$0int): Field { return 0; }")
+                .unwrap();
+        assert_eq!(name, "Point");
+        assert_eq!(kind, crate::SymbolKind::Struct);
+    }
+
+    #[test]
+    fn locals_shadow_top_level_items() {
+        // `helper` is both a top-level circuit and a local const: the local wins.
+        let source = "circuit helper(): Field { return 1; }\n\
+                      circuit main(): Field {\n  const helper = 2;\n  return help$0er;\n}";
+        let (mut host, pos, _dir) = full_host(source);
+        assert!(matches!(host.resolve(pos), Some(Definition::Local { .. })));
+    }
+
+    #[test]
+    fn resolves_imported_module_member() {
+        let (_, name, _) = resolve_item(
+            "module Inner {\n  export circuit double(x: Field): Field { return x + x; }\n}\n\
+             import Inner;\n\
+             circuit main(): Field { return dou$0ble(1); }",
+        )
+        .unwrap();
+        assert_eq!(name, "double");
+    }
+
+    #[test]
+    fn unimported_module_members_do_not_resolve() {
+        let (mut host, pos, _dir) = full_host(
+            "module Inner {\n  export circuit double(x: Field): Field { return x + x; }\n}\n\
+             circuit main(): Field { return dou$0ble(1); }",
+        );
+        assert_eq!(host.resolve(pos), None);
+    }
+
+    #[test]
+    fn selective_import_with_alias() {
+        let (_, name, _) = resolve_item(
+            "module Inner {\n  export circuit double(x: Field): Field { return x + x; }\n}\n\
+             import { double as twice } from Inner;\n\
+             circuit main(): Field { return twi$0ce(1); }",
+        )
+        .unwrap();
+        assert_eq!(name, "double");
+        // The original name is NOT visible under a selective import list.
+        let (mut host, pos, _dir) = full_host(
+            "module Inner {\n  export circuit double(x: Field): Field { return x + x; }\n  export circuit triple(x: Field): Field { return x + x + x; }\n}\n\
+             import { double } from Inner;\n\
+             circuit main(): Field { return tri$0ple(1); }",
+        );
+        assert_eq!(host.resolve(pos), None);
+    }
+
+    #[test]
+    fn prefix_import_strips_prefix() {
+        let (_, name, _) = resolve_item(
+            "module Inner {\n  export circuit double(x: Field): Field { return x + x; }\n}\n\
+             import Inner prefix In_;\n\
+             circuit main(): Field { return In_dou$0ble(1); }",
+        )
+        .unwrap();
+        assert_eq!(name, "double");
+        // Unprefixed name must NOT resolve from a prefixed import.
+        let (mut host, pos, _dir) = full_host(
+            "module Inner {\n  export circuit double(x: Field): Field { return x + x; }\n}\n\
+             import Inner prefix In_;\n\
+             circuit main(): Field { return dou$0ble(1); }",
+        );
+        assert_eq!(host.resolve(pos), None);
+    }
+
+    #[test]
+    fn resolves_stdlib_call_into_stub_file() {
+        let (mut host, pos, _dir) = full_host(
+            "import CompactStandardLibrary;\n\
+             circuit main(x: Field): Bytes<32> { return persistent$0Hash<Field>(x); }",
+        );
+        let Some(Definition::Item { file, index }) = host.resolve(pos) else {
+            panic!("expected stdlib item");
+        };
+        assert_eq!(Some(file), host.stdlib_file());
+        let sym = &host.analyze(file).unwrap().item_tree.symbols[index as usize];
+        assert_eq!(sym.name, "persistentHash");
+    }
+
+    #[test]
+    fn stdlib_not_visible_without_import() {
+        let (mut host, pos, _dir) =
+            full_host("circuit main(x: Field): Bytes<32> { return persistent$0Hash<Field>(x); }");
+        assert_eq!(host.resolve(pos), None);
+    }
+
+    #[test]
+    fn resolves_struct_literal_field_label() {
+        let (_, name, kind) = resolve_item(
+            "struct Point { x: Field; y: Field; }\n\
+             circuit f(): Field {\n  const p = Point { x$0: 1, y: 2 };\n  return 0;\n}",
+        )
+        .unwrap();
+        assert_eq!(name, "x");
+        assert_eq!(kind, crate::SymbolKind::StructField);
+    }
+
+    #[test]
+    fn resolves_enum_variant_member() {
+        let (_, name, kind) = resolve_item(
+            "enum Color { red, blue }\n\
+             circuit f(): [] {\n  const c = Color.re$0d;\n}",
+        )
+        .unwrap();
+        assert_eq!(name, "red");
+        assert_eq!(kind, crate::SymbolKind::EnumVariant);
+    }
+
+    #[test]
+    fn ledger_adt_methods_resolve_to_none() {
+        let (mut host, pos, _dir) = full_host(
+            "export ledger count: Counter;\n\
+             circuit f(): [] {\n  count.incre$0ment(1);\n}",
+        );
+        assert_eq!(host.resolve(pos), None);
+    }
+
+    #[test]
+    fn string_path_imports_resolve_to_none_in_m2a() {
+        let (mut host, pos, _dir) = full_host(
+            "import \"./utils\" prefix U_;\n\
+             circuit main(): Field { return U_help$0er(); }",
+        );
+        assert_eq!(host.resolve(pos), None);
     }
 }

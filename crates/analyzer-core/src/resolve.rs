@@ -116,11 +116,64 @@ impl crate::AnalysisHost {
             });
         }
 
+        // Included files' top-level declarations are spliced into this scope.
+        if let Some(def) = self.resolve_through_includes(pos.file, &root, name, &mut vec![pos.file])
+        {
+            return Some(def);
+        }
+
         // Imports, in order.
         let source_file = compactp_ast::SourceFile::cast(root)?;
         for import in source_file.imports() {
             if let Some(def) = self.resolve_through_import(pos.file, &tree, &import, name) {
                 return Some(def);
+            }
+        }
+        None
+    }
+
+    /// Resolves `name` against the top-level declarations of files reachable by
+    /// `include` from `root` (the syntax tree of `file`), depth-first. `active`
+    /// is the include path currently being expanded, for cycle detection.
+    fn resolve_through_includes(
+        &mut self,
+        file: FileId,
+        root: &SyntaxNode,
+        name: &str,
+        active: &mut Vec<FileId>,
+    ) -> Option<Definition> {
+        let source_file = compactp_ast::SourceFile::cast(root.clone())?;
+        let from_dir = self.vfs().path(file).parent()?.to_path_buf();
+        let search = self.import_search_path();
+        // Collect target FileIds first (avoids a borrow across the loop body).
+        let mut targets = Vec::new();
+        for inc in source_file.includes() {
+            if let Some(tok) = inc.path() {
+                let raw = crate::string_lit_text(tok.text());
+                if let Some(path) = crate::find_source_pathname(&from_dir, &search, &raw) {
+                    targets.push(self.vfs_mut().file_id(&path));
+                }
+            }
+        }
+        for target in targets {
+            if active.contains(&target) {
+                continue; // cycle along the active include path
+            }
+            let Some(analysis) = self.analyze(target) else {
+                continue; // unreadable include: skip, never die
+            };
+            if let Some((idx, _)) = analysis.item_tree.top_level().find(|(_, s)| s.name == name) {
+                return Some(Definition::Item {
+                    file: target,
+                    index: idx,
+                });
+            }
+            let target_root = SyntaxNode::new_root(analysis.green.clone());
+            active.push(target);
+            let found = self.resolve_through_includes(target, &target_root, name, active);
+            active.pop();
+            if found.is_some() {
+                return found;
             }
         }
         None
@@ -1179,6 +1232,52 @@ mod tests {
             "main.compact",
             &[],
         );
+        assert!(host.resolve(pos).is_none());
+    }
+
+    #[test]
+    fn include_makes_top_level_decls_visible() {
+        // `helper` is NOT exported in the included file — splice is raw.
+        let (mut host, _dir, pos) = cross_file(
+            "include \"inc\";\ncircuit m(): Field { return help$0er(); }",
+            "main.compact",
+            &[("inc.compact", "circuit helper(): Field { return 0; }")],
+        );
+        let pos_file = pos.file;
+        let def = host.resolve(pos).expect("resolves into included file");
+        assert_eq!(host.def_name(&def).unwrap(), "helper");
+        assert_ne!(host.nav_info(&def).unwrap().0, pos_file);
+    }
+
+    #[test]
+    fn transitive_includes_resolve() {
+        let (mut host, _dir, pos) = cross_file(
+            "include \"a\";\ncircuit m(): Field { return de$0ep(); }",
+            "main.compact",
+            &[
+                ("a.compact", "include \"b\";"),
+                ("b.compact", "circuit deep(): Field { return 0; }"),
+            ],
+        );
+        let pos_file = pos.file;
+        let def = host
+            .resolve(pos)
+            .expect("resolves through transitive include");
+        assert_eq!(host.def_name(&def).unwrap(), "deep");
+        assert_ne!(host.nav_info(&def).unwrap().0, pos_file);
+    }
+
+    #[test]
+    fn include_cycle_terminates() {
+        let (mut host, _dir, pos) = cross_file(
+            "include \"a\";\ncircuit m(): Field { return miss$0ing(); }",
+            "main.compact",
+            &[
+                ("a.compact", "include \"b\";"),
+                ("b.compact", "include \"a\";"), // a <-> b cycle
+            ],
+        );
+        // Must terminate (no hang, no panic) and resolve to None.
         assert!(host.resolve(pos).is_none());
     }
 }

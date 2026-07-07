@@ -703,16 +703,27 @@ fn local_from_pattern_site(file: FileId, token: &SyntaxToken) -> Option<Definiti
 }
 
 /// Walks outward from `offset` collecting the nearest binding of `name`.
+///
+/// Uses the same token-pick as `ident_at_offset` (prefer the IDENT at a
+/// token boundary) rather than a bare right-biased-then-left-biased pick.
+/// The two must agree: `resolve()` already anchored `name`/`offset` on the
+/// IDENT token via `ident_at_offset`, so re-deriving a *different* token
+/// here can land the ancestor walk in the wrong subtree. Concretely: for a
+/// reference immediately followed by a delimiter with no intervening
+/// whitespace (e.g. the `x` in `(x: Field) => x, xs`, where `x` abuts `,`),
+/// the old right-biased pick chose the delimiter token, whose parent is the
+/// *outer* node (e.g. `MAP_EXPR`), skipping straight past the enclosing
+/// `LAMBDA_EXPR` in the ancestor chain and causing the lambda param to be
+/// reported unresolved. Anchoring on the IDENT's own parent instead always
+/// starts the walk inside the innermost expression, so the enclosing scope
+/// (lambda body, block, etc.) is never skipped.
 fn resolve_local_name(
     file: FileId,
     root: &SyntaxNode,
     offset: TextSize,
     name: &str,
 ) -> Option<Definition> {
-    let token = root
-        .token_at_offset(offset)
-        .right_biased()
-        .or_else(|| root.token_at_offset(offset).left_biased())?;
+    let token = ident_at_offset(root, offset)?;
     let start = token.parent()?;
     for node in start.ancestors() {
         match node.kind() {
@@ -1085,6 +1096,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(name, "x");
+    }
+
+    #[test]
+    fn typed_lambda_param_resolves() {
+        // Corpus-proven form: `map((x: Field) => <body>, xs)`. Cursor on the
+        // body use of the typed param. Unlike the untyped case above, a
+        // typed lambda param parses as `PARAM(IDENT, TYPE)` with no
+        // `IDENT_PAT` wrapper (verified against compactp's
+        // `pattern_or_parg`), exercising `lambda_param_binding`'s bare-IDENT
+        // fallback branch — previously untested.
+        let (name, _) =
+            resolve_local("circuit c(): Field { return map((x: Field) => x$0, xs); }").unwrap();
+        assert_eq!(name, "x");
+    }
+
+    #[test]
+    fn struct_pattern_binding_resolves_from_binding_site() {
+        // Corpus-proven form: `const { a, b } = <expr>;`. Cursor on the `a`
+        // binding in the pattern itself: the token's parent is
+        // `STRUCT_PAT_FIELD` directly (shorthand field, no `: pattern`),
+        // hitting `resolve()`'s definition-site early return.
+        let (name, _) =
+            resolve_local("circuit c(pt: Field): Field { const { a$0, b } = pt; return a + b; }")
+                .unwrap();
+        assert_eq!(name, "a");
+    }
+
+    #[test]
+    fn struct_pattern_binding_resolves_from_use_site() {
+        // Same binding, resolved from a use site: cursor on `a` in the
+        // `return a + b;` expression, exercising `resolve_local_name`'s
+        // `Pat::Struct` traversal in `collect_pattern_bindings`.
+        let (name, _) =
+            resolve_local("circuit c(pt: Field): Field { const { a, b } = pt; return a$0 + b; }")
+                .unwrap();
+        assert_eq!(name, "a");
     }
 
     #[test]

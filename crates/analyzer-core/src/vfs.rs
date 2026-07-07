@@ -25,6 +25,7 @@ pub struct Vfs {
     paths: Vec<PathBuf>,
     ids: HashMap<PathBuf, FileId>,
     contents: HashMap<FileId, Content>,
+    generation: u64,
 }
 
 impl Vfs {
@@ -56,12 +57,14 @@ impl Vfs {
                 version,
             },
         );
+        self.generation += 1;
     }
 
     /// Drops the overlay (and any cached disk content) so the next `read`
     /// hits the disk fresh.
     pub fn remove_overlay(&mut self, file: FileId) {
         self.contents.remove(&file);
+        self.generation += 1;
     }
 
     pub fn overlay_version(&self, file: FileId) -> Option<i32> {
@@ -69,6 +72,21 @@ impl Vfs {
             Some(Content::Overlay { version, .. }) => Some(*version),
             _ => None,
         }
+    }
+
+    /// Monotonic revision, bumped by every content mutation.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Drops cached *disk* content so the next `read` re-reads from disk. An
+    /// active overlay is left untouched (it always wins). Called by the file
+    /// watcher on an external change.
+    pub fn invalidate_disk(&mut self, file: FileId) {
+        if matches!(self.contents.get(&file), Some(Content::Disk { .. })) {
+            self.contents.remove(&file);
+        }
+        self.generation += 1;
     }
 
     /// Current text of the file: overlay if present, else disk (cached).
@@ -143,5 +161,37 @@ mod tests {
         let mut vfs = Vfs::new();
         let file = vfs.file_id(std::path::Path::new("/nonexistent/nope.compact"));
         assert!(vfs.read(file).is_none());
+    }
+
+    #[test]
+    fn generation_bumps_only_on_mutation() {
+        let mut vfs = Vfs::new();
+        let g0 = vfs.generation();
+        let f = vfs.file_id(std::path::Path::new("/t/a.compact"));
+        assert_eq!(vfs.generation(), g0); // interning is not a mutation
+        vfs.set_overlay(f, "x".to_string(), 1);
+        let g1 = vfs.generation();
+        assert!(g1 > g0);
+        vfs.remove_overlay(f);
+        assert!(vfs.generation() > g1);
+    }
+
+    #[test]
+    fn invalidate_disk_rereads_but_overlay_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.compact");
+        std::fs::write(&path, "v1").unwrap();
+        let mut vfs = Vfs::new();
+        let f = vfs.file_id(&path);
+        assert_eq!(vfs.read(f).unwrap().as_ref(), "v1"); // caches disk content
+
+        std::fs::write(&path, "v2").unwrap();
+        vfs.invalidate_disk(f);
+        assert_eq!(vfs.read(f).unwrap().as_ref(), "v2"); // re-read after invalidate
+
+        vfs.set_overlay(f, "edit".to_string(), 1);
+        std::fs::write(&path, "v3").unwrap();
+        vfs.invalidate_disk(f);
+        assert_eq!(vfs.read(f).unwrap().as_ref(), "edit"); // overlay is untouched
     }
 }

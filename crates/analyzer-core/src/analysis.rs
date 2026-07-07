@@ -74,6 +74,11 @@ impl AnalysisHost {
         self.import_search_path.clone()
     }
 
+    /// Current workspace revision (see `Vfs::generation`).
+    pub fn generation(&self) -> u64 {
+        self.vfs.generation()
+    }
+
     /// Parses `file`, memoized on content. `None` if the file is unreadable.
     pub fn analyze(&mut self, file: FileId) -> Option<FileAnalysis> {
         let text = self.vfs.read(file)?;

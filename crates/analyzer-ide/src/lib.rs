@@ -1,11 +1,13 @@
 //! Editor-agnostic IDE features over analyzer-core. Speaks byte offsets
 //! (`TextSize`/`TextRange`) and `FileId` — zero LSP types.
 
+mod document_symbols;
 mod goto_definition;
 mod hover;
 mod references;
 mod rename;
 
+pub use document_symbols::{DocSymbol, document_symbols};
 pub use goto_definition::goto_definition;
 pub use hover::{HoverResult, hover};
 pub use references::find_references;

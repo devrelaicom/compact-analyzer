@@ -7,16 +7,16 @@ the [Compact](https://docs.midnight.network/compact) smart contract language
 Built on [compactp](https://github.com/devrelaicom/compactp), a lossless,
 error-tolerant parser frontend for Compact.
 
-## Status: M1 — real-time syntax diagnostics
+## Status: M2a — single-file navigation
 
-The server currently provides:
+- Live syntax diagnostics as you type (no compiler round-trip)
+- Goto-definition, find-references, rename, hover, and document symbols
+  across locals, top-level items, in-file modules, and the bundled
+  `CompactStandardLibrary` (goto lands in a readable stub with docs)
+- Correct UTF-16 positions; the server never dies on malformed code
 
-- Live syntax error diagnostics as you type (no compiler round-trip)
-- Correct UTF-16 positions, resilient to any input (the server never dies
-  on malformed code)
-
-Name resolution, navigation, completion, compiler-integrated diagnostics,
-and a VS Code extension are on the roadmap — see
+Cross-file imports, workspace symbols, completion, and compiler-integrated
+diagnostics are next — see
 `docs/superpowers/specs/2026-07-06-compact-analyzer-design.md`.
 
 ## Build

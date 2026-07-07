@@ -34,6 +34,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         references_provider: Some(lsp_types::OneOf::Left(true)),
         rename_provider: Some(lsp_types::OneOf::Left(true)),
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
+        document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
         ..Default::default()
     };
     let initialize_result = serde_json::json!({
@@ -207,6 +208,26 @@ impl GlobalState {
                         })
                     });
                 self.respond_ok(req.id, result);
+            }
+            "textDocument/documentSymbol" => {
+                let result = serde_json::from_value::<lsp_types::DocumentSymbolParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let file = *self.open_files.get(&params.text_document.uri)?;
+                        let analysis = self.host.analyze(file)?;
+                        let line_index = analysis.line_index.clone();
+                        let symbols = analyzer_ide::document_symbols(&mut self.host, file);
+                        Some(
+                            symbols
+                                .into_iter()
+                                .map(|s| doc_symbol_to_lsp(&line_index, s))
+                                .collect::<Vec<_>>(),
+                        )
+                    });
+                self.respond_ok(
+                    req.id,
+                    result.map(lsp_types::DocumentSymbolResponse::Nested),
+                );
             }
             "textDocument/rename" => {
                 let Ok(params) = serde_json::from_value::<lsp_types::RenameParams>(req.params)
@@ -446,6 +467,46 @@ impl GlobalState {
 
     fn respond(&self, response: Response) {
         let _ = self.sender.send(Message::Response(response));
+    }
+}
+
+#[allow(deprecated)] // lsp_types::DocumentSymbol::deprecated
+fn doc_symbol_to_lsp(
+    li: &analyzer_core::LineIndex,
+    symbol: analyzer_ide::DocSymbol,
+) -> lsp_types::DocumentSymbol {
+    lsp_types::DocumentSymbol {
+        name: symbol.name,
+        detail: symbol.detail,
+        kind: symbol_kind_to_lsp(symbol.kind),
+        tags: None,
+        deprecated: None,
+        range: crate::lsp_utils::range_to_lsp(li, symbol.full_range),
+        selection_range: crate::lsp_utils::range_to_lsp(li, symbol.selection_range),
+        children: Some(
+            symbol
+                .children
+                .into_iter()
+                .map(|c| doc_symbol_to_lsp(li, c))
+                .collect(),
+        ),
+    }
+}
+
+fn symbol_kind_to_lsp(kind: analyzer_core::SymbolKind) -> lsp_types::SymbolKind {
+    use analyzer_core::SymbolKind as K;
+    match kind {
+        K::Circuit | K::CircuitSig | K::Witness => lsp_types::SymbolKind::FUNCTION,
+        K::Struct => lsp_types::SymbolKind::STRUCT,
+        K::StructField => lsp_types::SymbolKind::FIELD,
+        K::Enum => lsp_types::SymbolKind::ENUM,
+        K::EnumVariant => lsp_types::SymbolKind::ENUM_MEMBER,
+        K::Module => lsp_types::SymbolKind::MODULE,
+        K::TypeAlias => lsp_types::SymbolKind::INTERFACE,
+        K::Ledger => lsp_types::SymbolKind::PROPERTY,
+        K::Contract => lsp_types::SymbolKind::INTERFACE,
+        K::ContractCircuit => lsp_types::SymbolKind::METHOD,
+        K::Constructor => lsp_types::SymbolKind::CONSTRUCTOR,
     }
 }
 

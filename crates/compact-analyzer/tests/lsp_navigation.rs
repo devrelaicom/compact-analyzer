@@ -114,6 +114,28 @@ fn rename_rejects_keyword_and_applies_valid() {
 }
 
 #[test]
+fn document_symbols_are_nested() {
+    let mut client = Client::start();
+    client.initialize();
+    let (_dir, uri) = open_fixture(&mut client);
+
+    let response = client.request(
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri}}),
+    );
+    let symbols = response["result"].as_array().unwrap();
+    let names: Vec<_> = symbols
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Point", "helper", "main"]);
+    let point_children = symbols[0]["children"].as_array().unwrap();
+    assert_eq!(point_children.len(), 2);
+
+    client.shutdown();
+}
+
+#[test]
 fn hover_shows_stdlib_signature() {
     let mut client = Client::start();
     client.initialize();

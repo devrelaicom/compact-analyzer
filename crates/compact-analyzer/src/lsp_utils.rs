@@ -184,4 +184,28 @@ mod tests {
         assert_eq!(related[0].message, "first defined here");
         assert_eq!(related[0].location.range.start, Position::new(0, 7));
     }
+
+    #[test]
+    fn warning_and_note_severities_map_correctly() {
+        let li = LineIndex::new(Arc::from("x"));
+        let uri = lsp_types::Url::parse("file:///tmp/x.compact").unwrap();
+        let warn = Diagnostic::warning(
+            DiagnosticCode::new("W", 1),
+            "w".to_string(),
+            TextRange::new(TextSize::new(0), TextSize::new(1)),
+        );
+        assert_eq!(
+            diagnostic_to_lsp(&warn, &li, &uri).severity,
+            Some(DiagnosticSeverity::WARNING)
+        );
+        let note = Diagnostic::note(
+            DiagnosticCode::new("N", 1),
+            "n".to_string(),
+            TextRange::new(TextSize::new(0), TextSize::new(1)),
+        );
+        assert_eq!(
+            diagnostic_to_lsp(&note, &li, &uri).severity,
+            Some(DiagnosticSeverity::INFORMATION)
+        );
+    }
 }

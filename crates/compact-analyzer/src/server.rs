@@ -22,6 +22,7 @@ const DEBOUNCE: Duration = Duration::from_millis(150);
 // JSON-RPC error codes (avoid depending on lsp-server exporting them).
 const METHOD_NOT_FOUND: i32 = -32601;
 const INTERNAL_ERROR: i32 = -32603;
+const REQUEST_FAILED: i32 = -32803;
 
 pub(crate) fn run() -> anyhow::Result<()> {
     let (connection, io_threads) = Connection::stdio();
@@ -31,6 +32,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         definition_provider: Some(lsp_types::OneOf::Left(true)),
         references_provider: Some(lsp_types::OneOf::Left(true)),
+        rename_provider: Some(lsp_types::OneOf::Left(true)),
         ..Default::default()
     };
     let initialize_result = serde_json::json!({
@@ -186,6 +188,59 @@ impl GlobalState {
                             .collect::<Vec<_>>()
                     });
                 self.respond_ok(req.id, result);
+            }
+            "textDocument/rename" => {
+                let Ok(params) = serde_json::from_value::<lsp_types::RenameParams>(req.params)
+                else {
+                    self.respond(Response::new_err(
+                        req.id,
+                        INTERNAL_ERROR,
+                        "bad params".into(),
+                    ));
+                    return;
+                };
+                let uri = params.text_document_position.text_document.uri.clone();
+                let Some(pos) =
+                    self.position_to_file_position(&uri, params.text_document_position.position)
+                else {
+                    self.respond_ok(req.id, Option::<lsp_types::WorkspaceEdit>::None);
+                    return;
+                };
+                match analyzer_ide::rename(&mut self.host, pos, &params.new_name) {
+                    Ok(edits) => {
+                        let mut changes: HashMap<Url, Vec<lsp_types::TextEdit>> = HashMap::new();
+                        for edit in edits {
+                            let Some(target_uri) =
+                                Url::from_file_path(self.host.vfs().path(edit.file)).ok()
+                            else {
+                                continue;
+                            };
+                            let Some(analysis) = self.host.analyze(edit.file) else {
+                                continue;
+                            };
+                            changes
+                                .entry(target_uri)
+                                .or_default()
+                                .push(lsp_types::TextEdit {
+                                    range: lsp_utils::range_to_lsp(
+                                        &analysis.line_index,
+                                        edit.range,
+                                    ),
+                                    new_text: edit.new_text,
+                                });
+                        }
+                        self.respond_ok(
+                            req.id,
+                            Some(lsp_types::WorkspaceEdit {
+                                changes: Some(changes),
+                                ..Default::default()
+                            }),
+                        );
+                    }
+                    Err(err) => {
+                        self.respond(Response::new_err(req.id, REQUEST_FAILED, err.to_string()))
+                    }
+                }
             }
             _ => self.respond(Response::new_err(
                 req.id,

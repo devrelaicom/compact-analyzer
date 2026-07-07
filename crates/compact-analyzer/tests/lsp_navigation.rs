@@ -78,3 +78,37 @@ fn references_for_helper() {
 
     client.shutdown();
 }
+
+#[test]
+fn rename_rejects_keyword_and_applies_valid() {
+    let mut client = Client::start();
+    client.initialize();
+    let (_dir, uri) = open_fixture(&mut client);
+
+    let (line, col) = lsp_position(NAV_FIXTURE, "doubled");
+    let response = client.request(
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+            "newName": "circuit",
+        }),
+    );
+    assert!(
+        response.get("error").is_some(),
+        "keyword rename must fail: {response}"
+    );
+
+    let response = client.request(
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+            "newName": "tripled",
+        }),
+    );
+    let edits = &response["result"]["changes"][uri.as_str()];
+    assert_eq!(edits.as_array().unwrap().len(), 2); // decl + use
+
+    client.shutdown();
+}

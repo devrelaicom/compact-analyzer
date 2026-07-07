@@ -5,8 +5,10 @@
 //! the `compact-analyzer` binary.
 
 mod analysis;
+pub mod fixture;
 mod item_tree;
 mod line_index;
+mod resolve;
 pub mod stdlib;
 mod vfs;
 
@@ -15,5 +17,6 @@ pub use compactp_diagnostics::{Diagnostic, DiagnosticCode, LabeledSpan, Severity
 pub use compactp_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 pub use item_tree::{ItemTree, Symbol, SymbolKind};
 pub use line_index::{LineCol, LineIndex};
+pub use resolve::{Definition, FilePosition};
 pub use text_size::{TextRange, TextSize};
 pub use vfs::{FileId, Vfs};

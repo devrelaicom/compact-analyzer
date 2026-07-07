@@ -4,6 +4,7 @@
 //! panicked request gets an InternalError response and the loop continues.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use analyzer_core::{AnalysisHost, FileId};
@@ -27,7 +28,7 @@ const REQUEST_FAILED: i32 = -32803;
 pub(crate) fn run() -> anyhow::Result<()> {
     let (connection, io_threads) = Connection::stdio();
 
-    let (initialize_id, _initialize_params) = connection.initialize_start()?;
+    let (initialize_id, initialize_params) = connection.initialize_start()?;
     let capabilities = ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         definition_provider: Some(lsp_types::OneOf::Left(true)),
@@ -47,7 +48,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
     connection.initialize_finish(initialize_id, initialize_result)?;
     eprintln!("compact-analyzer: initialized");
 
-    let mut state = GlobalState::new(connection.sender.clone());
+    let mut state = GlobalState::new(connection.sender.clone(), connection.receiver.clone());
     let stdlib_dir = std::env::temp_dir().join(format!(
         "compact-analyzer-stdlib-{}",
         env!("CARGO_PKG_VERSION")
@@ -61,6 +62,19 @@ pub(crate) fn run() -> anyhow::Result<()> {
             eprintln!("compact-analyzer: stdlib unavailable ({err}); continuing without it")
         }
     }
+
+    // M2b: consume workspace configuration and build the eager index.
+    state.host.set_import_search_path(import_search_path_from(
+        initialize_params.get("initializationOptions"),
+    ));
+    state.workspace_roots = workspace_roots_from_params(&initialize_params);
+    state.watch_supported = client_supports_watch(&initialize_params);
+    eprintln!(
+        "compact-analyzer: indexing {} workspace root(s)",
+        state.workspace_roots.len()
+    );
+    let roots = state.workspace_roots.clone();
+    state.host.discover_and_index(&roots, &|| true);
 
     loop {
         // When diagnostics are pending, wait only until the debounce
@@ -115,16 +129,36 @@ struct GlobalState {
     pending_diagnostics: HashSet<FileId>,
     /// When set, diagnostics are published once this instant passes.
     debounce_deadline: Option<Instant>,
+    /// Roots to (re)crawl for `.compact` files.
+    workspace_roots: Vec<PathBuf>,
+    /// The client supports dynamic `didChangeWatchedFiles` registration.
+    watch_supported: bool,
+    /// A clone of the connection receiver, used only to test emptiness for
+    /// cooperative cancellation (single-threaded — no concurrent consumer).
+    // Not yet consumed: wired up by the cancellation task.
+    #[expect(dead_code)]
+    cancel_receiver: crossbeam_channel::Receiver<Message>,
+    /// Id counter for server→client requests (e.g. registerCapability).
+    // Not yet consumed: wired up by the dynamic-watch-registration task.
+    #[expect(dead_code)]
+    next_request_id: i32,
 }
 
 impl GlobalState {
-    fn new(sender: crossbeam_channel::Sender<Message>) -> Self {
+    fn new(
+        sender: crossbeam_channel::Sender<Message>,
+        cancel_receiver: crossbeam_channel::Receiver<Message>,
+    ) -> Self {
         Self {
             sender,
             host: AnalysisHost::new(),
             open_files: HashMap::new(),
             pending_diagnostics: HashSet::new(),
             debounce_deadline: None,
+            workspace_roots: Vec::new(),
+            watch_supported: false,
+            cancel_receiver,
+            next_request_id: 0,
         }
     }
 
@@ -517,5 +551,85 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
         s.clone()
     } else {
         "unknown panic payload".to_string()
+    }
+}
+
+fn workspace_roots_from_params(params: &serde_json::Value) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(folders) = params.get("workspaceFolders").and_then(|v| v.as_array()) {
+        for f in folders {
+            if let Some(uri) = f.get("uri").and_then(|u| u.as_str())
+                && let Ok(url) = Url::parse(uri)
+                && let Some(p) = lsp_utils::abs_path_from_uri(&url)
+            {
+                roots.push(p);
+            }
+        }
+    }
+    if roots.is_empty()
+        && let Some(uri) = params.get("rootUri").and_then(|u| u.as_str())
+        && let Ok(url) = Url::parse(uri)
+        && let Some(p) = lsp_utils::abs_path_from_uri(&url)
+    {
+        roots.push(p);
+    }
+    roots
+}
+
+fn import_search_path_from(options: Option<&serde_json::Value>) -> Vec<PathBuf> {
+    if let Some(opts) = options
+        && let Some(arr) = opts.get("importSearchPath").and_then(|v| v.as_array())
+    {
+        return arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(PathBuf::from)
+            .collect();
+    }
+    std::env::var_os("COMPACT_PATH")
+        .map(|v| std::env::split_paths(&v).collect())
+        .unwrap_or_default()
+}
+
+fn client_supports_watch(params: &serde_json::Value) -> bool {
+    params
+        .pointer("/capabilities/workspace/didChangeWatchedFiles/dynamicRegistration")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn workspace_roots_prefers_folders_then_root_uri() {
+        let base = std::env::temp_dir();
+        let a = base.join("wsA");
+        let uri_a = Url::from_file_path(&a).unwrap();
+        let params = json!({ "workspaceFolders": [{ "uri": uri_a, "name": "A" }] });
+        assert_eq!(workspace_roots_from_params(&params), vec![a.clone()]);
+
+        let params = json!({ "rootUri": uri_a });
+        assert_eq!(workspace_roots_from_params(&params), vec![a]);
+
+        assert!(workspace_roots_from_params(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn import_search_path_reads_options() {
+        let opts = json!({ "importSearchPath": ["/libs/x", "/libs/y"] });
+        assert_eq!(
+            import_search_path_from(Some(&opts)),
+            vec![PathBuf::from("/libs/x"), PathBuf::from("/libs/y")]
+        );
+    }
+
+    #[test]
+    fn client_watch_capability_is_detected() {
+        let yes = json!({ "capabilities": { "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": true } } } });
+        assert!(client_supports_watch(&yes));
+        assert!(!client_supports_watch(&json!({ "capabilities": {} })));
     }
 }

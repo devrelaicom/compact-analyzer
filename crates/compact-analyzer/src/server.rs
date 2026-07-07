@@ -30,6 +30,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
     let capabilities = ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         definition_provider: Some(lsp_types::OneOf::Left(true)),
+        references_provider: Some(lsp_types::OneOf::Left(true)),
         ..Default::default()
     };
     let initialize_result = serde_json::json!({
@@ -165,6 +166,25 @@ impl GlobalState {
                     })
                     .and_then(|pos| analyzer_ide::goto_definition(&mut self.host, pos))
                     .and_then(|target| lsp_utils::nav_target_to_location(&mut self.host, &target));
+                self.respond_ok(req.id, result);
+            }
+            "textDocument/references" => {
+                let result = serde_json::from_value::<lsp_types::ReferenceParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let include_decl = params.context.include_declaration;
+                        let pos = self.position_to_file_position(
+                            &params.text_document_position.text_document.uri,
+                            params.text_document_position.position,
+                        )?;
+                        analyzer_ide::find_references(&mut self.host, pos, include_decl)
+                    })
+                    .map(|targets| {
+                        targets
+                            .iter()
+                            .filter_map(|t| lsp_utils::nav_target_to_location(&mut self.host, t))
+                            .collect::<Vec<_>>()
+                    });
                 self.respond_ok(req.id, result);
             }
             _ => self.respond(Response::new_err(

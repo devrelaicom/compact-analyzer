@@ -2,8 +2,10 @@
 //! (`TextSize`/`TextRange`) and `FileId` — zero LSP types.
 
 mod goto_definition;
+mod references;
 
 pub use goto_definition::goto_definition;
+pub use references::find_references;
 
 use analyzer_core::{FileId, TextRange};
 

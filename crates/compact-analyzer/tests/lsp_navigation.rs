@@ -57,3 +57,24 @@ fn definition_of_local_call_and_stdlib() {
 
     client.shutdown();
 }
+
+#[test]
+fn references_for_helper() {
+    let mut client = Client::start();
+    client.initialize();
+    let (_dir, uri) = open_fixture(&mut client);
+
+    let (line, col) = lsp_position(NAV_FIXTURE, "helper(base");
+    let response = client.request(
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+            "context": {"includeDeclaration": true},
+        }),
+    );
+    let locations = response["result"].as_array().expect("array of locations");
+    assert_eq!(locations.len(), 2); // declaration + call in main
+
+    client.shutdown();
+}

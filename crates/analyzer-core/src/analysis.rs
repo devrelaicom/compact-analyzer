@@ -30,6 +30,7 @@ pub struct FileAnalysis {
 pub struct AnalysisHost {
     vfs: Vfs,
     cache: HashMap<FileId, (u64, FileAnalysis)>,
+    stdlib: Option<FileId>,
 }
 
 impl AnalysisHost {
@@ -37,6 +38,7 @@ impl AnalysisHost {
         Self {
             vfs: Vfs::new(),
             cache: HashMap::new(),
+            stdlib: None,
         }
     }
 
@@ -46,6 +48,17 @@ impl AnalysisHost {
 
     pub fn vfs_mut(&mut self) -> &mut Vfs {
         &mut self.vfs
+    }
+
+    /// Registers the materialized stdlib stub so the resolver can target it.
+    pub fn register_stdlib(&mut self, path: &std::path::Path) -> FileId {
+        let file = self.vfs.file_id(path);
+        self.stdlib = Some(file);
+        file
+    }
+
+    pub fn stdlib_file(&self) -> Option<FileId> {
+        self.stdlib
     }
 
     /// Parses `file`, memoized on content. `None` if the file is unreadable.

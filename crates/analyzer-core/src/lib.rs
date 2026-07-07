@@ -7,6 +7,7 @@
 mod analysis;
 mod item_tree;
 mod line_index;
+pub mod stdlib;
 mod vfs;
 
 pub use analysis::{AnalysisHost, FileAnalysis};

@@ -1,0 +1,124 @@
+// CompactStandardLibrary — signature stub bundled with compact-analyzer.
+// Pinned to language 0.23 (compiler tag compactc-v0.31.0).
+// Signatures verbatim from compiler/standard-library.compact and
+// compiler/midnight-natives.ss at that tag; bodies are dummies (the
+// analyzer needs declarations, not behavior).
+
+// The kernel ledger giving access to Zswap/token/time operations.
+export ledger kernel: Kernel;
+
+// Encapsulates an optionally present value.
+export struct Maybe<T> { is_some: Boolean; value: T; }
+// Disjoint union of two alternatives.
+export struct Either<A, B> { is_left: Boolean; left: A; right: B; }
+// Root hash (digest) of a Merkle tree.
+export struct MerkleTreeDigest { field: Field; }
+// One authentication-path step: sibling digest plus direction.
+export struct MerkleTreePathEntry { sibling: MerkleTreeDigest; goes_left: Boolean; }
+// Full authentication path to a leaf in a depth-n tree.
+export struct MerkleTreePath<#n, T> { leaf: T; path: Vector<n, MerkleTreePathEntry>; }
+// A contract address.
+export struct ContractAddress { bytes: Bytes<32>; }
+// Description of a newly created shielded coin.
+export struct ShieldedCoinInfo { nonce: Bytes<32>; color: Bytes<32>; value: Uint<128>; }
+// An existing ledger shielded coin, ready to spend.
+export struct QualifiedShieldedCoinInfo { nonce: Bytes<32>; color: Bytes<32>; value: Uint<128>; mt_index: Uint<64>; }
+// Public key for receiving shielded coins.
+export struct ZswapCoinPublicKey { bytes: Bytes<32>; }
+// Result of a shielded send: coin sent plus optional change.
+export struct ShieldedSendResult { change: Maybe<ShieldedCoinInfo>; sent: ShieldedCoinInfo; }
+// A user's public address.
+export struct UserAddress { bytes: Bytes<32>; }
+
+// Opaque embedded-curve (Jubjub) point.
+export new type JubjubPoint = Opaque<'JubjubPoint'>;
+
+// Wrap a value as a present Maybe.
+export circuit some<T>(value: T): Maybe<T> { return default<Maybe<T>>; }
+// The empty Maybe.
+export circuit none<T>(): Maybe<T> { return default<Maybe<T>>; }
+// Construct the left variant.
+export circuit left<A, B>(value: A): Either<A, B> { return default<Either<A, B>>; }
+// Construct the right variant.
+export circuit right<A, B>(value: B): Either<A, B> { return default<Either<A, B>>; }
+// Compute the Merkle root implied by a leaf and its path.
+export circuit merkleTreePathRoot<#n, T>(path: MerkleTreePath<n, T>): MerkleTreeDigest { return default<MerkleTreeDigest>; }
+// As merkleTreePathRoot, but the leaf is already hashed.
+export circuit merkleTreePathRootNoLeafHash<#n>(path: MerkleTreePath<n, Bytes<32>>): MerkleTreeDigest { return default<MerkleTreeDigest>; }
+// Token type (color) of the native token.
+export circuit nativeToken(): Bytes<32> { return default<Bytes<32>>; }
+// Derive a namespaced token type from a domain separator and contract.
+export circuit tokenType(domain_sep: Bytes<32>, contractAddress: ContractAddress): Bytes<32> { return default<Bytes<32>>; }
+// Mint a shielded coin and send it to recipient.
+export circuit mintShieldedToken(domain_sep: Bytes<32>, value: Uint<64>, nonce: Bytes<32>, recipient: Either<ZswapCoinPublicKey, ContractAddress>): ShieldedCoinInfo { return default<ShieldedCoinInfo>; }
+// Deterministically derive a new nonce from a counter and prior nonce.
+export circuit evolveNonce(index: Uint<128>, nonce: Bytes<32>): Bytes<32> { return default<Bytes<32>>; }
+// A recipient that provably destroys a coin.
+export circuit shieldedBurnAddress(): Either<ZswapCoinPublicKey, ContractAddress> { return default<Either<ZswapCoinPublicKey, ContractAddress>>; }
+// Receive a shielded coin into the current contract.
+export circuit receiveShielded(coin: ShieldedCoinInfo): [] { }
+// Spend a ledger coin, sending value and returning change.
+export circuit sendShielded(input: QualifiedShieldedCoinInfo, recipient: Either<ZswapCoinPublicKey, ContractAddress>, value: Uint<128>): ShieldedSendResult { return default<ShieldedSendResult>; }
+// Send from a coin created earlier in the same transaction.
+export circuit sendImmediateShielded(input: ShieldedCoinInfo, target: Either<ZswapCoinPublicKey, ContractAddress>, value: Uint<128>): ShieldedSendResult { return default<ShieldedSendResult>; }
+// Merge two ledger coins of the same color.
+export circuit mergeCoin(a: QualifiedShieldedCoinInfo, b: QualifiedShieldedCoinInfo): ShieldedCoinInfo { return default<ShieldedCoinInfo>; }
+// Merge a ledger coin with a transaction-created coin.
+export circuit mergeCoinImmediate(a: QualifiedShieldedCoinInfo, b: ShieldedCoinInfo): ShieldedCoinInfo { return default<ShieldedCoinInfo>; }
+// True if current block time < time.
+export circuit blockTimeLt(time: Uint<64>): Boolean { return default<Boolean>; }
+// True if current block time >= time.
+export circuit blockTimeGte(time: Uint<64>): Boolean { return default<Boolean>; }
+// True if current block time > time.
+export circuit blockTimeGt(time: Uint<64>): Boolean { return default<Boolean>; }
+// True if current block time <= time.
+export circuit blockTimeLte(time: Uint<64>): Boolean { return default<Boolean>; }
+// Mint an unshielded token; returns its color.
+export circuit mintUnshieldedToken(domainSep: Bytes<32>, amount: Uint<64>, recipient: Either<ContractAddress, UserAddress>): Bytes<32> { return default<Bytes<32>>; }
+// Send unshielded tokens to a recipient.
+export circuit sendUnshielded(color: Bytes<32>, amount: Uint<128>, recipient: Either<ContractAddress, UserAddress>): [] { }
+// Receive a specified unshielded amount.
+export circuit receiveUnshielded(color: Bytes<32>, amount: Uint<128>): [] { }
+// Contract's unshielded balance for color.
+export circuit unshieldedBalance(color: Bytes<32>): Uint<128> { return default<Uint<128>>; }
+// Balance < amount.
+export circuit unshieldedBalanceLt(color: Bytes<32>, amount: Uint<128>): Boolean { return default<Boolean>; }
+// Balance >= amount.
+export circuit unshieldedBalanceGte(color: Bytes<32>, amount: Uint<128>): Boolean { return default<Boolean>; }
+// Balance > amount.
+export circuit unshieldedBalanceGt(color: Bytes<32>, amount: Uint<128>): Boolean { return default<Boolean>; }
+// Balance <= amount.
+export circuit unshieldedBalanceLte(color: Bytes<32>, amount: Uint<128>): Boolean { return default<Boolean>; }
+
+// Circuit-efficient (algebraic) hash.
+export circuit transientHash<T>(value: T): Field { return default<Field>; }
+// Circuit-efficient commitment hiding value under randomness rand.
+export circuit transientCommit<T>(value: T, rand: Field): Field { return default<Field>; }
+// SHA-256-based hash suitable for persistent state.
+export circuit persistentHash<T>(value: T): Bytes<32> { return default<Bytes<32>>; }
+// SHA-256-based commitment hiding value.
+export circuit persistentCommit<T>(value: T, rand: Bytes<32>): Bytes<32> { return default<Bytes<32>>; }
+// Convert a persistent hash to a field element.
+export circuit degradeToTransient(x: Bytes<32>): Field { return default<Field>; }
+// Convert a field element to persistent 32-byte form.
+export circuit upgradeFromTransient(x: Field): Bytes<32> { return default<Bytes<32>>; }
+// X coordinate of a curve point.
+export circuit jubjubPointX(np: JubjubPoint): Field { return default<Field>; }
+// Y coordinate of a curve point.
+export circuit jubjubPointY(np: JubjubPoint): Field { return default<Field>; }
+// Elliptic-curve point addition.
+export circuit ecAdd(a: JubjubPoint, b: JubjubPoint): JubjubPoint { return default<JubjubPoint>; }
+// Scalar multiplication of a point (scalar is Field at 0.31).
+export circuit ecMul(a: JubjubPoint, b: Field): JubjubPoint { return default<JubjubPoint>; }
+// Multiply the primary generator by a scalar.
+export circuit ecMulGenerator(b: Field): JubjubPoint { return default<JubjubPoint>; }
+// Hash an arbitrary value to a curve point.
+export circuit hashToCurve<T>(value: T): JubjubPoint { return default<JubjubPoint>; }
+// Build a point from coordinates.
+export circuit constructJubjubPoint(x: Field, y: Field): JubjubPoint { return default<JubjubPoint>; }
+// The caller's own Zswap coin public key (witness).
+export circuit ownPublicKey(): ZswapCoinPublicKey { return default<ZswapCoinPublicKey>; }
+// Register a Zswap input for the call (witness).
+export circuit createZswapInput(coin: QualifiedShieldedCoinInfo): [] { }
+// Register a Zswap output for the call (witness).
+export circuit createZswapOutput(coin: ShieldedCoinInfo, recipient: Either<ZswapCoinPublicKey, ContractAddress>): [] { }

@@ -1,9 +1,9 @@
 //! Memoized recompute engine (spec Approach A).
 //!
-//! Parse results are cached per file, keyed by a content hash. An edit that
-//! produces identical text is a cache hit; anything else recomputes that
-//! file only. The syntax tree is stored as a `rowan::GreenNode` because
-//! `SyntaxNode` is `!Send` — consumers rebuild a cursor with
+//! Parse results are cached per file, memoized on the VFS content's `Arc<str>`
+//! pointer identity (which changes whenever the content is replaced). Any file
+//! edit recomputes that file only. The syntax tree is stored as a `rowan::GreenNode`
+//! because `SyntaxNode` is `!Send` — consumers rebuild a cursor with
 //! `SyntaxNode::new_root(green)` (cheap).
 
 use std::collections::HashMap;

@@ -57,6 +57,19 @@ impl Client {
         self.notify("initialized", json!({}));
     }
 
+    /// Initialize with an explicit workspace root and client capabilities.
+    pub fn initialize_root(&mut self, root: &lsp_types::Url, caps: Value) {
+        let response = self.request(
+            "initialize",
+            json!({ "capabilities": caps, "rootUri": root }),
+        );
+        assert!(
+            response.get("result").is_some(),
+            "initialize failed: {response}"
+        );
+        self.notify("initialized", json!({}));
+    }
+
     pub fn send(&mut self, msg: Value) {
         let body = msg.to_string();
         write!(self.stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();

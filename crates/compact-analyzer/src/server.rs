@@ -36,6 +36,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         rename_provider: Some(lsp_types::OneOf::Left(true)),
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
         document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+        workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
         ..Default::default()
     };
     let initialize_result = serde_json::json!({
@@ -316,12 +317,44 @@ impl GlobalState {
                     }
                 }
             }
+            "workspace/symbol" => {
+                let result = serde_json::from_value::<lsp_types::WorkspaceSymbolParams>(req.params)
+                    .ok()
+                    .map(|params| self.workspace_symbol_infos(&params.query));
+                self.respond_ok(req.id, result.map(lsp_types::WorkspaceSymbolResponse::Flat));
+            }
             _ => self.respond(Response::new_err(
                 req.id,
                 METHOD_NOT_FOUND,
                 format!("method not supported: {}", req.method),
             )),
         }
+    }
+
+    #[allow(deprecated)] // lsp_types::SymbolInformation::deprecated
+    fn workspace_symbol_infos(&mut self, query: &str) -> Vec<lsp_types::SymbolInformation> {
+        let items = analyzer_ide::workspace_symbols(&mut self.host, query);
+        let mut out = Vec::new();
+        for it in items {
+            let Ok(uri) = Url::from_file_path(self.host.vfs().path(it.file)) else {
+                continue;
+            };
+            let Some(analysis) = self.host.analyze(it.file) else {
+                continue;
+            };
+            out.push(lsp_types::SymbolInformation {
+                name: it.name,
+                kind: symbol_kind_to_lsp(it.kind),
+                tags: None,
+                deprecated: None,
+                location: lsp_types::Location {
+                    uri,
+                    range: lsp_utils::range_to_lsp(&analysis.line_index, it.name_range),
+                },
+                container_name: it.container,
+            });
+        }
+        out
     }
 
     /// (uri, Position) → FilePosition for an OPEN document. Unknown or

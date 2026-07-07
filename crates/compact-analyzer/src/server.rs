@@ -136,11 +136,11 @@ struct GlobalState {
     /// A clone of the connection receiver, used only to test emptiness for
     /// cooperative cancellation (single-threaded — no concurrent consumer).
     // Not yet consumed: wired up by the cancellation task.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     cancel_receiver: crossbeam_channel::Receiver<Message>,
     /// Id counter for server→client requests (e.g. registerCapability).
     // Not yet consumed: wired up by the dynamic-watch-registration task.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     next_request_id: i32,
 }
 

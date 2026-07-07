@@ -184,6 +184,22 @@ impl AnalysisHost {
     pub fn workspace_symbols(&mut self, query: &str) -> Vec<(FileId, u32)> {
         self.workspace.symbols_matching(query)
     }
+
+    /// Discovers and indexes every `.compact` under `roots`. Polls
+    /// `should_continue` before each file so a superseded crawl abandons early.
+    pub fn discover_and_index(
+        &mut self,
+        roots: &[std::path::PathBuf],
+        should_continue: &dyn Fn() -> bool,
+    ) {
+        for path in crate::workspace::discover_compact_files(roots) {
+            if !should_continue() {
+                return;
+            }
+            let file = self.vfs_mut().file_id(&path);
+            self.index_file(file);
+        }
+    }
 }
 
 impl Default for AnalysisHost {

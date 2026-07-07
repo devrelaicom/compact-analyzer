@@ -3,6 +3,7 @@
 //! by `AnalysisHost::index_file`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use crate::FileId;
 
@@ -93,15 +94,81 @@ fn subsequence_ci(needle: &str, haystack: &str) -> bool {
     true
 }
 
+/// Every `*.compact` file under `roots`, gitignore-aware. `require_git(false)`
+/// applies `.gitignore` even outside a git repository (so tests and
+/// not-yet-committed projects behave the same); hidden files/dirs (`.git`,
+/// dotfiles) are skipped by default.
+pub fn discover_compact_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in roots {
+        let walker = ignore::WalkBuilder::new(root).require_git(false).build();
+        for entry in walker.flatten() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && entry.path().extension().and_then(|e| e.to_str()) == Some("compact")
+            {
+                out.push(entry.path().to_path_buf());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use crate::AnalysisHost;
+    use crate::workspace::discover_compact_files;
 
     fn write(dir: &std::path::Path, rel: &str, contents: &str) -> std::path::PathBuf {
         let p = dir.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, contents).unwrap();
         p
+    }
+
+    #[test]
+    fn discover_respects_gitignore_and_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.compact", "circuit a(): Field { return 0; }");
+        write(dir.path(), "note.txt", "not compact");
+        write(
+            dir.path(),
+            "vendored/b.compact",
+            "circuit b(): Field { return 0; }",
+        );
+        write(dir.path(), ".gitignore", "vendored/\n");
+
+        let found = discover_compact_files(&[dir.path().to_path_buf()]);
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_string))
+            .collect();
+        assert!(names.iter().any(|n| n == "a.compact"));
+        assert!(!names.iter().any(|n| n == "b.compact")); // gitignored
+        assert!(!names.iter().any(|n| n == "note.txt")); // wrong extension
+    }
+
+    #[test]
+    fn discover_and_index_populates_and_can_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "one.compact",
+            "circuit one(): Field { return 0; }",
+        );
+        write(
+            dir.path(),
+            "two.compact",
+            "circuit two(): Field { return 0; }",
+        );
+        let mut host = AnalysisHost::new();
+
+        // Cancel immediately: nothing indexed.
+        host.discover_and_index(&[dir.path().to_path_buf()], &|| false);
+        assert!(host.workspace_files().is_empty());
+
+        // Run to completion: both indexed.
+        host.discover_and_index(&[dir.path().to_path_buf()], &|| true);
+        assert_eq!(host.workspace_files().len(), 2);
     }
 
     #[test]

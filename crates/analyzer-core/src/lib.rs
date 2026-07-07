@@ -23,3 +23,4 @@ pub use resolve::{Definition, FilePosition};
 pub use source_path::{find_source_pathname, path_module_name, string_lit_text};
 pub use text_size::{TextRange, TextSize};
 pub use vfs::{FileId, Vfs};
+pub use workspace::discover_compact_files;

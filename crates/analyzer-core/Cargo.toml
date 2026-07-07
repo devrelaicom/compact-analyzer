@@ -14,6 +14,7 @@ compactp_syntax.workspace = true
 compactp_diagnostics.workspace = true
 rowan.workspace = true
 text-size.workspace = true
+ignore.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

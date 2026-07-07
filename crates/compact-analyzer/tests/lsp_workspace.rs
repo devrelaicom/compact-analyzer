@@ -2,7 +2,7 @@
 mod support;
 
 use serde_json::json;
-use support::Client;
+use support::{Client, did_open};
 
 #[test]
 fn workspace_symbol_finds_indexed_declarations() {
@@ -62,5 +62,33 @@ fn watched_file_creation_updates_the_index() {
     let after = client.request("workspace/symbol", json!({ "query": "addedThing" }));
     let after_syms = after["result"].as_array().unwrap();
     assert!(after_syms.iter().any(|s| s["name"] == "addedThing"));
+    client.shutdown();
+}
+
+#[test]
+fn unresolved_import_publishes_an_error_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = lsp_types::Url::from_file_path(dir.path()).unwrap();
+    let mut client = Client::start();
+    client.initialize_root(&root, json!({}));
+
+    let main = dir.path().join("main.compact");
+    let uri = lsp_types::Url::from_file_path(&main).unwrap();
+    did_open(
+        &mut client,
+        &uri,
+        1,
+        "import Missing;\ncircuit m(): Field { return 0; }",
+    );
+
+    let params = client.wait_for_notification("textDocument/publishDiagnostics");
+    let diags = params["diagnostics"].as_array().unwrap();
+    assert!(
+        diags.iter().any(|d| d["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cannot resolve import")),
+        "expected an unresolved-import diagnostic in {diags:?}"
+    );
     client.shutdown();
 }

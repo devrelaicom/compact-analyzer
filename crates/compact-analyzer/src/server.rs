@@ -434,7 +434,8 @@ impl GlobalState {
             params.text_document.version,
         );
         self.open_files.insert(uri, file);
-        self.schedule_diagnostics(file);
+        self.host.index_file(file);
+        self.republish_open_diagnostics();
     }
 
     fn did_change(&mut self, params: DidChangeTextDocumentParams) {
@@ -454,7 +455,8 @@ impl GlobalState {
         self.host
             .vfs_mut()
             .set_overlay(file, change.text, params.text_document.version);
-        self.schedule_diagnostics(file);
+        self.host.index_file(file);
+        self.republish_open_diagnostics();
     }
 
     fn did_close(&mut self, params: DidCloseTextDocumentParams) {
@@ -472,11 +474,6 @@ impl GlobalState {
             diagnostics: vec![],
             version: None,
         });
-    }
-
-    fn schedule_diagnostics(&mut self, file: FileId) {
-        self.pending_diagnostics.insert(file);
-        self.debounce_deadline = Some(Instant::now() + DEBOUNCE);
     }
 
     /// Never-die wrapper around diagnostics publication: parsing and
@@ -524,11 +521,14 @@ impl GlobalState {
             return;
         };
         let version = self.host.vfs().overlay_version(file);
-        let diagnostics = analysis
+        let mut diagnostics: Vec<lsp_types::Diagnostic> = analysis
             .diagnostics
             .iter()
             .map(|d| lsp_utils::diagnostic_to_lsp(d, &analysis.line_index, &uri))
             .collect();
+        for d in self.host.resolution_diagnostics(file) {
+            diagnostics.push(lsp_utils::diagnostic_to_lsp(&d, &analysis.line_index, &uri));
+        }
         self.publish(PublishDiagnosticsParams {
             uri,
             diagnostics,

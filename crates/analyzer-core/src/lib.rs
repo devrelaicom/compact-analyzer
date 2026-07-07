@@ -12,6 +12,7 @@ mod resolve;
 mod source_path;
 pub mod stdlib;
 mod vfs;
+mod workspace;
 
 pub use analysis::{AnalysisHost, FileAnalysis};
 pub use compactp_diagnostics::{Diagnostic, DiagnosticCode, LabeledSpan, Severity};

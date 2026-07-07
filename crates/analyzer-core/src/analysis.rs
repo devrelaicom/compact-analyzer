@@ -12,6 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use compactp_ast::AstNode;
 use compactp_diagnostics::Diagnostic;
 use rowan::GreenNode;
 
@@ -33,6 +34,7 @@ pub struct AnalysisHost {
     cache: HashMap<FileId, (u64, FileAnalysis)>,
     stdlib: Option<FileId>,
     import_search_path: Vec<PathBuf>,
+    workspace: crate::workspace::WorkspaceIndex,
 }
 
 impl AnalysisHost {
@@ -42,6 +44,7 @@ impl AnalysisHost {
             cache: HashMap::new(),
             stdlib: None,
             import_search_path: Vec::new(),
+            workspace: crate::workspace::WorkspaceIndex::default(),
         }
     }
 
@@ -98,6 +101,88 @@ impl AnalysisHost {
         };
         self.cache.insert(file, (hash, analysis.clone()));
         Some(analysis)
+    }
+
+    /// (Re)builds the workspace-index entry for one file: its symbol table and
+    /// its outgoing import/include dependency edges. Reads/parses the file
+    /// (and any freshly-referenced dependency targets) via the VFS. An
+    /// unreadable file is evicted from the index.
+    pub fn index_file(&mut self, file: FileId) {
+        let Some(analysis) = self.analyze(file) else {
+            self.workspace.remove(file);
+            return;
+        };
+        let tree = analysis.item_tree.clone();
+        let root = crate::SyntaxNode::new_root(analysis.green.clone());
+
+        let symbols: Vec<(String, u32)> = tree
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.name.is_empty())
+            .map(|(idx, s)| (s.name.clone(), idx as u32))
+            .collect();
+
+        let from_dir = self.vfs().path(file).parent().map(|d| d.to_path_buf());
+        let search = self.import_search_path();
+        let mut deps = std::collections::BTreeSet::new();
+        if let (Some(from_dir), Some(sf)) = (from_dir, compactp_ast::SourceFile::cast(root.clone()))
+        {
+            for import in sf.imports() {
+                let raw = if let Some(n) = import.name() {
+                    let nm = n.text().to_string();
+                    // Compiler-internal; not a file dependency.
+                    if nm == "CompactStandardLibrary" {
+                        continue;
+                    }
+                    // An in-scope module satisfies the import → no file edge.
+                    if tree
+                        .top_level()
+                        .any(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == nm)
+                    {
+                        continue;
+                    }
+                    nm
+                } else if let Some(p) = import.path() {
+                    crate::string_lit_text(p.text())
+                } else {
+                    continue;
+                };
+                if let Some(path) = crate::find_source_pathname(&from_dir, &search, &raw) {
+                    deps.insert(self.vfs_mut().file_id(&path));
+                }
+            }
+            for inc in sf.includes() {
+                if let Some(tok) = inc.path() {
+                    let raw = crate::string_lit_text(tok.text());
+                    if let Some(path) = crate::find_source_pathname(&from_dir, &search, &raw) {
+                        deps.insert(self.vfs_mut().file_id(&path));
+                    }
+                }
+            }
+        }
+        self.workspace.set_file(file, symbols, deps);
+    }
+
+    /// Evicts a file (deleted on disk) from the workspace index.
+    pub fn remove_workspace_file(&mut self, file: FileId) {
+        self.workspace.remove(file);
+    }
+
+    /// All files currently in the workspace index.
+    pub fn workspace_files(&self) -> Vec<FileId> {
+        self.workspace.files()
+    }
+
+    /// Files that import/include `file` (direct dependents).
+    pub fn dependents_of(&self, file: FileId) -> Vec<FileId> {
+        self.workspace.dependents(file)
+    }
+
+    /// Symbols whose name subsequence-matches `query` (case-insensitive).
+    /// Returns (file, symbol index into that file's ItemTree).
+    pub fn workspace_symbols(&mut self, query: &str) -> Vec<(FileId, u32)> {
+        self.workspace.symbols_matching(query)
     }
 }
 

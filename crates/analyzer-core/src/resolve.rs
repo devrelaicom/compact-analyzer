@@ -1332,7 +1332,11 @@ mod tests {
     }
 
     #[test]
-    fn string_path_imports_resolve_to_none_in_m2a() {
+    fn string_path_import_with_missing_file_is_unresolved() {
+        // `full_host` never writes `./utils` to disk, so this resolves to
+        // None because the import target file doesn't exist — NOT because
+        // string-path imports are unsupported (M2b resolves them like any
+        // other cross-file import; see the M2b tests below).
         let (mut host, pos, _dir) = full_host(
             "import \"./utils\" prefix U_;\n\
              circuit main(): Field { return U_help$0er(); }",

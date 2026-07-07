@@ -74,8 +74,24 @@ pub(crate) fn run() -> anyhow::Result<()> {
         "compact-analyzer: indexing {} workspace root(s)",
         state.workspace_roots.len()
     );
+    // Never-die: index each discovered file under its own catch_unwind so a
+    // single pathological `.compact` file can't unwind through `run()` and
+    // crash the process before the main loop even starts (this crawl runs
+    // before the client sees anything but `initialize`). One bad file is
+    // logged and skipped; the rest of the workspace still gets indexed.
     let roots = state.workspace_roots.clone();
-    state.host.discover_and_index(&roots, &|| true);
+    for path in analyzer_core::discover_compact_files(&roots) {
+        let file = state.host.vfs_mut().file_id(&path);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.host.index_file(file)));
+        if let Err(panic) = result {
+            eprintln!(
+                "compact-analyzer: panic while indexing {}: {}",
+                path.display(),
+                panic_message(panic.as_ref())
+            );
+        }
+    }
     if state.watch_supported {
         state.register_file_watcher();
     }
@@ -138,12 +154,8 @@ struct GlobalState {
     watch_supported: bool,
     /// A clone of the connection receiver, used only to test emptiness for
     /// cooperative cancellation (single-threaded — no concurrent consumer).
-    // Not yet consumed: wired up by the cancellation task.
-    #[allow(dead_code)]
     cancel_receiver: crossbeam_channel::Receiver<Message>,
     /// Id counter for server→client requests (e.g. registerCapability).
-    // Not yet consumed: wired up by the dynamic-watch-registration task.
-    #[allow(dead_code)]
     next_request_id: i32,
 }
 

@@ -79,6 +79,7 @@ fn corpus_smoke_no_panics_no_oob_spans() {
             let pos = FilePosition { file, offset: off };
             if let Some(nav) = analyzer_ide::goto_definition(&mut host, pos) {
                 assert_in_bounds(&mut host, nav.file, nav.name_range, "goto");
+                assert_in_bounds(&mut host, nav.file, nav.full_range, "goto full_range");
             }
             let _ = analyzer_ide::hover(&mut host, pos);
         }

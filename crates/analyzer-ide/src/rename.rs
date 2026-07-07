@@ -243,6 +243,24 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_aborts_rename() {
+        // A resolvable symbol and a valid, non-keyword new name — so
+        // validation and the initial `resolve` succeed — but
+        // `should_continue` returns false, so `find_references_cancellable`
+        // returns `None` inside `rename_cancellable`. That must map to
+        // `Err(RenameError::NotFound)`, not a panic or a spurious `Ok`.
+        let (clean, offset) =
+            fixture::extract("circuit f(ba$0se: Field): Field { return base + base; }");
+        let mut host = AnalysisHost::new();
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/main.compact"));
+        host.vfs_mut().set_overlay(file, clean, 1);
+        let result = rename_cancellable(&mut host, FilePosition { file, offset }, "gg", &|| false);
+        assert_eq!(result, Err(RenameError::NotFound));
+    }
+
+    #[test]
     fn refuses_stdlib_targets() {
         let (clean, offset) = fixture::extract(
             "import CompactStandardLibrary;\ncircuit m(x: Field): Bytes<32> { return persistentHa$0sh<Field>(x); }",

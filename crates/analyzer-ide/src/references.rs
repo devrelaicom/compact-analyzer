@@ -133,6 +133,24 @@ mod tests {
         assert!(refs("circuit f(): Field { return myst$0ery; }", false).is_empty());
     }
 
+    #[test]
+    fn cancellation_abandons_the_scan() {
+        // A resolvable symbol, but `should_continue` returns false before the
+        // first file is scanned — the scan must abandon and answer `None`,
+        // not an (incomplete) `Some(..)`.
+        let source =
+            "circuit f(ba$0se: Field): Field {\n  const a = base + base;\n  return base;\n}";
+        let (clean, offset) = fixture::extract(source);
+        let mut host = AnalysisHost::new();
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/main.compact"));
+        host.vfs_mut().set_overlay(file, clean, 1);
+        let result =
+            find_references_cancellable(&mut host, FilePosition { file, offset }, false, &|| false);
+        assert_eq!(result, None);
+    }
+
     use analyzer_core::TextSize;
 
     #[test]

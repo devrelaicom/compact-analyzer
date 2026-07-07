@@ -103,8 +103,9 @@ impl AnalysisHost {
     }
 
     /// (Re)builds the workspace-index entry for one file: its symbol table and
-    /// its outgoing import/include dependency edges. Reads/parses the file
-    /// (and any freshly-referenced dependency targets) via the VFS. An
+    /// its outgoing import/include dependency edges. Reads/parses `file`
+    /// itself via the VFS; for each import/include target it only interns the
+    /// path (records the target's `FileId`) without reading or parsing it. An
     /// unreadable file is evicted from the index.
     pub fn index_file(&mut self, file: FileId) {
         let Some(analysis) = self.analyze(file) else {

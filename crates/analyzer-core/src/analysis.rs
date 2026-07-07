@@ -7,8 +7,6 @@
 //! `SyntaxNode::new_root(green)` (cheap).
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -31,7 +29,7 @@ pub struct FileAnalysis {
 
 pub struct AnalysisHost {
     vfs: Vfs,
-    cache: HashMap<FileId, (u64, FileAnalysis)>,
+    cache: HashMap<FileId, (usize, FileAnalysis)>,
     stdlib: Option<FileId>,
     import_search_path: Vec<PathBuf>,
     workspace: crate::workspace::WorkspaceIndex,
@@ -82,12 +80,13 @@ impl AnalysisHost {
         self.vfs.generation()
     }
 
-    /// Parses `file`, memoized on content. `None` if the file is unreadable.
+    /// Parses `file`, memoized on the VFS content's `Arc` identity (which
+    /// changes exactly when the content is replaced). `None` if unreadable.
     pub fn analyze(&mut self, file: FileId) -> Option<FileAnalysis> {
         let text = self.vfs.read(file)?;
-        let hash = content_hash(&text);
-        if let Some((cached_hash, analysis)) = self.cache.get(&file)
-            && *cached_hash == hash
+        let key = Arc::as_ptr(&text) as *const u8 as usize;
+        if let Some((cached_key, analysis)) = self.cache.get(&file)
+            && *cached_key == key
         {
             return Some(analysis.clone());
         }
@@ -99,7 +98,7 @@ impl AnalysisHost {
             line_index: Arc::new(LineIndex::new(text)),
             item_tree: Arc::new(ItemTree::extract(&root)),
         };
-        self.cache.insert(file, (hash, analysis.clone()));
+        self.cache.insert(file, (key, analysis.clone()));
         Some(analysis)
     }
 
@@ -167,6 +166,13 @@ impl AnalysisHost {
     /// Evicts a file (deleted on disk) from the workspace index.
     pub fn remove_workspace_file(&mut self, file: FileId) {
         self.workspace.remove(file);
+        self.forget_file(file);
+    }
+
+    /// Drops the cached parse for `file` (e.g. deleted on disk), forcing a
+    /// recompute on next access.
+    pub fn forget_file(&mut self, file: FileId) {
+        self.cache.remove(&file);
     }
 
     /// All files currently in the workspace index.
@@ -206,12 +212,6 @@ impl Default for AnalysisHost {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn content_hash(text: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
 }
 
 #[cfg(test)]
@@ -281,6 +281,20 @@ mod tests {
         assert!(!std::sync::Arc::ptr_eq(
             &before.diagnostics,
             &after.diagnostics
+        ));
+    }
+
+    #[test]
+    fn forget_file_forces_recompute() {
+        let (mut host, file) = host_with("ledger count: Field;");
+        let first = host.analyze(file).unwrap();
+        host.forget_file(file);
+        let second = host.analyze(file).unwrap();
+        // Content is unchanged, but the cache entry was dropped → recomputed →
+        // a fresh diagnostics Arc.
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.diagnostics,
+            &second.diagnostics
         ));
     }
 

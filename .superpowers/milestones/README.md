@@ -13,8 +13,8 @@ that plan supersedes the file here; update the status line and treat the plan as
 | Milestone | Status | Where |
 |---|---|---|
 | M1 — core LSP + real-time syntax diagnostics | **Done** (merged to main 2026-07-06) | plan + errata: `docs/superpowers/plans/2026-07-06-m1-core-lsp-diagnostics.md` |
-| M2a — single-file navigation + stdlib | **Planned, not executed** | plan: `docs/superpowers/plans/2026-07-06-m2a-single-file-navigation.md` |
-| M2b — cross-file resolution + workspace | **Planned, not executed** | plan: `docs/superpowers/plans/2026-07-07-m2b-cross-file-and-workspace.md`; spec: `docs/superpowers/specs/2026-07-07-m2b-cross-file-and-workspace-design.md` |
+| M2a — single-file navigation + stdlib | **Done** (merged to main 2026-07-07) | plan: `docs/superpowers/plans/2026-07-06-m2a-single-file-navigation.md` |
+| M2b — cross-file resolution + workspace | **Done** (merged to main 2026-07-07) | plan + errata: `docs/superpowers/plans/2026-07-07-m2b-cross-file-and-workspace.md`; spec: `docs/superpowers/specs/2026-07-07-m2b-cross-file-and-workspace-design.md` |
 | M3 — completion + CST-derived features | Future | [m3-completion-and-cst-features.md](m3-completion-and-cst-features.md) |
 | M4 — toolchain integration | Future | [m4-toolchain-integration.md](m4-toolchain-integration.md) |
 | M5 — VS Code extension + distribution | Future | [m5-vscode-extension-and-distribution.md](m5-vscode-extension-and-distribution.md) |

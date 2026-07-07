@@ -1016,6 +1016,24 @@ mod tests {
     }
 
     #[test]
+    fn bare_member_access_on_non_enum_item_resolves_to_none() {
+        // Unlike `ledger_adt_methods_resolve_to_none` above (whose trailing
+        // call parens make the parser produce a CALL_EXPR, which routes
+        // through `resolve_name_at` rather than `resolve_member`), this
+        // fixture has NO call parens: `count.foo` parses to a MEMBER_EXPR
+        // whose NAME_EXPR receiver `count` resolves to the `Ledger` item.
+        // This exercises `resolve_member`'s enum-kind guard directly
+        // (verified against compactp's CST: `compactp cst` on this fixture
+        // shows `MEMBER_EXPR` wrapping `NAME_EXPR("count")`, `DOT`,
+        // `IDENT("foo")`, with zero parse diagnostics).
+        let (mut host, pos, _dir) = full_host(
+            "export ledger count: Counter;\n\
+             circuit f(): [] {\n  const c = count.fo$0o;\n}",
+        );
+        assert_eq!(host.resolve(pos), None);
+    }
+
+    #[test]
     fn string_path_imports_resolve_to_none_in_m2a() {
         let (mut host, pos, _dir) = full_host(
             "import \"./utils\" prefix U_;\n\

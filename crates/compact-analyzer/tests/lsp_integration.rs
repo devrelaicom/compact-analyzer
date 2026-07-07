@@ -97,10 +97,9 @@ fn unknown_requests_get_an_error_not_a_crash() {
     client.initialize();
 
     let response = client.request(
-        "textDocument/hover",
+        "textDocument/documentSymbol",
         json!({
             "textDocument": {"uri": uri},
-            "position": {"line": 0, "character": 0},
         }),
     );
     assert!(

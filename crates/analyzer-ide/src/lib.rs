@@ -2,10 +2,12 @@
 //! (`TextSize`/`TextRange`) and `FileId` — zero LSP types.
 
 mod goto_definition;
+mod hover;
 mod references;
 mod rename;
 
 pub use goto_definition::goto_definition;
+pub use hover::{HoverResult, hover};
 pub use references::find_references;
 pub use rename::{RenameError, SourceEdit, rename};
 

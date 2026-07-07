@@ -112,3 +112,23 @@ fn rename_rejects_keyword_and_applies_valid() {
 
     client.shutdown();
 }
+
+#[test]
+fn hover_shows_stdlib_signature() {
+    let mut client = Client::start();
+    client.initialize();
+    let (_dir, uri) = open_fixture(&mut client);
+
+    let (line, col) = lsp_position(NAV_FIXTURE, "persistentHash");
+    let response = client.request(
+        "textDocument/hover",
+        json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+        }),
+    );
+    let value = response["result"]["contents"]["value"].as_str().unwrap();
+    assert!(value.contains("persistentHash"), "{value}");
+
+    client.shutdown();
+}

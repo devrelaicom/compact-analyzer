@@ -33,6 +33,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         definition_provider: Some(lsp_types::OneOf::Left(true)),
         references_provider: Some(lsp_types::OneOf::Left(true)),
         rename_provider: Some(lsp_types::OneOf::Left(true)),
+        hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
         ..Default::default()
     };
     let initialize_result = serde_json::json!({
@@ -186,6 +187,24 @@ impl GlobalState {
                             .iter()
                             .filter_map(|t| lsp_utils::nav_target_to_location(&mut self.host, t))
                             .collect::<Vec<_>>()
+                    });
+                self.respond_ok(req.id, result);
+            }
+            "textDocument/hover" => {
+                let result = serde_json::from_value::<lsp_types::HoverParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let doc = params.text_document_position_params;
+                        let pos =
+                            self.position_to_file_position(&doc.text_document.uri, doc.position)?;
+                        let hover = analyzer_ide::hover(&mut self.host, pos)?;
+                        Some(lsp_types::Hover {
+                            contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
+                                kind: lsp_types::MarkupKind::Markdown,
+                                value: hover.markdown,
+                            }),
+                            range: None,
+                        })
                     });
                 self.respond_ok(req.id, result);
             }

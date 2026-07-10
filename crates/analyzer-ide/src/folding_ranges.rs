@@ -43,19 +43,35 @@ pub fn folding_ranges(host: &mut AnalysisHost, file: FileId) -> Vec<FoldRange> {
 
     // 2. Leading consecutive import/include run (the root is always
     // SOURCE_FILE; children are the top-level items in document order).
+    //
+    // A leading `pragma` (real files typically start with
+    // `pragma language_version >= 0.x;`) is skipped first, THEN the run is
+    // taken as consecutive imports/includes only. A bare
+    // `take_while(IMPORT | INCLUDE | PRAGMA)` would treat PRAGMA as a
+    // permanent pass-through: an *interior* pragma between two imports would
+    // keep the run alive across it (swallowing the pragma line into a
+    // `kind=imports` fold), while starting the `take_while` at child 0 (the
+    // leading pragma itself) would stop the run immediately in the common
+    // case, producing no imports fold at all.
     let import_run: Vec<SyntaxNode> = root
         .children()
-        .take_while(|n| {
-            matches!(n.kind(), SyntaxKind::IMPORT | SyntaxKind::INCLUDE)
-                || n.kind() == SyntaxKind::PRAGMA
-        })
-        .filter(|n| matches!(n.kind(), SyntaxKind::IMPORT | SyntaxKind::INCLUDE))
+        .skip_while(|n| n.kind() == SyntaxKind::PRAGMA)
+        .take_while(|n| matches!(n.kind(), SyntaxKind::IMPORT | SyntaxKind::INCLUDE))
         .collect();
     if let (Some(first), Some(last)) = (import_run.first(), import_run.last())
         && import_run.len() >= 2
     {
+        // An import NODE's `text_range().start()` includes its leading
+        // trivia (whitespace/comments, and — after a leading pragma — the
+        // newline separating it from the pragma line). Anchor on the first
+        // non-trivia token instead so the fold starts at `import`, not at
+        // the preceding trivia. Verified against compactp's CST: for
+        // `pragma p;\nimport A;`, the `IMPORT` node's first child is
+        // `WHITESPACE "\n"`, i.e. `text_range().start()` points one byte
+        // before the `import` keyword.
+        let start = crate::completion::non_trivia_start(first);
         out.push(FoldRange {
-            range: TextRange::new(first.text_range().start(), last.text_range().end()),
+            range: TextRange::new(start, last.text_range().end()),
             kind: FoldKind::Imports,
         });
     }
@@ -106,7 +122,13 @@ fn brace_span(node: &SyntaxNode) -> Option<TextRange> {
             }
         }
     }
-    Some(TextRange::new(open?, close?))
+    // Guard against a malformed/error-recovered node presenting `}` before
+    // `{` (unreachable for well-formed source today, but `folding_ranges` is
+    // an entry point fed by whatever the parser produces, and
+    // `TextRange::new` asserts start <= end and would panic otherwise).
+    let open = open?;
+    let close = close?;
+    (open <= close).then(|| TextRange::new(open, close))
 }
 
 #[cfg(test)]
@@ -142,6 +164,35 @@ mod tests {
         );
         assert!(v.iter().any(|(_, k)| *k == FoldKind::Imports));
         assert!(v.iter().any(|(_, k)| *k == FoldKind::Comment));
+    }
+
+    #[test]
+    fn imports_fold_skips_leading_pragma_and_stops_at_trailing_pragma() {
+        // F1 + F2: a leading `pragma` must not be swallowed into the fold's
+        // start (F2's trivia-anchoring), and a trailing pragma must not
+        // extend the run past the last import (F1's run detector).
+        let v = folds("pragma p;\nimport A;\nimport B;\npragma q;\ncircuit f(): [] { }");
+        let imports: Vec<&(String, FoldKind)> =
+            v.iter().filter(|(_, k)| *k == FoldKind::Imports).collect();
+        assert_eq!(imports.len(), 1, "expected exactly one Imports fold: {v:?}");
+        assert_eq!(imports[0].0, "import A;\nimport B;");
+    }
+
+    #[test]
+    fn interior_pragma_splits_the_import_run() {
+        // F1: an interior pragma between two imports must not keep the
+        // leading-run detector alive across it. The old
+        // `take_while(IMPORT|INCLUDE|PRAGMA)` treated PRAGMA as a permanent
+        // pass-through, so this fixture used to fold `import A;` through
+        // `import B;`, swallowing `pragma foo;` into a `kind=imports` fold.
+        // After the fix the run stops at the interior pragma, leaving a
+        // single-import run that's below the `>= 2` threshold, so no
+        // Imports fold is emitted at all.
+        let v = folds("import A;\npragma foo;\nimport B;\ncircuit f(): [] { }");
+        assert!(
+            !v.iter().any(|(_, k)| *k == FoldKind::Imports),
+            "a single leading import (run broken by the interior pragma) must not fold: {v:?}"
+        );
     }
 
     #[test]

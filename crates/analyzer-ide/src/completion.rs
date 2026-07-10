@@ -292,21 +292,179 @@ fn in_block_body(root: &SyntaxNode, offset: TextSize) -> bool {
     start.is_some_and(|n| n.ancestors().any(|a| a.kind() == SyntaxKind::BLOCK))
 }
 
-// Task 4/5 fill these; declared here so `completion` compiles now.
 fn push_scope_and_items(
-    _host: &mut AnalysisHost,
-    _pos: FilePosition,
-    _root: &SyntaxNode,
-    _items: &mut Vec<CompletionItem>,
+    host: &mut AnalysisHost,
+    pos: FilePosition,
+    root: &SyntaxNode,
+    items: &mut Vec<CompletionItem>,
 ) {
+    // Locals (params, consts, loop vars, lambda params, generics) — nearest
+    // wins; dedup by name.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for b in analyzer_core::scope_bindings_at(root, pos.offset) {
+        if seen.insert(b.name.clone()) {
+            items.push(CompletionItem {
+                label: b.name,
+                kind: local_kind(&b.detail),
+                detail: Some(b.detail),
+                documentation: None,
+            });
+        }
+    }
+    push_file_items(host, pos.file, items, ItemFilter::Value);
+    push_imported_items(host, pos.file, root, items, ItemFilter::Value);
 }
+
 fn push_type_items(
-    _host: &mut AnalysisHost,
-    _pos: FilePosition,
-    _root: &SyntaxNode,
-    _items: &mut Vec<CompletionItem>,
+    host: &mut AnalysisHost,
+    pos: FilePosition,
+    root: &SyntaxNode,
+    items: &mut Vec<CompletionItem>,
 ) {
+    // In-scope generic type params.
+    for b in analyzer_core::scope_bindings_at(root, pos.offset) {
+        if b.detail.starts_with("generic ") {
+            items.push(CompletionItem {
+                label: b.name,
+                kind: CompletionKind::Generic,
+                detail: Some(b.detail),
+                documentation: None,
+            });
+        }
+    }
+    push_file_items(host, pos.file, items, ItemFilter::Type);
+    push_imported_items(host, pos.file, root, items, ItemFilter::Type);
 }
+
+#[derive(Clone, Copy)]
+enum ItemFilter {
+    Value,
+    Type,
+}
+
+fn item_matches(kind: analyzer_core::SymbolKind, filter: ItemFilter) -> bool {
+    use analyzer_core::SymbolKind as K;
+    match filter {
+        ItemFilter::Value => matches!(
+            kind,
+            K::Circuit | K::CircuitSig | K::Witness | K::Ledger | K::Module
+        ),
+        ItemFilter::Type => matches!(kind, K::Struct | K::Enum | K::TypeAlias),
+    }
+}
+
+fn kind_of(kind: analyzer_core::SymbolKind) -> CompletionKind {
+    use analyzer_core::SymbolKind as K;
+    match kind {
+        K::Circuit | K::CircuitSig => CompletionKind::Circuit,
+        K::Witness => CompletionKind::Witness,
+        K::Struct => CompletionKind::Struct,
+        K::Enum => CompletionKind::Enum,
+        K::Module => CompletionKind::Module,
+        K::TypeAlias => CompletionKind::TypeAlias,
+        K::Ledger => CompletionKind::LedgerField,
+        _ => CompletionKind::Local,
+    }
+}
+
+fn local_kind(detail: &str) -> CompletionKind {
+    if detail.starts_with("generic ") {
+        CompletionKind::Generic
+    } else if detail.contains(": ") && !detail.starts_with("const ") && !detail.starts_with("for ")
+    {
+        CompletionKind::Param
+    } else {
+        CompletionKind::Local
+    }
+}
+
+/// Top-level (and enclosing-module) items of `file` matching `filter`.
+fn push_file_items(
+    host: &mut AnalysisHost,
+    file: analyzer_core::FileId,
+    items: &mut Vec<CompletionItem>,
+    filter: ItemFilter,
+) {
+    let Some(analysis) = host.analyze(file) else {
+        return;
+    };
+    let tree = analysis.item_tree.clone();
+    for (_, sym) in tree.top_level() {
+        if sym.name.is_empty() || !item_matches(sym.kind, filter) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: sym.name.clone(),
+            kind: kind_of(sym.kind),
+            detail: Some(sym.signature.clone()),
+            documentation: sym.doc.clone(),
+        });
+    }
+}
+
+/// Names brought in by imports (stdlib exports; in-scope-module members).
+fn push_imported_items(
+    host: &mut AnalysisHost,
+    file: analyzer_core::FileId,
+    root: &SyntaxNode,
+    items: &mut Vec<CompletionItem>,
+    filter: ItemFilter,
+) {
+    let Some(sf) = compactp_ast::SourceFile::cast(root.clone()) else {
+        return;
+    };
+    for import in sf.imports() {
+        match import.name() {
+            Some(t) if t.text() == "CompactStandardLibrary" => {
+                let Some(std_file) = host.stdlib_file() else {
+                    continue;
+                };
+                let Some(analysis) = host.analyze(std_file) else {
+                    continue;
+                };
+                let tree = analysis.item_tree.clone();
+                for (_, sym) in tree.top_level() {
+                    if !sym.exported || sym.name.is_empty() || !item_matches(sym.kind, filter) {
+                        continue;
+                    }
+                    items.push(CompletionItem {
+                        label: sym.name.clone(),
+                        kind: CompletionKind::StdlibItem,
+                        detail: Some(sym.signature.clone()),
+                        documentation: sym.doc.clone(),
+                    });
+                }
+            }
+            Some(t) => {
+                // In-scope module: offer its exported members (no prefix/alias
+                // rewriting in M3 — labels are the plain member names; a
+                // prefixed import still resolves the plain member via M2).
+                let module_name = t.text().to_string();
+                let Some(analysis) = host.analyze(file) else {
+                    continue;
+                };
+                let tree = analysis.item_tree.clone();
+                if let Some((midx, _)) = tree.top_level().find(|(_, s)| {
+                    s.kind == analyzer_core::SymbolKind::Module && s.name == module_name
+                }) {
+                    for (_, sym) in tree.children_of(midx) {
+                        if !sym.exported || sym.name.is_empty() || !item_matches(sym.kind, filter) {
+                            continue;
+                        }
+                        items.push(CompletionItem {
+                            label: sym.name.clone(),
+                            kind: kind_of(sym.kind),
+                            detail: Some(sym.signature.clone()),
+                            documentation: sym.doc.clone(),
+                        });
+                    }
+                }
+            }
+            None => {} // string-path imports: cross-file member enumeration deferred (see Self-review)
+        }
+    }
+}
+
 fn push_member(
     _host: &mut AnalysisHost,
     _pos: FilePosition,
@@ -367,5 +525,50 @@ mod tests {
         assert!(ls.contains(&"Field".to_string()));
         assert!(ls.contains(&"Bytes".to_string()));
         assert!(!ls.contains(&"return".to_string()));
+    }
+
+    #[test]
+    fn expr_position_offers_locals_and_items() {
+        let ls = labels(
+            "circuit helper(): Field { return 1; }\n\
+             circuit f(base: Field): Field {\n  const local = 1;\n  return $0\n}",
+        );
+        assert!(ls.contains(&"base".to_string())); // param
+        assert!(ls.contains(&"local".to_string())); // const local
+        assert!(ls.contains(&"helper".to_string())); // sibling circuit
+        assert!(ls.contains(&"f".to_string())); // self
+    }
+
+    #[test]
+    fn expr_position_offers_stdlib_when_imported() {
+        // full_host-style: register stdlib in a tempdir.
+        let (clean, offset) =
+            fixture::extract("import CompactStandardLibrary;\ncircuit f(): Field { return $0 }");
+        let dir = tempfile::tempdir().unwrap();
+        let std_path = analyzer_core::stdlib::materialize(dir.path()).unwrap();
+        let mut host = AnalysisHost::new();
+        host.register_stdlib(&std_path);
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/main.compact"));
+        host.vfs_mut().set_overlay(file, clean, 1);
+        let ls: Vec<String> = completion(&mut host, FilePosition { file, offset })
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert!(ls.contains(&"persistentHash".to_string()));
+    }
+
+    #[test]
+    fn type_position_offers_user_types() {
+        let ls = labels(
+            "struct Point { x: Field; }\nenum Color { red }\n\
+             circuit f(p: $0): Field { return 0; }",
+        );
+        assert!(ls.contains(&"Point".to_string()));
+        assert!(ls.contains(&"Color".to_string()));
+        assert!(ls.contains(&"Field".to_string())); // builtin still there
+        // Not a value-only circuit.
+        assert!(!ls.contains(&"f".to_string()));
     }
 }

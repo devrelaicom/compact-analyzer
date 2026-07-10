@@ -37,3 +37,52 @@ jobs:
         with:
           toolchain: "1.90"
       - run: cargo check --workspace --all-targets --locked
+
+  # Installs the real `compact` CLI and runs the toolchain-gated integration
+  # tests end-to-end (compile-on-save + formatting). The default `test`
+  # matrix above runs WITHOUT the toolchain, so those tests self-skip there
+  # via `Toolchain::discover(None).is_none()`; this is the one job where the
+  # real compiler is exercised as an oracle.
+  toolchain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Official non-interactive installer (cargo-dist generated), verified
+      # by reading the script itself: with no COMPACT_INSTALL_DIR/XDG vars
+      # set (the default GitHub-hosted runner), it installs the `compact`
+      # launcher binary to `$HOME/.local/bin`. The script also auto-appends
+      # that directory to $GITHUB_PATH when it detects it's running in
+      # GitHub Actions; we still add it explicitly below so this job doesn't
+      # depend on that undocumented installer-internal behavior.
+      - name: Install compact CLI
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/midnightntwrk/compact/releases/latest/download/compact-installer.sh | sh
+
+      - name: Add compact CLI to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Pin the compiler to the exact version the gated tests were written
+      # and empirically verified against (compiler 0.31.1 / language
+      # 0.23.0 — see crates/compact-analyzer/tests/lsp_toolchain.rs and
+      # crates/analyzer-toolchain/src/compile.rs), rather than tracking
+      # `compact update`'s unpinned "latest". `compact update <version>` is
+      # documented to accept an exact version and is non-interactive, so
+      # pinning is cleanly supported — this keeps the job deterministic and
+      # immune to a future compiler release (e.g. language 0.24) silently
+      # breaking these fixtures. Bump this version (and the fixtures) as a
+      # deliberate, reviewed change, not as a side effect of upstream drift.
+      - name: Install compact compiler 0.31.1
+        run: compact update 0.31.1
+
+      - name: Verify installed toolchain versions
+        run: |
+          compact --version
+          compact compile --version
+          compact compile --language-version
+          test "$(compact compile --language-version)" = "0.23.0"
+
+      - run: cargo test -p analyzer-toolchain --locked
+      - run: cargo test -p compact-analyzer --test lsp_toolchain --locked

@@ -87,6 +87,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
     ));
     state.workspace_roots = workspace_roots_from_params(&initialize_params);
     state.watch_supported = client_supports_watch(&initialize_params);
+    state.toolchain_config = toolchain_config_from(initialize_params.get("initializationOptions"));
     eprintln!(
         "compact-analyzer: indexing {} workspace root(s)",
         state.workspace_roots.len()
@@ -169,6 +170,9 @@ struct GlobalState {
     workspace_roots: Vec<PathBuf>,
     /// The client supports dynamic `didChangeWatchedFiles` registration.
     watch_supported: bool,
+    /// v1 toolchain configuration surface (design §4): toolchain path,
+    /// compile-on-save, and formatting toggles from `initializationOptions`.
+    toolchain_config: ToolchainConfig,
     /// A clone of the connection receiver, used only to test emptiness for
     /// cooperative cancellation (single-threaded — no concurrent consumer).
     cancel_receiver: crossbeam_channel::Receiver<Message>,
@@ -188,6 +192,7 @@ impl GlobalState {
             pending_diagnostics: HashMap::new(),
             workspace_roots: Vec::new(),
             watch_supported: false,
+            toolchain_config: ToolchainConfig::default(),
             cancel_receiver,
             next_request_id: 0,
         }
@@ -838,6 +843,46 @@ fn workspace_roots_from_params(params: &serde_json::Value) -> Vec<PathBuf> {
     roots
 }
 
+/// v1 toolchain configuration surface (design §4), read from
+/// `initializationOptions`. `toolchain_path`, `compile_on_save`, and
+/// `formatting` are forward-declared here for Tasks 6/7/9, which will read
+/// them; this task only parses and stores them.
+pub(crate) struct ToolchainConfig {
+    #[allow(dead_code)]
+    pub toolchain_path: Option<PathBuf>,
+    #[allow(dead_code)]
+    pub compile_on_save: bool,
+    #[allow(dead_code)]
+    pub formatting: bool,
+}
+
+impl Default for ToolchainConfig {
+    fn default() -> Self {
+        Self {
+            toolchain_path: None,
+            compile_on_save: true,
+            formatting: true,
+        }
+    }
+}
+
+fn toolchain_config_from(options: Option<&serde_json::Value>) -> ToolchainConfig {
+    let mut config = ToolchainConfig::default();
+    let Some(opts) = options else {
+        return config;
+    };
+    if let Some(path) = opts.get("toolchainPath").and_then(|v| v.as_str()) {
+        config.toolchain_path = Some(PathBuf::from(path));
+    }
+    if let Some(flag) = opts.get("compileOnSave").and_then(|v| v.as_bool()) {
+        config.compile_on_save = flag;
+    }
+    if let Some(flag) = opts.get("formatting").and_then(|v| v.as_bool()) {
+        config.formatting = flag;
+    }
+    config
+}
+
 fn import_search_path_from(options: Option<&serde_json::Value>) -> Vec<PathBuf> {
     if let Some(opts) = options
         && let Some(arr) = opts.get("importSearchPath").and_then(|v| v.as_array())
@@ -886,6 +931,31 @@ mod tests {
             import_search_path_from(Some(&opts)),
             vec![PathBuf::from("/libs/x"), PathBuf::from("/libs/y")]
         );
+    }
+
+    #[test]
+    fn toolchain_config_reads_options() {
+        let opts = json!({ "toolchainPath": "/opt/compact", "compileOnSave": false });
+        let config = toolchain_config_from(Some(&opts));
+        assert_eq!(config.toolchain_path, Some(PathBuf::from("/opt/compact")));
+        assert!(!config.compile_on_save);
+        assert!(config.formatting);
+    }
+
+    #[test]
+    fn toolchain_config_defaults_when_options_empty() {
+        let config = toolchain_config_from(Some(&json!({})));
+        assert_eq!(config.toolchain_path, None);
+        assert!(config.compile_on_save);
+        assert!(config.formatting);
+    }
+
+    #[test]
+    fn toolchain_config_defaults_when_options_absent() {
+        let config = toolchain_config_from(None);
+        assert_eq!(config.toolchain_path, None);
+        assert!(config.compile_on_save);
+        assert!(config.formatting);
     }
 
     #[test]

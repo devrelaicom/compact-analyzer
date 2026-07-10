@@ -118,8 +118,7 @@ mod tests {
     // --- Real fixtures, captured 2026-07-10 against `compact 0.5.1`
     // (compiler 0.31.1, language 0.23.0) by compiling deliberately broken
     // `.compact` files with `compact compile --skip-zk --vscode <src>
-    // <scratch>` and pasting the true stderr. See task-2-report.md for the
-    // full capture transcript.
+    // <scratch>` and pasting the true stderr.
 
     #[test]
     fn parses_semantic_error_bad_ledger_adt_method() {
@@ -362,8 +361,8 @@ mod tests {
         // (not a first-whitespace split) so a basename with an interior
         // space survives intact. This is a REAL capture: copying a broken
         // source to `my file.compact` and compiling it with `compact 0.5.1`
-        // yields exactly this stderr verbatim (see task-2-report.md) — the
-        // compiler does emit spaced basenames.
+        // yields exactly this stderr verbatim — the compiler does emit
+        // spaced basenames.
         let stderr =
             "Exception: my file.compact line 4 char 13: unbound identifier undefined_in_util\n";
 

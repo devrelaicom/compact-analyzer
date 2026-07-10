@@ -1,9 +1,9 @@
 //! Runs `compact compile --skip-zk --vscode` on a single source file with a
 //! wall-clock timeout, capturing stderr and classifying the outcome.
 //!
-//! Empirically verified against real `compact 0.5.1` (2026-07-10, see
-//! `task-4-report.md`): exit `0` on success (empty stdout/stderr, scratch
-//! dir populated), exit `255` on a compile error (stderr holds the
+//! Empirically verified against real `compact 0.5.1` (2026-07-10): exit `0`
+//! on success (empty stdout/stderr, scratch dir populated), exit `255` on a
+//! compile error (stderr holds the
 //! `Exception: ...` line — see [`crate::parse`]), exit `1` with a `Usage:`
 //! block on stderr when a required argument (e.g. the scratch dir) is
 //! omitted. `--compact-path <joined>` is accepted and does resolve
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn compact_path_resolves_included_file_in_search_path() {
-        // Empirical confirmation (2026-07-10, task-4-report.md) that
+        // Empirical confirmation (2026-07-10) that
         // `--compact-path` is accepted and actually consulted: without it,
         // this same setup fails with `failed to locate file "util.compact"`.
         let Some(tc) = Toolchain::discover(None) else {

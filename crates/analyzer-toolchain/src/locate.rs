@@ -2,7 +2,7 @@
 //!
 //! `RawCompilerDiagnostic::col` (see [`crate::parse`]) is a 1-based
 //! **Unicode-scalar** column, empirically re-confirmed against real `compact
-//! 0.5.1` output (2026-07-10, see task-3-report.md): a diagnostic whose
+//! 0.5.1` output (2026-07-10): a diagnostic whose
 //! offending token is preceded by a multibyte char (`é`, 2 bytes / 1 scalar)
 //! or an astral char (`😀`, 4 bytes / 2 UTF-16 units / 1 scalar) reports the
 //! *scalar* column in both cases, never the byte column and never the

@@ -4,21 +4,47 @@
 //! panicked request gets an InternalError response and the loop continues.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use analyzer_core::{AnalysisHost, FileId};
+use analyzer_core::{AnalysisHost, FileId, LineIndex, TextRange, TextSize};
+use analyzer_toolchain::{CompileOutcome, CompileStatus, Toolchain};
 use crossbeam_channel::RecvTimeoutError;
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, PublishDiagnosticsParams, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, PublishDiagnosticsParams,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 
 use crate::lsp_utils;
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Wall-clock ceiling on a single compile-on-save invocation (OQ7). Also
+/// bounds worst-case shutdown latency while a compile is literally in flight:
+/// `run()` never joins worker threads, but `io_threads.join()` waits for every
+/// `sender` clone to drop, and an in-flight worker holds one until
+/// `compile_file` returns — which this timeout bounds. No config key.
+const COMPILE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Diagnostics stored per open file. `HashMap` keyed by `FileId` under a
+/// `Mutex`, wrapped in an `Arc` so a compile worker (which cannot touch the
+/// single-threaded `host`) can store its results and the main thread's
+/// `publish_file_diagnostics` can re-merge them.
+type CompilerDiagnostics = Arc<Mutex<HashMap<FileId, Vec<lsp_types::Diagnostic>>>>;
+
+/// Per-file monotonic save generation, used to drop stale compile results
+/// (thread-per-save, superseded workers publish nothing).
+type SaveGenerations = Arc<Mutex<HashMap<FileId, u64>>>;
+
+/// Locks a `Mutex`, recovering the guard even if a previous holder panicked
+/// (never-die: a poisoned lock must not wedge every later compile).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // JSON-RPC error codes (avoid depending on lsp-server exporting them).
 const METHOD_NOT_FOUND: i32 = -32601;
@@ -30,7 +56,18 @@ pub(crate) fn run() -> anyhow::Result<()> {
 
     let (initialize_id, initialize_params) = connection.initialize_start()?;
     let capabilities = ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        // Options form (was `Kind(FULL)`): keeps FULL-document change sync and
+        // additionally advertises `save`, so the client sends `didSave` — the
+        // trigger for compile-on-save. `includeText` is intentionally omitted:
+        // the compiler reads the saved file from disk, not from the payload.
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            lsp_types::TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::FULL),
+                save: Some(lsp_types::TextDocumentSyncSaveOptions::Supported(true)),
+                ..Default::default()
+            },
+        )),
         definition_provider: Some(lsp_types::OneOf::Left(true)),
         references_provider: Some(lsp_types::OneOf::Left(true)),
         rename_provider: Some(lsp_types::OneOf::Left(true)),
@@ -88,6 +125,19 @@ pub(crate) fn run() -> anyhow::Result<()> {
     state.workspace_roots = workspace_roots_from_params(&initialize_params);
     state.watch_supported = client_supports_watch(&initialize_params);
     state.toolchain_config = toolchain_config_from(initialize_params.get("initializationOptions"));
+    // Discover the optional `compact` toolchain once, honoring an explicit
+    // override path. Absence is a first-class state: with no toolchain,
+    // compile-on-save is simply never attempted (a clean no-op, no error spam).
+    state.toolchain = Toolchain::discover(state.toolchain_config.toolchain_path.as_deref());
+    match &state.toolchain {
+        Some(tc) => eprintln!(
+            "compact-analyzer: compact toolchain {} (language {}) at {}",
+            tc.tool_version,
+            tc.language_version,
+            tc.compact_bin.display()
+        ),
+        None => eprintln!("compact-analyzer: no compact toolchain found; compile-on-save disabled"),
+    }
     eprintln!(
         "compact-analyzer: indexing {} workspace root(s)",
         state.workspace_roots.len()
@@ -149,9 +199,13 @@ pub(crate) fn run() -> anyhow::Result<()> {
 
     // `io_threads`'s writer thread only exits once every clone of
     // `connection.sender` is dropped (its receiving iterator ends when the
-    // channel closes). `state` holds a clone, and `connection` holds the
-    // original, so both must be dropped before joining or this blocks
-    // forever.
+    // channel closes). `state` holds a clone, `connection` holds the original,
+    // and each in-flight compile worker holds one too. Signal shutdown first so
+    // workers skip publishing and drop their sender promptly once their compile
+    // returns; then drop our two clones. `io_threads.join()` then blocks only
+    // until the last in-flight worker's `compile_file` returns — bounded by
+    // `COMPILE_TIMEOUT`, so shutdown is never-hang (see that constant's docs).
+    state.shutdown.store(true, Ordering::SeqCst);
     drop(state);
     drop(connection);
     io_threads.join()?;
@@ -173,6 +227,19 @@ struct GlobalState {
     /// v1 toolchain configuration surface (design §4): toolchain path,
     /// compile-on-save, and formatting toggles from `initializationOptions`.
     toolchain_config: ToolchainConfig,
+    /// The discovered `compact` toolchain, or `None` when absent (compile-on-save
+    /// is then a no-op). Cloned into each compile worker.
+    toolchain: Option<Toolchain>,
+    /// Per-file compiler diagnostics, shared with compile workers. Merged into
+    /// the native set by both a worker (on save) and `publish_file_diagnostics`
+    /// (so a debounced native republish doesn't wipe them).
+    compiler_diagnostics: CompilerDiagnostics,
+    /// Per-file save generation; a worker whose captured generation is no longer
+    /// current drops its result (supersession).
+    save_generations: SaveGenerations,
+    /// Set true at teardown so in-flight workers skip publishing and drop their
+    /// `sender` clone promptly (bounded, never-hang shutdown).
+    shutdown: Arc<AtomicBool>,
     /// A clone of the connection receiver, used only to test emptiness for
     /// cooperative cancellation (single-threaded — no concurrent consumer).
     cancel_receiver: crossbeam_channel::Receiver<Message>,
@@ -193,6 +260,10 @@ impl GlobalState {
             workspace_roots: Vec::new(),
             watch_supported: false,
             toolchain_config: ToolchainConfig::default(),
+            toolchain: None,
+            compiler_diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            save_generations: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: Arc::new(AtomicBool::new(false)),
             cancel_receiver,
             next_request_id: 0,
         }
@@ -532,8 +603,14 @@ impl GlobalState {
                     self.did_change_watched_files(params);
                 }
             }
-            // Recognized but irrelevant in M1.
-            "textDocument/didSave" | "initialized" | "$/setTrace" | "$/cancelRequest" => {}
+            "textDocument/didSave" => {
+                if let Ok(params) = serde_json::from_value::<DidSaveTextDocumentParams>(not.params)
+                {
+                    self.did_save(params);
+                }
+            }
+            // Recognized but irrelevant.
+            "initialized" | "$/setTrace" | "$/cancelRequest" => {}
             other => eprintln!("compact-analyzer: ignoring notification {other}"),
         }
     }
@@ -582,11 +659,101 @@ impl GlobalState {
         };
         self.host.vfs_mut().remove_overlay(file);
         self.pending_diagnostics.remove(&file);
+        // Drop any stored compiler diagnostics so they can't resurface on a
+        // later reopen (a stale result merged against fresh native ones).
+        lock(&self.compiler_diagnostics).remove(&file);
         // Clear this document's diagnostics in the editor.
         self.publish(PublishDiagnosticsParams {
             uri: params.text_document.uri,
             diagnostics: vec![],
             version: None,
+        });
+    }
+
+    /// `didSave` (on the MAIN thread): if a toolchain is present and
+    /// compile-on-save is enabled, launch an off-loop compile of the saved
+    /// file and merge its diagnostics with the native ones. All host reads
+    /// (source, line index, native diagnostics, import search path) happen
+    /// here — the worker cannot touch `host` — and are handed to the worker as
+    /// owned, `Send` values.
+    fn did_save(&mut self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
+        // Only compile files the editor actually has open (we have their source).
+        let Some(&file) = self.open_files.get(&uri) else {
+            return;
+        };
+        // Toolchain optionality (hard invariant): no toolchain OR toggle off →
+        // a clean no-op. No error spam, no per-request error.
+        let Some(toolchain) = self.toolchain.clone() else {
+            return;
+        };
+        if !self.toolchain_config.compile_on_save {
+            return;
+        }
+        // didSave compiles the ON-DISK file; a non-file URI has no disk path.
+        let Some(disk_path) = lsp_utils::abs_path_from_uri(&uri) else {
+            return;
+        };
+        // Current in-editor source (for `locate`) + line index (for byte→UTF-16
+        // conversion). Single-threaded main loop, so these are consistent.
+        let Some(source) = self.host.vfs_mut().read(file) else {
+            return;
+        };
+        let Some(analysis) = self.host.analyze(file) else {
+            return;
+        };
+        let line_index = analysis.line_index.clone();
+        // Native diagnostics, computed on the main thread (the worker can't read
+        // `host`): both the parser set and the import/include resolution set,
+        // exactly as `publish_file_diagnostics` builds them.
+        let mut native: Vec<lsp_types::Diagnostic> = analysis
+            .diagnostics
+            .iter()
+            .map(|d| lsp_utils::diagnostic_to_lsp(d, &line_index, &uri))
+            .collect();
+        drop(analysis);
+        for d in self.host.resolution_diagnostics(file) {
+            native.push(lsp_utils::diagnostic_to_lsp(&d, &line_index, &uri));
+        }
+        let search_path = self.host.import_search_path();
+        // Bump this file's save generation under lock; the worker re-checks it
+        // (under the same lock) before storing/publishing, so a stale worker
+        // drops its result and can't clobber a newer one.
+        let generation = {
+            let mut gens = lock(&self.save_generations);
+            let g = gens.entry(file).or_insert(0);
+            *g += 1;
+            *g
+        };
+
+        let job = CompileJob {
+            sender: self.sender.clone(),
+            compiler_diagnostics: Arc::clone(&self.compiler_diagnostics),
+            save_generations: Arc::clone(&self.save_generations),
+            shutdown: Arc::clone(&self.shutdown),
+            toolchain,
+            disk_path,
+            source: source.to_string(),
+            line_index,
+            uri,
+            search_path,
+            native,
+            file,
+            generation,
+        };
+        // Off the main loop. The body has its OWN catch_unwind because it runs
+        // OUTSIDE `dispatch`'s per-message guard: a broken/adversarial compiler
+        // or a panic in position mapping must never crash the server. The
+        // handle is intentionally dropped (never joined) — shutdown is bounded
+        // by the sender-drop mechanism, not by joining workers.
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()));
+            if let Err(panic) = result {
+                eprintln!(
+                    "compact-analyzer: panic in compile worker: {}",
+                    panic_message(panic.as_ref())
+                );
+            }
         });
     }
 
@@ -642,14 +809,21 @@ impl GlobalState {
             return;
         };
         let version = self.host.vfs().overlay_version(file);
-        let mut diagnostics: Vec<lsp_types::Diagnostic> = analysis
+        let mut native: Vec<lsp_types::Diagnostic> = analysis
             .diagnostics
             .iter()
             .map(|d| lsp_utils::diagnostic_to_lsp(d, &analysis.line_index, &uri))
             .collect();
         for d in self.host.resolution_diagnostics(file) {
-            diagnostics.push(lsp_utils::diagnostic_to_lsp(&d, &analysis.line_index, &uri));
+            native.push(lsp_utils::diagnostic_to_lsp(&d, &analysis.line_index, &uri));
         }
+        // Re-merge the file's stored compiler diagnostics (from the last save)
+        // so this debounced NATIVE republish doesn't wipe them.
+        let compiler = lock(&self.compiler_diagnostics)
+            .get(&file)
+            .cloned()
+            .unwrap_or_default();
+        let diagnostics = merge_diagnostics(&native, &compiler);
         self.publish(PublishDiagnosticsParams {
             uri,
             diagnostics,
@@ -729,6 +903,181 @@ impl GlobalState {
             self.pending_diagnostics.insert(f, deadline);
         }
     }
+}
+
+/// One compile-on-save job, moved wholesale into a worker thread. Every field
+/// is owned/`Send`; grouping them into a struct (rather than a 13-argument
+/// function) keeps the spawn site legible and sidesteps `too_many_arguments`.
+struct CompileJob {
+    sender: crossbeam_channel::Sender<Message>,
+    compiler_diagnostics: CompilerDiagnostics,
+    save_generations: SaveGenerations,
+    shutdown: Arc<AtomicBool>,
+    toolchain: Toolchain,
+    disk_path: PathBuf,
+    /// The in-editor source at save time — `locate` maps compiler `(line,col)`
+    /// against this, not against a fresh disk read (they match on save, and
+    /// this keeps position mapping consistent with what the editor shows).
+    source: String,
+    line_index: Arc<LineIndex>,
+    uri: Url,
+    search_path: Vec<PathBuf>,
+    /// Native diagnostics, pre-computed on the main thread.
+    native: Vec<lsp_types::Diagnostic>,
+    file: FileId,
+    generation: u64,
+}
+
+impl CompileJob {
+    /// Runs the compile, then (if still current) stores + publishes the merged
+    /// set. Called inside the worker's own `catch_unwind`. Publishes directly
+    /// via the cloned `sender`, bypassing the main-loop debounce.
+    fn run(self) {
+        // Fresh scratch dir, auto-removed when `scratch` drops at function end.
+        let Ok(scratch) = tempfile::tempdir() else {
+            return; // can't make a scratch dir; nothing actionable to do
+        };
+        let outcome = analyzer_toolchain::compile_file(
+            &self.toolchain,
+            &self.disk_path,
+            scratch.path(),
+            &self.search_path,
+            COMPILE_TIMEOUT,
+        );
+        let compiler =
+            build_compiler_diagnostics(&outcome, &self.source, &self.line_index, &self.disk_path);
+
+        // Supersession + store, atomic w.r.t. `did_save`'s generation bump:
+        // holding `save_generations` across the store means a newer save can't
+        // slip in between "am I current?" and "store my result", so a stale
+        // worker can neither publish nor clobber the stored set.
+        {
+            let gens = lock(&self.save_generations);
+            if gens.get(&self.file).copied() != Some(self.generation) {
+                return; // superseded by a newer save
+            }
+            if self.shutdown.load(Ordering::Acquire) {
+                return; // shutting down; publish nothing, drop the sender
+            }
+            let mut store = lock(&self.compiler_diagnostics);
+            if compiler.is_empty() {
+                store.remove(&self.file);
+            } else {
+                store.insert(self.file, compiler.clone());
+            }
+        }
+
+        // Merge OUTSIDE the locks; never hold a lock across a `send`.
+        let merged = merge_diagnostics(&self.native, &compiler);
+        let params = PublishDiagnosticsParams {
+            uri: self.uri,
+            diagnostics: merged,
+            version: None,
+        };
+        let not = Notification::new("textDocument/publishDiagnostics".to_string(), params);
+        let _ = self.sender.send(Message::Notification(not));
+    }
+}
+
+/// Turns a [`CompileOutcome`] into tagged (`source = "compactc"`) LSP
+/// diagnostics.
+///
+/// - `Ok` → empty (clears any prior compiler set for this file).
+/// - `CompileError` → one squiggle per diagnostic attributable to the saved
+///   file (basename match + a resolvable position); every un-attributable one
+///   (a dependency basename, or an unresolvable position) collapses into a
+///   single generic file-top diagnostic. Exit-255-with-nothing-structured
+///   still yields a generic "compilation failed" so a real failure is never
+///   silently cleared.
+/// - `TimedOut` / `InvocationError` → one generic file-top diagnostic (never
+///   a storm).
+fn build_compiler_diagnostics(
+    outcome: &CompileOutcome,
+    source: &str,
+    line_index: &LineIndex,
+    disk_path: &Path,
+) -> Vec<lsp_types::Diagnostic> {
+    match outcome.status {
+        CompileStatus::Ok => Vec::new(),
+        CompileStatus::CompileError => {
+            let parsed = analyzer_toolchain::parse_compiler_stderr(&outcome.stderr);
+            let saved_basename = disk_path.file_name().and_then(|s| s.to_str());
+            let mut attributed: Vec<lsp_types::Diagnostic> = Vec::new();
+            let mut unattributed: Vec<String> = Vec::new();
+            for d in &parsed.diagnostics {
+                let matches_saved = saved_basename == Some(d.file_basename.as_str());
+                match (
+                    matches_saved,
+                    analyzer_toolchain::locate(source, d.line, d.col),
+                ) {
+                    (true, Some(range)) => attributed.push(lsp_utils::compiler_diagnostic_to_lsp(
+                        range,
+                        d.message.clone(),
+                        line_index,
+                    )),
+                    // Dependency-attributed, or a position that wouldn't resolve
+                    // (line 0 / col 0 / out-of-range line): fold into the generic.
+                    _ => unattributed.push(format!("{} (in {})", d.message, d.file_basename)),
+                }
+            }
+            let mut out = attributed;
+            if !unattributed.is_empty() {
+                out.push(file_top_compiler_diagnostic(
+                    format!("compact: {}", unattributed.join("; ")),
+                    line_index,
+                ));
+            } else if out.is_empty() && !parsed.unparsed.is_empty() {
+                out.push(file_top_compiler_diagnostic(
+                    "compact: could not parse compiler output".to_string(),
+                    line_index,
+                ));
+            }
+            if out.is_empty() {
+                // Exit 255 but nothing structured to show: surface a generic
+                // failure rather than silently clearing diagnostics.
+                out.push(file_top_compiler_diagnostic(
+                    "compact: compilation failed".to_string(),
+                    line_index,
+                ));
+            }
+            out
+        }
+        CompileStatus::TimedOut => vec![file_top_compiler_diagnostic(
+            format!(
+                "compact: compiler timed out after {}s",
+                COMPILE_TIMEOUT.as_secs()
+            ),
+            line_index,
+        )],
+        CompileStatus::InvocationError => vec![file_top_compiler_diagnostic(
+            "compact: compiler unavailable (invocation failed)".to_string(),
+            line_index,
+        )],
+    }
+}
+
+/// A single `source = "compactc"` diagnostic anchored at the top of the file
+/// (zero-width range at offset 0), for compiler output that isn't attributable
+/// to a specific span in the saved file.
+fn file_top_compiler_diagnostic(message: String, line_index: &LineIndex) -> lsp_types::Diagnostic {
+    lsp_utils::compiler_diagnostic_to_lsp(TextRange::empty(TextSize::new(0)), message, line_index)
+}
+
+/// Merges native diagnostics with compiler ones: all native, then every
+/// compiler diagnostic whose `range` does NOT coincide with a native one
+/// (span-coincidence dedup, keep native). Deterministic and order-stable.
+/// Shared by the compile worker and `publish_file_diagnostics`.
+fn merge_diagnostics(
+    native: &[lsp_types::Diagnostic],
+    compiler: &[lsp_types::Diagnostic],
+) -> Vec<lsp_types::Diagnostic> {
+    let mut merged = native.to_vec();
+    for c in compiler {
+        if !native.iter().any(|n| n.range == c.range) {
+            merged.push(c.clone());
+        }
+    }
+    merged
 }
 
 #[allow(deprecated)] // lsp_types::DocumentSymbol::deprecated

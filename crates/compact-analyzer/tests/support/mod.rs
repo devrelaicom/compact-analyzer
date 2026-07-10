@@ -70,6 +70,23 @@ impl Client {
         self.notify("initialized", json!({}));
     }
 
+    /// Initialize with `initializationOptions` (e.g. `{"compileOnSave": true}`)
+    /// and default (empty) client capabilities. Returns the `capabilities`
+    /// object the server advertised, so a test can additionally assert on it.
+    pub fn initialize_with_options(&mut self, options: Value) -> Value {
+        let response = self.request(
+            "initialize",
+            json!({ "capabilities": {}, "initializationOptions": options }),
+        );
+        assert!(
+            response.get("result").is_some(),
+            "initialize failed: {response}"
+        );
+        let capabilities = response["result"]["capabilities"].clone();
+        self.notify("initialized", json!({}));
+        capabilities
+    }
+
     pub fn send(&mut self, msg: Value) {
         let body = msg.to_string();
         write!(self.stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();

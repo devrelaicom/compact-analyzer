@@ -97,6 +97,29 @@ pub(crate) fn diagnostic_to_lsp(
     }
 }
 
+/// Builds an LSP diagnostic for a `compact` compiler error, tagged
+/// `source = "compactc"` (distinct from native `"compact-analyzer"`
+/// diagnostics) and always `ERROR` severity — the `compact` CLI is fail-fast
+/// and only reports genuine compile errors.
+///
+/// Unlike [`diagnostic_to_lsp`], there is no `code` and no related
+/// information: the `--vscode` diagnostic grammar carries only a position and
+/// a message ([`analyzer_toolchain::RawCompilerDiagnostic`]). `range` is the
+/// byte [`TextRange`] already resolved by `analyzer_toolchain::locate`.
+pub(crate) fn compiler_diagnostic_to_lsp(
+    range: TextRange,
+    message: String,
+    li: &LineIndex,
+) -> lsp_types::Diagnostic {
+    lsp_types::Diagnostic {
+        range: range_to_lsp(li, range),
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("compactc".to_string()),
+        message,
+        ..Default::default()
+    }
+}
+
 pub(crate) fn completion_kind_to_lsp(
     kind: analyzer_ide::CompletionKind,
 ) -> lsp_types::CompletionItemKind {
@@ -220,6 +243,24 @@ mod tests {
         assert_eq!(related.len(), 1);
         assert_eq!(related[0].message, "first defined here");
         assert_eq!(related[0].location.range.start, Position::new(0, 7));
+    }
+
+    #[test]
+    fn compiler_diagnostic_is_sourced_compactc_and_error() {
+        let li = LineIndex::new(Arc::from("  round.incremen(1);"));
+        let diag = compiler_diagnostic_to_lsp(
+            TextRange::new(TextSize::new(7), TextSize::new(8)),
+            "operation incremen undefined for ledger field type Counter".to_string(),
+            &li,
+        );
+        assert_eq!(diag.source.as_deref(), Some("compactc"));
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diag.range.start, Position::new(0, 7));
+        assert_eq!(diag.range.end, Position::new(0, 8));
+        assert!(diag.message.contains("incremen"));
+        // No code / related info: the `--vscode` grammar carries neither.
+        assert!(diag.code.is_none());
+        assert!(diag.related_information.is_none());
     }
 
     #[test]

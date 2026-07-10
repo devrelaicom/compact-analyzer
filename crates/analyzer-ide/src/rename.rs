@@ -30,6 +30,7 @@ const KEYWORDS: &[&str] = &[
     "if",
     "import",
     "include",
+    "Integer",
     "ledger",
     "map",
     "module",
@@ -47,6 +48,7 @@ const KEYWORDS: &[&str] = &[
     "true",
     "type",
     "Uint",
+    "Unsigned",
     "Vector",
     "witness",
 ];
@@ -197,6 +199,19 @@ mod tests {
         assert!(matches!(
             try_rename(src, "has space"),
             Err(RenameError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn refuses_unsigned_and_integer_keywords() {
+        let src = "circuit f(ba$0se: Field): Field { return base; }";
+        assert!(matches!(
+            try_rename(src, "Unsigned"),
+            Err(RenameError::Keyword(_))
+        ));
+        assert!(matches!(
+            try_rename(src, "Integer"),
+            Err(RenameError::Keyword(_))
         ));
     }
 

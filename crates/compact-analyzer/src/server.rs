@@ -37,6 +37,8 @@ pub(crate) fn run() -> anyhow::Result<()> {
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
         document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
         workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+        folding_range_provider: Some(lsp_types::FoldingRangeProviderCapability::Simple(true)),
+        selection_range_provider: Some(lsp_types::SelectionRangeProviderCapability::Simple(true)),
         completion_provider: Some(lsp_types::CompletionOptions {
             trigger_characters: Some(vec![".".to_string()]),
             resolve_provider: Some(false),
@@ -395,6 +397,44 @@ impl GlobalState {
                     .map(lsp_types::SemanticTokensResult::Tokens);
                 self.respond_ok(req.id, result);
             }
+            "textDocument/foldingRange" => {
+                let result = serde_json::from_value::<lsp_types::FoldingRangeParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let file = *self.open_files.get(&params.text_document.uri)?;
+                        let li = self.host.analyze(file)?.line_index.clone();
+                        let folds = analyzer_ide::folding_ranges(&mut self.host, file);
+                        Some(
+                            folds
+                                .into_iter()
+                                .filter_map(|f| fold_to_lsp(&li, f))
+                                .collect::<Vec<_>>(),
+                        )
+                    });
+                self.respond_ok(req.id, result);
+            }
+            "textDocument/selectionRange" => {
+                let result = serde_json::from_value::<lsp_types::SelectionRangeParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let file = *self.open_files.get(&params.text_document.uri)?;
+                        let analysis = self.host.analyze(file)?;
+                        let li = analysis.line_index.clone();
+                        let offsets: Vec<analyzer_core::TextSize> = params
+                            .positions
+                            .iter()
+                            .filter_map(|p| lsp_utils::offset_from_position(&li, *p))
+                            .collect();
+                        let chains = analyzer_ide::selection_ranges(&mut self.host, file, &offsets);
+                        Some(
+                            chains
+                                .into_iter()
+                                .filter_map(|chain| build_selection(&li, &chain))
+                                .collect::<Vec<_>>(),
+                        )
+                    });
+                self.respond_ok(req.id, result);
+            }
             "workspace/symbol" => {
                 let result = serde_json::from_value::<lsp_types::WorkspaceSymbolParams>(req.params)
                     .ok()
@@ -724,6 +764,46 @@ fn symbol_kind_to_lsp(kind: analyzer_core::SymbolKind) -> lsp_types::SymbolKind 
         K::ContractCircuit => lsp_types::SymbolKind::METHOD,
         K::Constructor => lsp_types::SymbolKind::CONSTRUCTOR,
     }
+}
+
+/// Byte-range fold → LSP `FoldingRange`; single-line ranges are dropped.
+fn fold_to_lsp(
+    li: &analyzer_core::LineIndex,
+    fold: analyzer_ide::FoldRange,
+) -> Option<lsp_types::FoldingRange> {
+    let start = li.line_col(fold.range.start());
+    let end = li.line_col(fold.range.end());
+    if start.line == end.line {
+        return None;
+    }
+    let kind = match fold.kind {
+        analyzer_ide::FoldKind::Imports => Some(lsp_types::FoldingRangeKind::Imports),
+        analyzer_ide::FoldKind::Comment => Some(lsp_types::FoldingRangeKind::Comment),
+        analyzer_ide::FoldKind::Region => Some(lsp_types::FoldingRangeKind::Region),
+    };
+    Some(lsp_types::FoldingRange {
+        start_line: start.line,
+        start_character: None,
+        end_line: end.line,
+        end_character: None,
+        kind,
+        collapsed_text: None,
+    })
+}
+
+/// Innermost-first byte-range chain → nested LSP `SelectionRange`.
+fn build_selection(
+    li: &analyzer_core::LineIndex,
+    chain: &[analyzer_core::TextRange],
+) -> Option<lsp_types::SelectionRange> {
+    let mut cur: Option<Box<lsp_types::SelectionRange>> = None;
+    for &r in chain.iter().rev() {
+        cur = Some(Box::new(lsp_types::SelectionRange {
+            range: lsp_utils::range_to_lsp(li, r),
+            parent: cur,
+        }));
+    }
+    cur.map(|b| *b)
 }
 
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {

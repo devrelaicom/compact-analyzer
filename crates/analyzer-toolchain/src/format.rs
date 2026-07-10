@@ -49,7 +49,10 @@ pub fn format_source(tc: &Toolchain, text: &str, timeout: Duration) -> Option<St
     let mut command = Command::new(&tc.compact_bin);
     command.arg("format").arg(&path);
 
-    match run_with_timeout(command, timeout) {
+    // `None`: formatting is a synchronous main-thread request, not an
+    // off-main-loop worker, so it does not participate in shutdown
+    // cancellation (see [`crate::process::run_with_timeout`]).
+    match run_with_timeout(command, timeout, None) {
         ProcessResult::Exited { status, .. } if status.success() => {
             std::fs::read_to_string(&path).ok()
         }

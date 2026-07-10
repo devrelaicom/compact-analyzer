@@ -23,11 +23,13 @@ use crate::lsp_utils;
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
 
-/// Wall-clock ceiling on a single compile-on-save invocation (OQ7). Also
-/// bounds worst-case shutdown latency while a compile is literally in flight:
-/// `run()` never joins worker threads, but `io_threads.join()` waits for every
-/// `sender` clone to drop, and an in-flight worker holds one until
-/// `compile_file` returns — which this timeout bounds. No config key.
+/// Wall-clock ceiling on a single compile-on-save invocation (OQ7). Shutdown
+/// latency is deliberately NOT bounded by this (Task 6b / OQ2 FAST-EXIT): the
+/// worker threads `GlobalState.shutdown` into `compile_file` as a cancellation
+/// token, so on teardown an in-flight compile's child process group is killed
+/// within a poll tick and the worker drops its `sender` clone promptly —
+/// `io_threads.join()` returns fast even against a hung/adversarial compiler,
+/// instead of waiting out this timeout. No config key.
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Diagnostics stored per open file. `HashMap` keyed by `FileId` under a
@@ -201,11 +203,14 @@ pub(crate) fn run() -> anyhow::Result<()> {
     // `io_threads`'s writer thread only exits once every clone of
     // `connection.sender` is dropped (its receiving iterator ends when the
     // channel closes). `state` holds a clone, `connection` holds the original,
-    // and each in-flight compile worker holds one too. Signal shutdown first so
-    // workers skip publishing and drop their sender promptly once their compile
-    // returns; then drop our two clones. `io_threads.join()` then blocks only
-    // until the last in-flight worker's `compile_file` returns — bounded by
-    // `COMPILE_TIMEOUT`, so shutdown is never-hang (see that constant's docs).
+    // and each in-flight compile worker holds one too. Set the shutdown flag
+    // FIRST: the worker threaded it into `compile_file` as a cancellation
+    // token, so an in-flight compile now observes it within a poll tick, KILLS
+    // its child compiler's whole process group, and returns promptly — the
+    // worker then skips publishing and drops its `sender` clone. Then drop our
+    // two clones. `io_threads.join()` therefore returns within ~a poll tick even
+    // with a hung/adversarial compiler in flight (Task 6b / OQ2 FAST-EXIT), not
+    // bounded by `COMPILE_TIMEOUT`. Still no `worker.join()`.
     state.shutdown.store(true, Ordering::SeqCst);
     drop(state);
     drop(connection);
@@ -1030,12 +1035,18 @@ impl CompileJob {
         let Ok(scratch) = tempfile::tempdir() else {
             return; // can't make a scratch dir; nothing actionable to do
         };
+        // Thread `shutdown` in as the cancellation token: if teardown sets it
+        // while this compile is in flight, `compile_file` kills the child's
+        // process group within a poll tick and returns promptly (rather than
+        // waiting out `COMPILE_TIMEOUT`), so this worker drops its `sender`
+        // clone and `io_threads.join()` returns fast (OQ2 FAST-EXIT).
         let outcome = analyzer_toolchain::compile_file(
             &self.toolchain,
             &self.disk_path,
             scratch.path(),
             &self.search_path,
             COMPILE_TIMEOUT,
+            Some(&*self.shutdown),
         );
         let compiler =
             build_compiler_diagnostics(&outcome, &self.source, &self.line_index, &self.disk_path);
@@ -1174,6 +1185,11 @@ fn build_compiler_diagnostics(
             ),
             line_index,
         )],
+        // Only produced on the shutdown path (the worker passes `shutdown` in as
+        // the cancel token). The result is discarded — `store_if_current` sees
+        // `shutdown` set and drops it — so emit nothing rather than a spurious
+        // squiggle that would never be published anyway.
+        CompileStatus::Cancelled => Vec::new(),
         CompileStatus::InvocationError => vec![file_top_compiler_diagnostic(
             "compact: compiler unavailable (invocation failed)".to_string(),
             line_index,

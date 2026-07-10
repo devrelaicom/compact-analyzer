@@ -43,6 +43,7 @@
 
 use std::io::Read;
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -78,6 +79,12 @@ pub(crate) enum ProcessResult {
     /// and reaped. `stderr` holds whatever partial output it had produced
     /// before being killed.
     TimedOut { stderr: String },
+    /// The caller's cancellation flag (the LSP shutdown token) was observed
+    /// set before the child exited; the *whole process group* was killed and
+    /// reaped, exactly as on the timeout path. `stderr` holds whatever partial
+    /// output was captured before the kill. Distinct from [`ProcessResult::TimedOut`]
+    /// only so the outcome is reported honestly — both kill identically.
+    Cancelled { stderr: String },
     /// `Command::spawn` itself failed (e.g. the binary doesn't exist or
     /// isn't executable). `message` describes the failure.
     SpawnFailed { message: String },
@@ -97,10 +104,24 @@ pub(crate) enum ProcessResult {
 /// child) before reaping it. See the module doc comment for the full
 /// rationale.
 ///
+/// `cancel`, when `Some`, is polled every [`POLL_INTERVAL`] alongside the
+/// exit/deadline checks: the moment it reads `true`, the child's whole process
+/// group is killed and reaped immediately — the same handling as a deadline
+/// overrun, but reported as [`ProcessResult::Cancelled`]. This is how the LSP
+/// binary makes shutdown prompt (its `GlobalState.shutdown` flag becomes the
+/// token) instead of waiting out `timeout` on an in-flight compile. `None`
+/// disables cancellation (the formatting path, a synchronous main-thread
+/// request that never participates in shutdown, passes `None`).
+///
 /// Never panics. Every failure mode — spawn failure, a `try_wait` polling
-/// failure, a deadline overrun, or a reap failure — is reported through
-/// [`ProcessResult`] rather than propagating an error type or unwrapping.
-pub(crate) fn run_with_timeout(mut command: Command, timeout: Duration) -> ProcessResult {
+/// failure, a deadline overrun, a cancellation, or a reap failure — is
+/// reported through [`ProcessResult`] rather than propagating an error type or
+/// unwrapping.
+pub(crate) fn run_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> ProcessResult {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -128,8 +149,8 @@ pub(crate) fn run_with_timeout(mut command: Command, timeout: Duration) -> Proce
     spawn_stdout_drain(child.stdout.take());
     let stderr_rx = spawn_stderr_capture(child.stderr.take());
 
-    let timed_out = poll_until_exit_or_deadline(&mut child, timeout);
-    if timed_out {
+    let outcome = poll_until_exit_or_deadline(&mut child, timeout, cancel);
+    if !matches!(outcome, WaitOutcome::Exited) {
         kill_child_tree(&mut child);
     }
     // Reaps the child (a no-op re-read of the already-known status if it
@@ -139,38 +160,64 @@ pub(crate) fn run_with_timeout(mut command: Command, timeout: Duration) -> Proce
 
     let stderr = stderr_rx.recv_timeout(DRAIN_GRACE).unwrap_or_default();
 
-    if timed_out {
-        return ProcessResult::TimedOut { stderr };
-    }
-
-    match wait_result {
-        Ok(status) => ProcessResult::Exited { status, stderr },
-        Err(err) => ProcessResult::WaitFailed {
-            message: format!("failed to reap child process: {err}"),
-            stderr,
+    match outcome {
+        WaitOutcome::TimedOut => ProcessResult::TimedOut { stderr },
+        WaitOutcome::Cancelled => ProcessResult::Cancelled { stderr },
+        WaitOutcome::Exited => match wait_result {
+            Ok(status) => ProcessResult::Exited { status, stderr },
+            Err(err) => ProcessResult::WaitFailed {
+                message: format!("failed to reap child process: {err}"),
+                stderr,
+            },
         },
     }
 }
 
-/// Polls `child` with `try_wait` until it exits or `timeout` elapses.
+/// Why [`poll_until_exit_or_deadline`] stopped waiting on the child.
+enum WaitOutcome {
+    /// The child exited on its own, before the deadline and before any
+    /// cancellation. The caller reaps it and reports its status.
+    Exited,
+    /// The wall-clock `timeout` elapsed first (or a `try_wait` failure forced
+    /// the same handling). The caller kills the whole process group.
+    TimedOut,
+    /// The caller's `cancel` flag was observed set first. The caller kills the
+    /// whole process group — handled identically to [`WaitOutcome::TimedOut`],
+    /// kept distinct only so the outcome is reported honestly.
+    Cancelled,
+}
+
+/// Polls `child` with `try_wait` until it exits, `timeout` elapses, or (when
+/// `cancel` is `Some`) that flag is observed set.
 ///
-/// Returns `true` if the deadline passed first (the caller kills the
-/// child), `false` if the child exited on its own. A `try_wait` failure
-/// (vanishingly rare — see its docs) is treated the same as a deadline
-/// overrun: the caller's subsequent kill will itself fail harmlessly if the
-/// process is already gone, and `wait()` still reaps it.
-fn poll_until_exit_or_deadline(child: &mut Child, timeout: Duration) -> bool {
+/// `cancel` is checked at the top of every iteration, *before* `try_wait`, so
+/// a flag that becomes `true` is honored within roughly one [`POLL_INTERVAL`]
+/// tick no matter how much of `timeout` remains — that promptness is the whole
+/// point of the hook. A `try_wait` failure (vanishingly rare — see its docs)
+/// is treated the same as a deadline overrun: the caller's subsequent kill
+/// will itself fail harmlessly if the process is already gone, and `wait()`
+/// still reaps it.
+fn poll_until_exit_or_deadline(
+    child: &mut Child,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> WaitOutcome {
     let deadline = Instant::now() + timeout;
     loop {
+        if let Some(flag) = cancel
+            && flag.load(Ordering::Acquire)
+        {
+            return WaitOutcome::Cancelled;
+        }
         match child.try_wait() {
-            Ok(Some(_status)) => return false,
+            Ok(Some(_status)) => return WaitOutcome::Exited,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    return true;
+                    return WaitOutcome::TimedOut;
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
-            Err(_) => return true,
+            Err(_) => return WaitOutcome::TimedOut,
         }
     }
 }

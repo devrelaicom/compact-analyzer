@@ -95,6 +95,80 @@ fn compile_on_save_publishes_merged_compactc_diagnostic() {
     client.shutdown();
 }
 
+/// DoD (OQ2 FAST-EXIT): shutdown must complete PROMPTLY even with a compile
+/// literally in flight against a hung/adversarial compiler. A `compact` shim
+/// answers the version probes `Toolchain::discover` makes at initialize (so the
+/// server accepts it as the toolchain) but SLEEPS on the real compile
+/// invocation — a stand-in for a compiler that never returns. Its 60s sleep far
+/// exceeds both this test's 5s patience AND the server's 30s `COMPILE_TIMEOUT`,
+/// so the server can only exit within the bound if shutdown actively KILLS the
+/// in-flight child (Task 6b): the worker threads `GlobalState.shutdown` into
+/// `compile_file` as a cancel token, the poll loop observes it within a tick,
+/// kills the child's process group, and drops its `sender` so `io_threads.join()`
+/// returns. Without the kill, `io_threads.join()` would block ~30s and
+/// `wait_with_timeout(5s)` would fail. `#[cfg(unix)]` (shell shim + chmod).
+#[cfg(unix)]
+#[test]
+fn shutdown_is_prompt_with_a_hung_compile_in_flight() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let shim_dir = tempfile::tempdir().unwrap();
+    let shim_path = shim_dir.path().join("compact");
+    let script = concat!(
+        "#!/bin/sh\n",
+        "if [ \"$1\" = \"compile\" ] && [ \"$2\" = \"--version\" ]; then echo 9.9.9-shim; exit 0; fi\n",
+        "if [ \"$1\" = \"compile\" ] && [ \"$2\" = \"--language-version\" ]; then echo 0.0.0-shim; exit 0; fi\n",
+        "sleep 60\n",
+    );
+    std::fs::write(&shim_path, script).unwrap();
+    std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut client = Client::start();
+    client.initialize_with_options(json!({
+        "toolchainPath": shim_dir.path().to_str().unwrap(),
+        "compileOnSave": true,
+    }));
+
+    // didSave compiles the ON-DISK file, so the fixture must exist on disk; its
+    // contents are irrelevant (the shim sleeps regardless). Reuse the
+    // compiler-only-error fixture shape already used by the gated tests.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hang.compact");
+    std::fs::write(&path, COMPILER_ONLY_ERROR).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+
+    did_open(&mut client, &uri, 1, COMPILER_ONLY_ERROR);
+    client.notify(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+
+    // Immediately shut down while the compile worker is blocked in the sleeping
+    // shim. `request("shutdown")` returns once the server has replied (it then
+    // blocks for `exit`, which we send next). Time the whole handshake +
+    // teardown + join.
+    let started = Instant::now();
+    client.request("shutdown", Value::Null);
+    client.notify("exit", Value::Null);
+    // `wait_with_timeout` panics (failing the test) if the server hasn't exited
+    // within 5s — the actual DoD bound. Without the cancel-kill it would hang
+    // ~30s here.
+    let status = client.wait_with_timeout(Duration::from_secs(5));
+    let elapsed = started.elapsed();
+
+    assert!(
+        status.success(),
+        "server exited with failure during shutdown-with-compile-in-flight: {status:?}"
+    );
+    eprintln!("shutdown-with-hung-compile-in-flight returned in {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "shutdown took {elapsed:?}; a killed in-flight compile should exit in well under the \
+         5s bound (and far under the shim's 60s sleep / the 30s COMPILE_TIMEOUT)"
+    );
+}
+
 /// A syntax-only file that is opened but never saved must publish only
 /// native (`compact-analyzer`) diagnostics — the compiler is invoked on save,
 /// not on open, so nothing sourced `compactc` may appear. This holds

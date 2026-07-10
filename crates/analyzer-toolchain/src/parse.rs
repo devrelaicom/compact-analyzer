@@ -340,4 +340,44 @@ mod tests {
             "note: something: nested colons here"
         );
     }
+
+    #[test]
+    fn empty_basename_is_unparsed_not_panicking() {
+        // Exercises the `if file_basename.is_empty() { return None; }` guard
+        // directly: a leading space before ` line ` makes the basename an
+        // empty string once split on the marker. Without the guard this
+        // would produce a nonsensical diagnostic with an empty basename;
+        // with it, the whole line falls through to `unparsed`. No panic.
+        let stderr = " line 1 char 1: message";
+
+        let parsed = parse_compiler_stderr(stderr);
+
+        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.unparsed, " line 1 char 1: message");
+    }
+
+    #[test]
+    fn basename_containing_spaces_is_not_truncated() {
+        // The brief's VERIFY item: prove the ` line `/` char ` marker split
+        // (not a first-whitespace split) so a basename with an interior
+        // space survives intact. This is a REAL capture: copying a broken
+        // source to `my file.compact` and compiling it with `compact 0.5.1`
+        // yields exactly this stderr verbatim (see task-2-report.md) — the
+        // compiler does emit spaced basenames.
+        let stderr =
+            "Exception: my file.compact line 4 char 13: unbound identifier undefined_in_util\n";
+
+        let parsed = parse_compiler_stderr(stderr);
+
+        assert_eq!(
+            parsed.diagnostics,
+            vec![RawCompilerDiagnostic {
+                file_basename: "my file.compact".to_string(),
+                line: 4,
+                col: 13,
+                message: "unbound identifier undefined_in_util".to_string(),
+            }]
+        );
+        assert_eq!(parsed.unparsed, "");
+    }
 }

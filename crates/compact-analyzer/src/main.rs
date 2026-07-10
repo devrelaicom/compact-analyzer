@@ -1,4 +1,5 @@
 mod lsp_utils;
+mod semantic_tokens_legend;
 mod server;
 
 fn main() -> anyhow::Result<()> {

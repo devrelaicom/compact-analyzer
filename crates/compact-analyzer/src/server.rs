@@ -42,6 +42,16 @@ pub(crate) fn run() -> anyhow::Result<()> {
             resolve_provider: Some(false),
             ..Default::default()
         }),
+        semantic_tokens_provider: Some(
+            lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
+                lsp_types::SemanticTokensOptions {
+                    work_done_progress_options: Default::default(),
+                    legend: crate::semantic_tokens_legend::legend(),
+                    range: Some(false),
+                    full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+                },
+            ),
+        ),
         ..Default::default()
     };
     let initialize_result = serde_json::json!({
@@ -366,6 +376,23 @@ impl GlobalState {
                             .collect::<Vec<_>>()
                     })
                     .map(lsp_types::CompletionResponse::Array);
+                self.respond_ok(req.id, result);
+            }
+            "textDocument/semanticTokens/full" => {
+                let result = serde_json::from_value::<lsp_types::SemanticTokensParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let file = *self.open_files.get(&params.text_document.uri)?;
+                        let li = self.host.analyze(file)?.line_index.clone();
+                        let tokens = analyzer_ide::semantic_tokens(&mut self.host, file);
+                        Some(lsp_types::SemanticTokens {
+                            result_id: None,
+                            data: crate::semantic_tokens_legend::encode_semantic_tokens(
+                                &tokens, &li,
+                            ),
+                        })
+                    })
+                    .map(lsp_types::SemanticTokensResult::Tokens);
                 self.respond_ok(req.id, result);
             }
             "workspace/symbol" => {

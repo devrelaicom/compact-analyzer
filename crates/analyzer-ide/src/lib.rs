@@ -8,6 +8,7 @@ mod goto_definition;
 mod hover;
 mod references;
 mod rename;
+mod selection_ranges;
 mod semantic_tokens;
 mod workspace_symbols;
 
@@ -18,6 +19,7 @@ pub use goto_definition::goto_definition;
 pub use hover::{HoverResult, hover};
 pub use references::{find_references, find_references_cancellable};
 pub use rename::{RenameError, SourceEdit, rename, rename_cancellable};
+pub use selection_ranges::selection_ranges;
 pub use semantic_tokens::{SemToken, TokenMods, TokenType, semantic_tokens};
 pub use workspace_symbols::{WorkspaceSymbolItem, workspace_symbols};
 

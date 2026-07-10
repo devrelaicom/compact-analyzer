@@ -155,7 +155,7 @@ fn shutdown_is_prompt_with_a_hung_compile_in_flight() {
     client.notify("exit", Value::Null);
     // `wait_with_timeout` panics (failing the test) if the server hasn't exited
     // within 5s — the actual DoD bound. Without the cancel-kill it would hang
-    // ~30s here.
+    // ~8s here (min of the shim's 8s sleep and the 30s COMPILE_TIMEOUT).
     let status = client.wait_with_timeout(Duration::from_secs(5));
     let elapsed = started.elapsed();
 

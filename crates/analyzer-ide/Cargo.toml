@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 analyzer-core.workspace = true
+compactp_ast.workspace = true
+rowan.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

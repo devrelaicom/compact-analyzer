@@ -38,6 +38,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "analyzer-toolchain"
+version = "0.1.0"
+dependencies = [
+ "analyzer-core",
+ "compactp_parser",
+ "tempfile",
+ "text-size",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"

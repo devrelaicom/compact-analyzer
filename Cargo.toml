@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/analyzer-core",
     "crates/analyzer-ide",
+    "crates/analyzer-toolchain",
     "crates/compact-analyzer",
 ]
 
@@ -39,3 +40,4 @@ ignore = "0.4"
 # internal
 analyzer-core = { path = "crates/analyzer-core" }
 analyzer-ide = { path = "crates/analyzer-ide" }
+analyzer-toolchain = { path = "crates/analyzer-toolchain" }

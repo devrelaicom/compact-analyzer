@@ -1,0 +1,17 @@
+[package]
+name = "analyzer-toolchain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+analyzer-core.workspace = true
+text-size.workspace = true
+compactp_parser.workspace = true
+# SyntaxNode/SyntaxKind come via analyzer-core's re-exports (M3 convention,
+# as analyzer-ide does) — no direct compactp_syntax dep.
+# tempfile is a RUNTIME dep: format_source round-trips through a temp file.
+tempfile.workspace = true

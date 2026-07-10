@@ -76,6 +76,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
         folding_range_provider: Some(lsp_types::FoldingRangeProviderCapability::Simple(true)),
         selection_range_provider: Some(lsp_types::SelectionRangeProviderCapability::Simple(true)),
+        document_formatting_provider: Some(lsp_types::OneOf::Left(true)),
         completion_provider: Some(lsp_types::CompletionOptions {
             trigger_characters: Some(vec![".".to_string()]),
             resolve_provider: Some(false),
@@ -511,6 +512,13 @@ impl GlobalState {
                     });
                 self.respond_ok(req.id, result);
             }
+            "textDocument/formatting" => {
+                let result =
+                    serde_json::from_value::<lsp_types::DocumentFormattingParams>(req.params)
+                        .ok()
+                        .and_then(|params| self.format_document(&params.text_document.uri));
+                self.respond_ok(req.id, result);
+            }
             "workspace/symbol" => {
                 let result = serde_json::from_value::<lsp_types::WorkspaceSymbolParams>(req.params)
                     .ok()
@@ -562,6 +570,42 @@ impl GlobalState {
         let analysis = self.host.analyze(file)?;
         let offset = lsp_utils::offset_from_position(&analysis.line_index, position)?;
         Some(analyzer_core::FilePosition { file, offset })
+    }
+
+    /// `textDocument/formatting` (Task 7): format the CURRENT in-editor buffer
+    /// via the real `compact format` compiler and return a single
+    /// whole-document-replace edit.
+    ///
+    /// An unopened/unknown document returns `None` (→ LSP `null`), mirroring
+    /// `position_to_file_position`'s idiom for every other file-scoped
+    /// handler. Once the document resolves, every other outcome — no
+    /// toolchain, the `formatting` toggle off, an already-formatted buffer, or
+    /// a `compact format` failure (syntax error / timeout) — is a clean
+    /// `Some(vec![])`: never an error, never the one-time toolchain-absent
+    /// notice (that wiring is Task 9's deliverable).
+    fn format_document(&mut self, uri: &Url) -> Option<Vec<lsp_types::TextEdit>> {
+        let file = *self.open_files.get(uri)?;
+        let text = self.host.vfs_mut().read(file)?;
+        let line_index = self.host.analyze(file)?.line_index.clone();
+
+        // Toolchain optionality (hard invariant): no toolchain OR the
+        // `formatting` toggle off is a clean no-op, not an error.
+        let Some(toolchain) = self.toolchain.clone() else {
+            return Some(Vec::new());
+        };
+        if !self.toolchain_config.formatting {
+            return Some(Vec::new());
+        }
+
+        match analyzer_toolchain::format_source(&toolchain, &text, COMPILE_TIMEOUT) {
+            Some(formatted) if formatted != *text => Some(vec![lsp_types::TextEdit {
+                range: lsp_utils::whole_document_range(&line_index, &text),
+                new_text: formatted,
+            }]),
+            // Already formatted, or `None` (syntax error / timeout — toolchain
+            // absence was already ruled out above): nothing to change.
+            _ => Some(Vec::new()),
+        }
     }
 
     fn respond_ok<T: serde::Serialize>(&self, id: lsp_server::RequestId, result: T) {
@@ -1244,7 +1288,6 @@ pub(crate) struct ToolchainConfig {
     pub toolchain_path: Option<PathBuf>,
     #[allow(dead_code)]
     pub compile_on_save: bool,
-    #[allow(dead_code)]
     pub formatting: bool,
 }
 

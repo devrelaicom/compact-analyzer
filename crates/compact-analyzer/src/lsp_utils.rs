@@ -2,7 +2,7 @@
 //! UTF-16 protocol types. This module is the ONLY place lsp_types and
 //! analyzer_core types meet.
 
-use analyzer_core::{Diagnostic, LineIndex, Severity, TextRange};
+use analyzer_core::{Diagnostic, LineIndex, Severity, TextRange, TextSize};
 use lsp_types::{
     DiagnosticRelatedInformation, DiagnosticSeverity, Location, NumberOrString, Position, Range,
     Url,
@@ -25,6 +25,15 @@ pub(crate) fn range_to_lsp(li: &LineIndex, range: TextRange) -> Range {
         Position::new(start.line, start.col),
         Position::new(end.line, end.col),
     )
+}
+
+/// The range spanning an entire document — used for whole-document-replace
+/// edits (`textDocument/formatting`, Task 7). `range_to_lsp`/`LineIndex::line_col`
+/// already clamp an out-of-bounds end offset down to the last line/UTF-16
+/// column, so `TextSize::of(text)` (one-past-the-end) needs no bespoke
+/// last-line arithmetic here.
+pub(crate) fn whole_document_range(li: &LineIndex, text: &str) -> Range {
+    range_to_lsp(li, TextRange::new(TextSize::new(0), TextSize::of(text)))
 }
 
 pub(crate) fn offset_from_position(
@@ -197,6 +206,25 @@ mod tests {
         let range = range_to_lsp(&li, TextRange::new(TextSize::new(23), TextSize::new(23)));
         assert_eq!(range.start, Position::new(0, 21));
         assert_eq!(range.end, Position::new(0, 21));
+    }
+
+    #[test]
+    fn whole_document_range_spans_first_to_last_line_and_column() {
+        let text = "circuit f(): Field {\n  return 1;\n}\n";
+        let li = LineIndex::new(Arc::from(text));
+        let range = whole_document_range(&li, text);
+        assert_eq!(range.start, Position::new(0, 0));
+        // Trailing "\n" means the last line (index 3) is empty, at column 0.
+        assert_eq!(range.end, Position::new(3, 0));
+    }
+
+    #[test]
+    fn whole_document_range_ends_mid_last_line_without_trailing_newline() {
+        let text = "export circuit foo(): Field {\n  return 1;\n}";
+        let li = LineIndex::new(Arc::from(text));
+        let range = whole_document_range(&li, text);
+        assert_eq!(range.start, Position::new(0, 0));
+        assert_eq!(range.end, Position::new(2, 1)); // "}" is 1 UTF-16 unit wide
     }
 
     #[test]

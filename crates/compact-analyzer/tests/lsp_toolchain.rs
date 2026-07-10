@@ -1,12 +1,13 @@
-//! Black-box tests for M4 compile-on-save (`didSave` → real `compact`
-//! compiler → merged, tagged diagnostics). The compile-driving test is
-//! **gated**: it is a no-op unless a real `compact` toolchain is discoverable,
-//! because it drives the actual compiler as its oracle.
+//! Black-box tests for M4 toolchain integration: compile-on-save (`didSave` →
+//! real `compact` compiler → merged, tagged diagnostics) and
+//! `textDocument/formatting` (→ real `compact format`). The compiler-driving
+//! tests are **gated**: they are a no-op unless a real `compact` toolchain is
+//! discoverable, because they drive the actual compiler as their oracle.
 
 mod support;
 
 use serde_json::{Value, json};
-use support::{Client, did_open};
+use support::{Client, did_open, temp_doc};
 
 /// A self-contained contract whose ONLY error is a compiler-only semantic
 /// error (`incremen` is a one-letter typo of the `Counter` ADT's `increment`
@@ -132,5 +133,182 @@ fn advertises_text_document_save_capability() {
     assert_eq!(sync["openClose"], json!(true));
     assert_eq!(sync["change"], json!(1)); // TextDocumentSyncKind::FULL
     assert_eq!(sync["save"], json!(true));
+    client.shutdown();
+}
+
+// --- textDocument/formatting (Task 7) ---------------------------------
+
+/// A syntactically valid but unformatted buffer (extra parens/whitespace).
+/// Empirically verified against real `compact 0.5.1` (2026-07-10):
+/// `compact format` rewrites this to exactly `FORMATTED_FIXTURE` below,
+/// exits 0, and is idempotent — the same fixture and behavior documented in
+/// `analyzer-toolchain`'s own `format_source` unit test
+/// (crates/analyzer-toolchain/src/format.rs).
+const UNFORMATTED_FIXTURE: &str = "pragma language_version >= 0.16;\n\n\
+    export circuit foo(   ): Field {\n  return    1;\n}\n";
+
+/// The exact byte-for-byte output `compact format` produces for
+/// `UNFORMATTED_FIXTURE` (captured empirically, see doc comment above).
+const FORMATTED_FIXTURE: &str =
+    "pragma language_version >= 0.16;\n\nexport circuit foo(): Field {\n  return 1;\n}\n";
+
+/// Syntactically broken (unclosed paren before `: Field`). Empirically
+/// verified: `compact format` exits non-zero, writes `"<path>: failed"` to
+/// stderr, and leaves the file untouched.
+const BROKEN_FIXTURE: &str = "pragma language_version >= 0.16;\n\n\
+    export circuit foo(: Field {\n  return 1;\n}\n";
+
+/// Applies a `textDocument/formatting` JSON-RPC result the way a real LSP
+/// client would. The handler only ever returns `null`, `[]`, or a single
+/// whole-document-replace edit (never a sequence of smaller edits), so
+/// "applying" is just taking that edit's `newText` — but this also
+/// independently re-derives the edit's expected range from `original` (rather
+/// than trusting the implementation under test) and asserts it matches.
+fn apply_formatting_result(original: &str, result: &Value) -> String {
+    let edits = match result {
+        Value::Null => return original.to_string(),
+        Value::Array(edits) => edits,
+        other => panic!("expected an array or null formatting result, got {other}"),
+    };
+    if edits.is_empty() {
+        return original.to_string();
+    }
+    assert_eq!(
+        edits.len(),
+        1,
+        "expected a single whole-document TextEdit, got {edits:?}"
+    );
+    let edit = &edits[0];
+    assert_eq!(
+        edit["range"]["start"],
+        json!({ "line": 0, "character": 0 }),
+        "a whole-document edit must start at the top of the file"
+    );
+    let lines: Vec<&str> = original.split('\n').collect();
+    let expected_end_line = (lines.len() - 1) as u32;
+    let expected_end_char = lines.last().unwrap().encode_utf16().count() as u32;
+    assert_eq!(
+        edit["range"]["end"],
+        json!({ "line": expected_end_line, "character": expected_end_char }),
+        "a whole-document edit must end at the original text's last line/column"
+    );
+    edit["newText"].as_str().unwrap().to_string()
+}
+
+fn request_formatting(client: &mut Client, uri: &lsp_types::Url) -> Value {
+    client.request(
+        "textDocument/formatting",
+        json!({
+            "textDocument": { "uri": uri },
+            "options": { "tabSize": 2, "insertSpaces": true },
+        }),
+    )["result"]
+        .clone()
+}
+
+#[test]
+fn formatting_rewrites_unformatted_buffer_to_match_real_compact_format() {
+    if analyzer_toolchain::Toolchain::discover(None).is_none() {
+        eprintln!("compact toolchain not present; skipping gated formatting test");
+        return;
+    }
+
+    let mut client = Client::start();
+    client.initialize_with_options(json!({}));
+    let (_dir, uri) = temp_doc();
+    did_open(&mut client, &uri, 1, UNFORMATTED_FIXTURE);
+
+    let result = request_formatting(&mut client, &uri);
+    let applied = apply_formatting_result(UNFORMATTED_FIXTURE, &result);
+    assert_eq!(
+        applied, FORMATTED_FIXTURE,
+        "formatting should produce exactly what the real `compact format` produces"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn formatting_already_formatted_buffer_returns_no_edits() {
+    if analyzer_toolchain::Toolchain::discover(None).is_none() {
+        eprintln!("compact toolchain not present; skipping gated formatting test");
+        return;
+    }
+
+    let mut client = Client::start();
+    client.initialize_with_options(json!({}));
+    let (_dir, uri) = temp_doc();
+    did_open(&mut client, &uri, 1, FORMATTED_FIXTURE);
+
+    let result = request_formatting(&mut client, &uri);
+    let applied = apply_formatting_result(FORMATTED_FIXTURE, &result);
+    assert_eq!(
+        applied, FORMATTED_FIXTURE,
+        "an already-formatted buffer should be a no-op"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn formatting_broken_buffer_returns_no_edits_without_error() {
+    if analyzer_toolchain::Toolchain::discover(None).is_none() {
+        eprintln!("compact toolchain not present; skipping gated formatting test");
+        return;
+    }
+
+    let mut client = Client::start();
+    client.initialize_with_options(json!({}));
+    let (_dir, uri) = temp_doc();
+    did_open(&mut client, &uri, 1, BROKEN_FIXTURE);
+
+    let response = client.request(
+        "textDocument/formatting",
+        json!({
+            "textDocument": { "uri": uri },
+            "options": { "tabSize": 2, "insertSpaces": true },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "formatting must not error on a broken buffer: {response}"
+    );
+    let applied = apply_formatting_result(BROKEN_FIXTURE, &response["result"]);
+    assert_eq!(
+        applied, BROKEN_FIXTURE,
+        "a syntactically broken buffer should yield no edits"
+    );
+
+    client.shutdown();
+}
+
+/// The server advertises `documentFormattingProvider` (T7) so the client
+/// knows to send `textDocument/formatting` requests. Ungated: capability
+/// advertisement doesn't depend on a real toolchain being present.
+#[test]
+fn advertises_document_formatting_capability() {
+    let mut client = Client::start();
+    let caps = client.initialize_with_options(json!({}));
+    assert_eq!(caps["documentFormattingProvider"], json!(true));
+    client.shutdown();
+}
+
+/// Toolchain optionality (hard invariant): with the `formatting` toggle off,
+/// formatting must be a clean `[]` — never an error, regardless of whether a
+/// real toolchain happens to be installed. Ungated for that reason.
+#[test]
+fn formatting_toggle_off_returns_empty_edits() {
+    let mut client = Client::start();
+    client.initialize_with_options(json!({ "formatting": false }));
+    let (_dir, uri) = temp_doc();
+    did_open(&mut client, &uri, 1, UNFORMATTED_FIXTURE);
+
+    let result = request_formatting(&mut client, &uri);
+    assert_eq!(
+        result,
+        json!([]),
+        "formatting toggle off must return a clean empty edit list"
+    );
+
     client.shutdown();
 }

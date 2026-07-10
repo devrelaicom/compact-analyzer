@@ -23,12 +23,29 @@ pub struct Client {
 
 impl Client {
     pub fn start() -> Client {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_compact-analyzer"))
+        Self::start_with_env(&[])
+    }
+
+    /// Spawns the server like [`Client::start`], but with `env` overriding
+    /// (or adding to) the child's otherwise-inherited environment. Does NOT
+    /// clear the inherited environment first — a wholesale `env_clear()`
+    /// would drop vars like `HOME`/`TMPDIR` the server may need; only the
+    /// listed keys are overridden.
+    ///
+    /// Used to deterministically hide the `compact` toolchain (override
+    /// `PATH` to a directory with no `compact` binary on it) independent of
+    /// whether the host actually has one installed — `Toolchain::discover`
+    /// only scans `PATH` when no `toolchainPath` override is configured.
+    pub fn start_with_env(env: &[(&str, &str)]) -> Client {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_compact-analyzer"));
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("failed to spawn compact-analyzer");
+            .stderr(Stdio::inherit());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("failed to spawn compact-analyzer");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, incoming) = std::sync::mpsc::channel();

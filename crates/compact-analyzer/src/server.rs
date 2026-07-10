@@ -241,6 +241,10 @@ struct GlobalState {
     /// Set true at teardown so in-flight workers skip publishing and drop their
     /// `sender` clone promptly (bounded, never-hang shutdown).
     shutdown: Arc<AtomicBool>,
+    /// Set once the one-time toolchain-absent `window/showMessage` (Task 9)
+    /// has been sent, so a later toolchain-requiring feature use no-ops
+    /// without sending it again. Never reset within a session.
+    toolchain_notice_shown: bool,
     /// A clone of the connection receiver, used only to test emptiness for
     /// cooperative cancellation (single-threaded — no concurrent consumer).
     cancel_receiver: crossbeam_channel::Receiver<Message>,
@@ -265,6 +269,7 @@ impl GlobalState {
             compiler_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             save_generations: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
+            toolchain_notice_shown: false,
             cancel_receiver,
             next_request_id: 0,
         }
@@ -578,24 +583,30 @@ impl GlobalState {
     ///
     /// An unopened/unknown document returns `None` (→ LSP `null`), mirroring
     /// `position_to_file_position`'s idiom for every other file-scoped
-    /// handler. Once the document resolves, every other outcome — no
-    /// toolchain, the `formatting` toggle off, an already-formatted buffer, or
-    /// a `compact format` failure (syntax error / timeout) — is a clean
-    /// `Some(vec![])`: never an error, never the one-time toolchain-absent
-    /// notice (that wiring is Task 9's deliverable).
+    /// handler. The `formatting` toggle is checked BEFORE the toolchain
+    /// (Task 9): toggle-off is a silent no-op (a deliberate disable, no
+    /// notice), while toolchain-absent-but-wanted fires the one-time
+    /// [`GlobalState::notify_toolchain_missing_once`] notice. The text/line-
+    /// index reads are deferred until after both checks so neither no-op path
+    /// pays for them. Every other outcome — an already-formatted buffer, or a
+    /// `compact format` failure (syntax error / timeout) — is a clean
+    /// `Some(vec![])`: never an error.
     fn format_document(&mut self, uri: &Url) -> Option<Vec<lsp_types::TextEdit>> {
         let file = *self.open_files.get(uri)?;
-        let text = self.host.vfs_mut().read(file)?;
-        let line_index = self.host.analyze(file)?.line_index.clone();
 
-        // Toolchain optionality (hard invariant): no toolchain OR the
-        // `formatting` toggle off is a clean no-op, not an error.
-        let Some(toolchain) = self.toolchain.clone() else {
-            return Some(Vec::new());
-        };
+        // Toolchain optionality (hard invariant): the `formatting` toggle off
+        // is a clean no-op, no notice. Toolchain absent while wanted fires
+        // the one-time notice, then no-ops the same way.
         if !self.toolchain_config.formatting {
             return Some(Vec::new());
         }
+        let Some(toolchain) = self.toolchain.clone() else {
+            self.notify_toolchain_missing_once();
+            return Some(Vec::new());
+        };
+
+        let text = self.host.vfs_mut().read(file)?;
+        let line_index = self.host.analyze(file)?.line_index.clone();
 
         match analyzer_toolchain::format_source(&toolchain, &text, COMPILE_TIMEOUT) {
             Some(formatted) if formatted != *text => Some(vec![lsp_types::TextEdit {
@@ -737,14 +748,17 @@ impl GlobalState {
         let Some(&file) = self.open_files.get(&uri) else {
             return;
         };
-        // Toolchain optionality (hard invariant): no toolchain OR toggle off →
-        // a clean no-op. No error spam, no per-request error.
-        let Some(toolchain) = self.toolchain.clone() else {
-            return;
-        };
+        // Toolchain optionality (hard invariant): the `compile_on_save`
+        // toggle off is a clean no-op, no notice (a deliberate disable).
+        // Toolchain absent while wanted fires the one-time notice (Task 9),
+        // then no-ops the same way as before.
         if !self.toolchain_config.compile_on_save {
             return;
         }
+        let Some(toolchain) = self.toolchain.clone() else {
+            self.notify_toolchain_missing_once();
+            return;
+        };
         // didSave compiles the ON-DISK file; a non-file URI has no disk path.
         let Some(disk_path) = lsp_utils::abs_path_from_uri(&uri) else {
             return;
@@ -893,6 +907,30 @@ impl GlobalState {
     fn send_notification<N: lsp_types::notification::Notification>(&self, params: N::Params) {
         let not = Notification::new(N::METHOD.to_string(), params);
         let _ = self.sender.send(Message::Notification(not));
+    }
+
+    /// Sends the one-time `window/showMessage` (INFO) that tells the user how
+    /// to enable toolchain-requiring features — install the `compact` CLI, or
+    /// point `toolchainPath` (in `initializationOptions`) at it — the first
+    /// time a WANTED feature (its toggle on) discovers the toolchain is
+    /// absent. A subsequent call this session is a silent no-op: never more
+    /// than one notice per session, and never for a feature whose toggle is
+    /// off (that path never calls this at all — see `did_save` /
+    /// `format_document`).
+    fn notify_toolchain_missing_once(&mut self) {
+        if self.toolchain_notice_shown {
+            return;
+        }
+        self.toolchain_notice_shown = true;
+        self.send_notification::<lsp_types::notification::ShowMessage>(
+            lsp_types::ShowMessageParams {
+                typ: lsp_types::MessageType::INFO,
+                message: "compact-analyzer: no `compact` toolchain found. Install the Compact \
+                          CLI (`compact`) or set \"toolchainPath\" in initializationOptions to \
+                          enable compile-on-save diagnostics and document formatting."
+                    .to_string(),
+            },
+        );
     }
 
     fn respond(&self, response: Response) {

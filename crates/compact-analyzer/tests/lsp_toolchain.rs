@@ -312,3 +312,103 @@ fn formatting_toggle_off_returns_empty_edits() {
 
     client.shutdown();
 }
+
+// --- One-time toolchain-missing notice (Task 9) ------------------------
+
+/// Sends a `textDocument/formatting` request with a caller-chosen id (NOT
+/// `Client::request`, which silently discards any notification it happens to
+/// read while scanning for the matching response id — exactly the messages
+/// this test needs to inspect) and returns `(response, notifications_seen)`:
+/// every notification observed while waiting for the response, in order.
+///
+/// Because the server's main loop is single-threaded and strictly FIFO, this
+/// also captures whatever an *earlier* queued notification (e.g. a preceding
+/// `didSave`) produced — that notification is fully handled, and anything it
+/// sends is already in the transport, before the server even looks at this
+/// request.
+fn request_formatting_capturing_notifications(
+    client: &mut Client,
+    uri: &lsp_types::Url,
+) -> (Value, Vec<Value>) {
+    const ID: i64 = 9_999_001; // far outside Client's own auto-incrementing id space
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": ID,
+        "method": "textDocument/formatting",
+        "params": {
+            "textDocument": { "uri": uri },
+            "options": { "tabSize": 2, "insertSpaces": true },
+        },
+    }));
+    let mut notifications = Vec::new();
+    loop {
+        let msg = client.recv();
+        if msg.get("id").and_then(Value::as_i64) == Some(ID) {
+            return (msg, notifications);
+        }
+        if msg.get("method").is_some() {
+            notifications.push(msg);
+        }
+    }
+}
+
+/// Never-die / optionality (hard invariant): when a toolchain-requiring
+/// feature is WANTED (its toggle on) but no `compact` toolchain is present,
+/// the server sends exactly ONE `window/showMessage` (INFO) for the whole
+/// session — not one per feature, not one per use — and every feature use
+/// still no-ops cleanly (no error response, no diagnostics storm).
+///
+/// The toolchain is hidden deterministically by scrubbing the child's `PATH`
+/// (via `Client::start_with_env`), independent of whether the host actually
+/// has `compact` installed — `Toolchain::discover(None)` only scans `PATH`.
+/// Ungated: this test needs the toolchain ABSENT, so it runs unconditionally
+/// (including in CI, which has no `compact` on PATH anyway).
+#[test]
+fn toolchain_missing_notice_fires_once_across_did_save_and_formatting() {
+    let empty_path_dir = tempfile::tempdir().unwrap();
+    let mut client = Client::start_with_env(&[("PATH", empty_path_dir.path().to_str().unwrap())]);
+    client.initialize_with_options(json!({ "compileOnSave": true, "formatting": true }));
+
+    let (_dir, uri) = temp_doc();
+    did_open(&mut client, &uri, 1, UNFORMATTED_FIXTURE);
+
+    // First toolchain-requiring feature use: didSave (compile-on-save).
+    client.notify(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+
+    // Second toolchain-requiring feature use: a formatting request. The
+    // capturing helper's response wait also nets whatever the preceding
+    // didSave notification produced (FIFO, single-threaded dispatch).
+    let (response, notifications) = request_formatting_capturing_notifications(&mut client, &uri);
+
+    assert!(
+        response.get("error").is_none(),
+        "formatting must not error when the toolchain is absent: {response:?}"
+    );
+    assert_eq!(
+        response["result"],
+        json!([]),
+        "formatting must still return well-formed (empty) edits when the toolchain is absent"
+    );
+
+    let show_messages: Vec<&Value> = notifications
+        .iter()
+        .filter(|n| n["method"] == "window/showMessage")
+        .collect();
+    assert_eq!(
+        show_messages.len(),
+        1,
+        "expected exactly one window/showMessage across didSave + formatting, got: {notifications:#?}"
+    );
+    let params = &show_messages[0]["params"];
+    assert_eq!(params["type"], json!(3), "MessageType::INFO (3)");
+    let message = params["message"].as_str().unwrap();
+    assert!(
+        message.to_lowercase().contains("compact"),
+        "notice should mention the compact toolchain: {message}"
+    );
+
+    client.shutdown();
+}

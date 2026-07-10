@@ -11,7 +11,9 @@
 //! no-op when no usable toolchain is found.
 
 mod discovery;
+mod locate;
 mod parse;
 
 pub use discovery::Toolchain;
+pub use locate::locate;
 pub use parse::{ParsedStderr, RawCompilerDiagnostic, parse_compiler_stderr};

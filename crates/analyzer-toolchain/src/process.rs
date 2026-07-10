@@ -278,7 +278,10 @@ mod group_kill {
     /// Sends `SIGKILL` to the process group led by `pid`. Per `kill(2)`,
     /// passing a *negative* pid targets the whole group rather than the
     /// single process — this is the mechanism [`super::isolate_process_group`]
-    /// sets each spawned child up for.
+    /// sets each spawned child up for. The negated pgid is computed via
+    /// [`group_signal_target`], which saturates rather than naively negating
+    /// a cast `i32`, so this can never overflow-panic in a debug build even
+    /// for a (real-world impossible) `pid >= 2^31`.
     ///
     /// The return value is ignored: `ESRCH` (the group has already exited —
     /// an expected, harmless race on the timeout path, since the child may
@@ -291,7 +294,41 @@ mod group_kill {
         // POSIX usage (`kill(2)`) that only affects OS-level process
         // signaling, not memory safety.
         unsafe {
-            kill(-(pid as i32), SIGKILL);
+            kill(group_signal_target(pid), SIGKILL);
+        }
+    }
+
+    /// Negated process-group id to pass to `kill(2)`. Saturates a `u32` that
+    /// exceeds `i32::MAX` (impossible for a real OS pid) to `-i32::MAX` so
+    /// the negation can never overflow-panic in a debug build — the naive
+    /// `-(pid as i32)` form panics on overflow for any `pid` whose cast to
+    /// `i32` lands on `i32::MIN` (e.g. `pid == 1 << 31`), since negating
+    /// `i32::MIN` has no representable positive counterpart.
+    fn group_signal_target(pid: u32) -> i32 {
+        -i32::try_from(pid).unwrap_or(i32::MAX)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::group_signal_target;
+
+        #[test]
+        fn group_signal_target_leaves_a_real_pid_unchanged() {
+            assert_eq!(group_signal_target(1234), -1234);
+        }
+
+        #[test]
+        fn group_signal_target_saturates_u32_max_without_panicking() {
+            assert_eq!(group_signal_target(u32::MAX), -i32::MAX);
+        }
+
+        #[test]
+        fn group_signal_target_saturates_the_i32_min_cast_boundary_without_panicking() {
+            // `1 << 31` cast to `i32` reinterprets as `i32::MIN`; negating
+            // that directly overflows and panics in a debug build (the bug
+            // this fn exists to close) — confirm the saturating form
+            // sidesteps it instead.
+            assert_eq!(group_signal_target(1 << 31), -i32::MAX);
         }
     }
 }

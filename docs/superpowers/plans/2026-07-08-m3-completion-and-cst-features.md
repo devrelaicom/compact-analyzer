@@ -3272,7 +3272,9 @@ git commit -m "test(server): corpus smoke exercises completion, tokens, folding,
 
 ## Errata
 
-_(Empty at authoring time. During execution, when a step's own code/fixture/API turns out wrong, fix it empirically, record the correction here with the task number and the root cause, and commit the Errata edit promptly — uncommitted plan edits get reverted by implementer subagents' git operations, as bit M2b.)_
+_(During execution, when a step's own code/fixture/API turns out wrong, fix it empirically, record the correction here with the task number and the root cause, and commit the Errata edit promptly — uncommitted plan edits get reverted by implementer subagents' git operations, as bit M2b.)_
+
+- **E1 (Task 2) — `ledger_field_adt`'s ledger-decl lookup only inspected the *first* `LEDGER_DECL`.** Step 6's code was `root.descendants().filter(|n| n.kind() == LEDGER_DECL).find_map(compactp_ast::LedgerDecl::cast).filter(|d| d.name().is_some_and(|t| t.text_range() == name_range))?`. Because every `LEDGER_DECL` node casts successfully, `find_map(cast)` returns the *first* ledger declaration and stops; the trailing `Option::filter` then only tests whether that first decl's name matches `name_range` — it never searches later decls. So for any file with more than one ledger field, `ledger_field_adt` on a non-first field returned `None`. Caught by the task's own Step-8 test `ledger_field_adt_maps_head_and_implicit_cell`, which asserts the *second* field (`bal: Uint<64>`) maps to `Some("Cell")`: RED `None` vs expected `Some("Cell")`. Root cause: `find_map(cast)` + `Option::filter` is not a search-by-predicate. **Fix:** `root.descendants().filter_map(compactp_ast::LedgerDecl::cast).find(|d| d.name().is_some_and(|t| t.text_range() == name_range))?`. Fixed in commit `b3cd4e1`.
 
 ## Definition of Done
 

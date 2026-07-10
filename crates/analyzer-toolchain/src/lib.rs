@@ -10,10 +10,12 @@
 //! startup, never a build-time one: everything here degrades to `None` /
 //! no-op when no usable toolchain is found.
 
+mod compile;
 mod discovery;
 mod locate;
 mod parse;
 
+pub use compile::{CompileOutcome, CompileStatus, compile_file};
 pub use discovery::Toolchain;
 pub use locate::locate;
 pub use parse::{ParsedStderr, RawCompilerDiagnostic, parse_compiler_stderr};

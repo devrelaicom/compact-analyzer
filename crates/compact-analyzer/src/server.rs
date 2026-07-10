@@ -32,6 +32,17 @@ const DEBOUNCE: Duration = Duration::from_millis(150);
 /// instead of waiting out this timeout. No config key.
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-file cap on published diagnostics (CR-4). `compactp`'s error-recovery
+/// parser can emit hundreds of diagnostics for a single tiny broken file
+/// (observed: 257 for a 60-byte file), and every publish path sends the
+/// merged list over the wire on every re-highlight/republish. Left uncapped,
+/// that wastes bandwidth and floods the editor's problems panel for no
+/// benefit — nobody reads diagnostic #200. 100 is generous enough that a
+/// realistic multi-error file is never truncated in practice, while still
+/// bounding the payload against a genuine recovery-diagnostic explosion. See
+/// [`cap_diagnostics`].
+const MAX_DIAGNOSTICS_PER_FILE: usize = 100;
+
 /// Diagnostics stored per open file. `HashMap` keyed by `FileId` under a
 /// `Mutex`, wrapped in an `Arc` so a compile worker (which cannot touch the
 /// single-threaded `host`) can store its results and the main thread's
@@ -1207,7 +1218,10 @@ fn file_top_compiler_diagnostic(message: String, line_index: &LineIndex) -> lsp_
 /// Merges native diagnostics with compiler ones: all native, then every
 /// compiler diagnostic whose `range` does NOT coincide with a native one
 /// (span-coincidence dedup, keep native). Deterministic and order-stable.
-/// Shared by the compile worker and `publish_file_diagnostics`.
+/// The merged list is then run through [`cap_diagnostics`] before being
+/// returned. Shared by the compile worker (`CompileJob::run`) and
+/// `publish_file_diagnostics` — this is the ONLY place either publish path
+/// builds its payload, so capping here caps both consistently.
 fn merge_diagnostics(
     native: &[lsp_types::Diagnostic],
     compiler: &[lsp_types::Diagnostic],
@@ -1218,7 +1232,40 @@ fn merge_diagnostics(
             merged.push(c.clone());
         }
     }
-    merged
+    cap_diagnostics(merged)
+}
+
+/// Bounds `diagnostics` at [`MAX_DIAGNOSTICS_PER_FILE`]. A list within the cap
+/// is returned unchanged (no note appended). An over-cap list is truncated to
+/// its first `MAX_DIAGNOSTICS_PER_FILE` entries — a pure suffix truncation,
+/// so the kept prefix is never reordered — and the dropped tail is replaced
+/// by exactly one synthetic `INFORMATION`-severity note describing how many
+/// diagnostics were hidden, so the published length is at most
+/// `MAX_DIAGNOSTICS_PER_FILE + 1`. The note is sourced `"compact-analyzer"`
+/// (the existing native diagnostic source — not a new one), so it reads as
+/// this tool's own output rather than another problem with the file, and
+/// sits at a stable, valid zero-width position at the top of the file.
+fn cap_diagnostics(mut diagnostics: Vec<lsp_types::Diagnostic>) -> Vec<lsp_types::Diagnostic> {
+    let total = diagnostics.len();
+    if total <= MAX_DIAGNOSTICS_PER_FILE {
+        return diagnostics;
+    }
+    diagnostics.truncate(MAX_DIAGNOSTICS_PER_FILE);
+    let hidden = total - MAX_DIAGNOSTICS_PER_FILE;
+    diagnostics.push(lsp_types::Diagnostic {
+        range: lsp_types::Range::new(
+            lsp_types::Position::new(0, 0),
+            lsp_types::Position::new(0, 0),
+        ),
+        severity: Some(lsp_types::DiagnosticSeverity::INFORMATION),
+        source: Some("compact-analyzer".to_string()),
+        message: format!(
+            "compact-analyzer: showing the first {MAX_DIAGNOSTICS_PER_FILE} of {total} \
+             diagnostics for this file; {hidden} hidden."
+        ),
+        ..Default::default()
+    });
+    diagnostics
 }
 
 #[allow(deprecated)] // lsp_types::DocumentSymbol::deprecated
@@ -1530,5 +1577,126 @@ mod tests {
         // this close is superseded and reopen sees no stale compiler set.
         assert_eq!(lock(&state.save_generations).get(&file).copied(), Some(4));
         assert!(!lock(&state.compiler_diagnostics).contains_key(&file));
+    }
+
+    // --- Per-file diagnostic cap (CR-4) -------------------------------------
+
+    /// A diagnostic with a distinct range (so ordering/equality checks are
+    /// unambiguous) and a distinct message (so it's obvious which entries
+    /// survived truncation).
+    fn diag_at(line: u32, message: String) -> lsp_types::Diagnostic {
+        lsp_types::Diagnostic {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(line, 0),
+                lsp_types::Position::new(line, 1),
+            ),
+            message,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cap_diagnostics_passes_through_under_cap() {
+        let diags: Vec<_> = (0..10u32).map(|i| diag_at(i, format!("d{i}"))).collect();
+        assert_eq!(
+            cap_diagnostics(diags.clone()),
+            diags,
+            "under the cap: list must pass through unchanged, no note appended"
+        );
+    }
+
+    #[test]
+    fn cap_diagnostics_passes_through_exactly_at_cap() {
+        let diags: Vec<_> = (0..MAX_DIAGNOSTICS_PER_FILE as u32)
+            .map(|i| diag_at(i, format!("d{i}")))
+            .collect();
+        assert_eq!(
+            cap_diagnostics(diags.clone()),
+            diags,
+            "exactly at the cap: list must pass through unchanged, no note appended"
+        );
+    }
+
+    #[test]
+    fn cap_diagnostics_over_cap_truncates_and_appends_one_note() {
+        // Mirrors the reported case: 257 diagnostics for a 60-byte file.
+        let total = 257usize;
+        let diags: Vec<_> = (0..total as u32)
+            .map(|i| diag_at(i, format!("d{i}")))
+            .collect();
+
+        let capped = cap_diagnostics(diags.clone());
+
+        assert_eq!(
+            capped.len(),
+            MAX_DIAGNOSTICS_PER_FILE + 1,
+            "published length must be bounded to MAX_DIAGNOSTICS_PER_FILE + 1 \
+             (the kept prefix plus exactly one truncation note)"
+        );
+        assert_eq!(
+            &capped[..MAX_DIAGNOSTICS_PER_FILE],
+            &diags[..MAX_DIAGNOSTICS_PER_FILE],
+            "the kept prefix must be the original first-N diagnostics, untouched and in order"
+        );
+
+        let note = &capped[MAX_DIAGNOSTICS_PER_FILE];
+        assert_eq!(
+            note.severity,
+            Some(lsp_types::DiagnosticSeverity::INFORMATION),
+            "the note must not read as another problem"
+        );
+        assert_eq!(
+            note.source.as_deref(),
+            Some("compact-analyzer"),
+            "the note must carry the existing native diagnostic source, not a new one"
+        );
+        assert_eq!(
+            note.message,
+            format!(
+                "compact-analyzer: showing the first {MAX_DIAGNOSTICS_PER_FILE} of {total} \
+                 diagnostics for this file; {} hidden.",
+                total - MAX_DIAGNOSTICS_PER_FILE
+            )
+        );
+        assert_eq!(
+            note.range,
+            lsp_types::Range::new(
+                lsp_types::Position::new(0, 0),
+                lsp_types::Position::new(0, 0)
+            ),
+            "the note must sit at a stable, valid position"
+        );
+    }
+
+    #[test]
+    fn merge_diagnostics_caps_the_combined_native_and_compiler_total() {
+        // The reported explosion is in the NATIVE set, but a real file also
+        // carries compiler diagnostics; the cap must bound the MERGED total,
+        // not just one side. Both publish call sites build their payload from
+        // `merge_diagnostics` (`publish_file_diagnostics` and
+        // `CompileJob::run`), so this one test covers both paths.
+        let native: Vec<_> = (0..80u32).map(|i| diag_at(i, format!("n{i}"))).collect();
+        // Distinct range space (80..160) so nothing coincides with `native`
+        // and every compiler diagnostic survives the merge's dedup step.
+        let compiler: Vec<_> = (80..160u32).map(|i| diag_at(i, format!("c{i}"))).collect();
+
+        let merged = merge_diagnostics(&native, &compiler);
+
+        assert_eq!(merged.len(), MAX_DIAGNOSTICS_PER_FILE + 1);
+        assert_eq!(
+            &merged[..80],
+            &native[..],
+            "native diagnostics come first, untouched"
+        );
+        assert_eq!(
+            &merged[80..MAX_DIAGNOSTICS_PER_FILE],
+            &compiler[..MAX_DIAGNOSTICS_PER_FILE - 80],
+            "compiler diagnostics fill the remainder of the kept prefix, in order"
+        );
+        assert_eq!(
+            merged.last().unwrap().source.as_deref(),
+            Some("compact-analyzer"),
+            "the truncation note is appended after the merge"
+        );
     }
 }

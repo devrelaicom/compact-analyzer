@@ -97,6 +97,43 @@ pub(crate) fn diagnostic_to_lsp(
     }
 }
 
+pub(crate) fn completion_kind_to_lsp(
+    kind: analyzer_ide::CompletionKind,
+) -> lsp_types::CompletionItemKind {
+    use analyzer_ide::CompletionKind as K;
+    use lsp_types::CompletionItemKind as L;
+    match kind {
+        K::Keyword => L::KEYWORD,
+        K::Circuit | K::Witness | K::StdlibItem => L::FUNCTION,
+        K::Struct => L::STRUCT,
+        K::StructField => L::FIELD,
+        K::Enum => L::ENUM,
+        K::EnumVariant => L::ENUM_MEMBER,
+        K::Module => L::MODULE,
+        K::TypeAlias => L::INTERFACE,
+        K::LedgerField => L::PROPERTY,
+        K::LedgerMethod => L::METHOD,
+        K::Param | K::Local => L::VARIABLE,
+        K::Generic => L::TYPE_PARAMETER,
+        K::BuiltinType => L::KEYWORD,
+    }
+}
+
+pub(crate) fn completion_item_to_lsp(c: analyzer_ide::CompletionItem) -> lsp_types::CompletionItem {
+    lsp_types::CompletionItem {
+        label: c.label,
+        kind: Some(completion_kind_to_lsp(c.kind)),
+        detail: c.detail,
+        documentation: c.documentation.map(|value| {
+            lsp_types::Documentation::MarkupContent(lsp_types::MarkupContent {
+                kind: lsp_types::MarkupKind::Markdown,
+                value,
+            })
+        }),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

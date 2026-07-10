@@ -37,6 +37,11 @@ pub(crate) fn run() -> anyhow::Result<()> {
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
         document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
         workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+        completion_provider: Some(lsp_types::CompletionOptions {
+            trigger_characters: Some(vec![".".to_string()]),
+            resolve_provider: Some(false),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let initialize_result = serde_json::json!({
@@ -346,6 +351,22 @@ impl GlobalState {
                         self.respond(Response::new_err(req.id, REQUEST_FAILED, err.to_string()))
                     }
                 }
+            }
+            "textDocument/completion" => {
+                let result = serde_json::from_value::<lsp_types::CompletionParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let doc = params.text_document_position;
+                        self.position_to_file_position(&doc.text_document.uri, doc.position)
+                    })
+                    .map(|pos| {
+                        analyzer_ide::completion(&mut self.host, pos)
+                            .into_iter()
+                            .map(lsp_utils::completion_item_to_lsp)
+                            .collect::<Vec<_>>()
+                    })
+                    .map(lsp_types::CompletionResponse::Array);
+                self.respond_ok(req.id, result);
             }
             "workspace/symbol" => {
                 let result = serde_json::from_value::<lsp_types::WorkspaceSymbolParams>(req.params)

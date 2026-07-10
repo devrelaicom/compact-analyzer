@@ -311,7 +311,7 @@ fn push_scope_and_items(
             });
         }
     }
-    push_file_items(host, pos.file, items, ItemFilter::Value);
+    push_file_items(host, pos.file, pos.offset, items, ItemFilter::Value);
     push_imported_items(host, pos.file, root, items, ItemFilter::Value);
 }
 
@@ -332,7 +332,7 @@ fn push_type_items(
             });
         }
     }
-    push_file_items(host, pos.file, items, ItemFilter::Type);
+    push_file_items(host, pos.file, pos.offset, items, ItemFilter::Type);
     push_imported_items(host, pos.file, root, items, ItemFilter::Type);
 }
 
@@ -379,9 +379,15 @@ fn local_kind(detail: &str) -> CompletionKind {
 }
 
 /// Top-level (and enclosing-module) items of `file` matching `filter`.
+///
+/// Mirrors the resolver's `resolve_in_file_scope` (crates/analyzer-core/src/
+/// resolve.rs): inside a module the innermost enclosing module's siblings are
+/// in scope (and — like the resolver's same-file lookup — need *not* be
+/// exported), in addition to the file's top-level items.
 fn push_file_items(
     host: &mut AnalysisHost,
     file: analyzer_core::FileId,
+    offset: analyzer_core::TextSize,
     items: &mut Vec<CompletionItem>,
     filter: ItemFilter,
 ) {
@@ -389,6 +395,20 @@ fn push_file_items(
         return;
     };
     let tree = analysis.item_tree.clone();
+    // Innermost enclosing module's siblings (same-file: no `exported` gate).
+    if let Some(module_idx) = enclosing_module_index(&tree, offset) {
+        for (_, sym) in tree.children_of(module_idx) {
+            if sym.name.is_empty() || !item_matches(sym.kind, filter) {
+                continue;
+            }
+            items.push(CompletionItem {
+                label: sym.name.clone(),
+                kind: kind_of(sym.kind),
+                detail: Some(sym.signature.clone()),
+                documentation: sym.doc.clone(),
+            });
+        }
+    }
     for (_, sym) in tree.top_level() {
         if sym.name.is_empty() || !item_matches(sym.kind, filter) {
             continue;
@@ -400,6 +420,23 @@ fn push_file_items(
             documentation: sym.doc.clone(),
         });
     }
+}
+
+/// Index of the innermost `Module` symbol whose full range contains `offset`,
+/// or `None` at top level. Replicates the resolver's private `enclosing_module`
+/// (modules nest in document order, so the last match is the innermost).
+fn enclosing_module_index(
+    tree: &analyzer_core::ItemTree,
+    offset: analyzer_core::TextSize,
+) -> Option<u32> {
+    tree.symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.kind == analyzer_core::SymbolKind::Module && s.full_range.contains(offset)
+        })
+        .map(|(i, _)| i as u32)
+        .next_back()
 }
 
 /// Names brought in by imports (stdlib exports; in-scope-module members).
@@ -570,5 +607,29 @@ mod tests {
         assert!(ls.contains(&"Field".to_string())); // builtin still there
         // Not a value-only circuit.
         assert!(!ls.contains(&"f".to_string()));
+    }
+
+    #[test]
+    fn expr_position_offers_enclosing_module_siblings() {
+        // Inside module `M`, `helper` (a non-exported sibling) is in scope and
+        // must be offered — mirroring the resolver's `resolve_in_file_scope`.
+        // `hidden`, a child of a *non-enclosing* module `N`, must NOT be.
+        let ls = labels(
+            "module N { circuit hidden(): Field { return 1; } }\n\
+             module M {\n\
+               circuit helper(): Field { return 1; }\n\
+               circuit f(): Field { return $0 }\n\
+             }",
+        );
+        assert!(ls.contains(&"helper".to_string())); // enclosing-module sibling
+        assert!(!ls.contains(&"hidden".to_string())); // non-enclosing module's private child
+    }
+
+    #[test]
+    fn expr_position_dedups_shadowed_locals() {
+        // `const x` shadows the `x` param; the label must appear exactly once
+        // (nearest/const wins over the param via the `seen` dedup set).
+        let ls = labels("circuit f(x: Field): Field { const x = 1; return $0 }");
+        assert_eq!(ls.iter().filter(|l| *l == "x").count(), 1);
     }
 }

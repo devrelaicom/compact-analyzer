@@ -29,6 +29,15 @@ pub struct FileAnalysis {
 
 pub struct AnalysisHost {
     vfs: Vfs,
+    /// Per-file parse memo, keyed on the raw address of the content `Arc<str>`
+    /// (`Arc::as_ptr`, stored as `usize`). A bare pointer is ABA-safe as a key
+    /// here ONLY because of a retention coupling: each cached [`FileAnalysis`]
+    /// holds `line_index: Arc<LineIndex>`, and `LineIndex` owns a clone of the
+    /// exact `Arc<str>` whose pointer is the key. The cached entry therefore
+    /// pins that allocation alive, so its address cannot be freed and reused by
+    /// a different allocation while the stale key still lives (no ABA).
+    /// Replacing a file's content (`set_overlay`) installs a *new* `Arc<str>`
+    /// at a new address ⇒ key mismatch ⇒ recompute, exactly as intended.
     cache: HashMap<FileId, (usize, FileAnalysis)>,
     stdlib: Option<FileId>,
     import_search_path: Vec<PathBuf>,
@@ -155,6 +164,14 @@ impl AnalysisHost {
 
     /// Parses `file`, memoized on the VFS content's `Arc` identity (which
     /// changes exactly when the content is replaced). `None` if unreadable.
+    ///
+    /// The key is the content `Arc<str>`'s raw pointer (`Arc::as_ptr`). This is
+    /// ABA-safe: the cached `FileAnalysis` retains that same `Arc<str>` (via
+    /// `line_index: Arc<LineIndex>`), so the allocation the key names is pinned
+    /// for as long as the entry lives and its address cannot be recycled under
+    /// a stale key — see the `cache` field. A content replacement allocates a
+    /// fresh `Arc<str>` at a distinct address, so the key changes and the parse
+    /// is recomputed.
     pub fn analyze(&mut self, file: FileId) -> Option<FileAnalysis> {
         let text = self.vfs.read(file)?;
         let key = Arc::as_ptr(&text) as *const u8 as usize;

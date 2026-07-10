@@ -76,6 +76,10 @@ fn classify_token(
         INT_LIT | HEX_LIT | OCT_LIT | BIN_LIT | VERSION_LIT => TokenType::Number,
         BOOLEAN_KW | FIELD_KW | UINT_KW | BYTES_KW | OPAQUE_KW | VECTOR_KW | UNSIGNED_KW
         | INTEGER_KW => TokenType::Type,
+        // `<` / `>` are structurally ambiguous (type-argument brackets vs
+        // relational operators); classify by parent kind. Must precede the
+        // generic `is_operator` check, which no longer matches LT/GT.
+        LT | GT => classify_angle_bracket(tok),
         k if is_keyword(k) => TokenType::Keyword,
         k if is_operator(k) => TokenType::Operator,
         k if is_punct(k) => TokenType::Punctuation,
@@ -83,6 +87,28 @@ fn classify_token(
         _ => return None,
     };
     Some((ty, mods))
+}
+
+/// Classify a `<` / `>` token by structural context (spec §5): the bracket of a
+/// type-argument list, sized-builtin type, generic-parameter list, or
+/// `default<...>` expression is punctuation; anything else is a relational
+/// operator. Verified against the CST at `compactp` 0.1.0-beta.1: the LT/GT
+/// tokens are *direct children* of the delimiter node in every type context
+/// (`BYTES_TYPE`/`UINT_TYPE`/`VECTOR_TYPE`/`OPAQUE_TYPE` for sized builtins,
+/// `GENERIC_ARG_LIST` for use-site type args and generic calls,
+/// `GENERIC_PARAM_LIST` for declaration-site params, `DEFAULT_EXPR` for
+/// `default<T>`) and of `BINARY_EXPR` when relational. Unknown parents fall
+/// back to `Operator` (the pre-fix behaviour) to avoid over-broad
+/// reclassification.
+fn classify_angle_bracket(tok: &SyntaxToken) -> TokenType {
+    use SyntaxKind::*;
+    match tok.parent().map(|p| p.kind()) {
+        Some(
+            BYTES_TYPE | UINT_TYPE | VECTOR_TYPE | OPAQUE_TYPE | GENERIC_ARG_LIST
+            | GENERIC_PARAM_LIST | DEFAULT_EXPR,
+        ) => TokenType::Punctuation,
+        _ => TokenType::Operator,
+    }
 }
 
 fn is_keyword(k: SyntaxKind) -> bool {
@@ -130,13 +156,15 @@ fn is_operator(k: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(
         k,
+        // NB: LT/GT are handled by `classify_angle_bracket` (structural), not
+        // here. LT_EQ/GT_EQ (`<=`/`>=`) are always relational, never brackets.
+        // DOT is punctuation (member access); DOT_DOT/DOT_DOT_DOT (range/spread)
+        // remain operators.
         EQ | PLUS_EQ
             | MINUS_EQ
             | EQ_EQ
             | BANG_EQ
-            | LT
             | LT_EQ
-            | GT
             | GT_EQ
             | AMP_AMP
             | PIPE_PIPE
@@ -147,7 +175,6 @@ fn is_operator(k: SyntaxKind) -> bool {
             | BANG
             | QUESTION
             | FAT_ARROW
-            | DOT
             | DOT_DOT
             | DOT_DOT_DOT
     )
@@ -167,6 +194,7 @@ fn is_punct(k: SyntaxKind) -> bool {
             | SEMICOLON
             | COLON
             | HASH
+            | DOT
     )
 }
 
@@ -367,5 +395,102 @@ mod tests {
         assert_eq!(f.ty, TokenType::Function);
         assert!(f.mods.declaration);
         assert!(ts.iter().any(|t| t.ty == TokenType::Comment));
+    }
+
+    // ---- Fix #2: member-access `.` is punctuation (spec §5) ----
+
+    #[test]
+    fn member_access_dot_is_punctuation() {
+        // The `.` in `cnt.increment` delimits a member access — it is
+        // punctuation, not an operator.
+        let v = toks("circuit f(): [] { cnt.increment(1); }");
+        assert_eq!(ty_of(&v, "."), Some(&TokenType::Punctuation));
+    }
+
+    // ---- Fix #1: `<` / `>` classified by structural context (spec §5) ----
+
+    #[test]
+    fn sized_type_angle_brackets_are_punctuation() {
+        // `Bytes<32>`: both brackets are children of BYTES_TYPE → punctuation.
+        // (Verified against the CST: the LT/GT tokens are direct children of
+        // the type node, not of TYPE_SIZE, which only wraps the size expr.)
+        let v = toks("circuit f(x: Bytes<32>): [] { }");
+        assert_eq!(ty_of(&v, "<"), Some(&TokenType::Punctuation));
+        assert_eq!(ty_of(&v, ">"), Some(&TokenType::Punctuation));
+    }
+
+    #[test]
+    fn generic_type_arg_angle_brackets_are_punctuation() {
+        // `Vector<3, Field>`: brackets are children of VECTOR_TYPE.
+        let v = toks("circuit f(): Vector<3, Field> { return default<Vector<3, Field>>; }");
+        assert_eq!(ty_of(&v, "<"), Some(&TokenType::Punctuation));
+        assert_eq!(ty_of(&v, ">"), Some(&TokenType::Punctuation));
+    }
+
+    #[test]
+    fn generic_param_list_angle_brackets_are_punctuation() {
+        // `struct S<T>`: brackets are children of GENERIC_PARAM_LIST.
+        let v = toks("struct S<T> { v: T; }");
+        assert_eq!(ty_of(&v, "<"), Some(&TokenType::Punctuation));
+        assert_eq!(ty_of(&v, ">"), Some(&TokenType::Punctuation));
+    }
+
+    #[test]
+    fn relational_angle_brackets_are_operators() {
+        // A relational `<` / `>` in an expression stays an operator. This guards
+        // against over-broad reclassification of every angle bracket.
+        let v = toks("circuit f(a: Field, b: Field): Boolean { return a < b || a > b; }");
+        assert_eq!(ty_of(&v, "<"), Some(&TokenType::Operator));
+        assert_eq!(ty_of(&v, ">"), Some(&TokenType::Operator));
+    }
+
+    // ---- Fix #3: the resolution-refinement path (`classify_use_site`) ----
+
+    #[test]
+    fn use_site_ledger_reference_resolves_to_property() {
+        // Guards the RESOLVED branch of `classify_use_site`: the *use-site*
+        // `cnt` (a bare NAME_EXPR receiver) is not classified structurally —
+        // it must resolve to the ledger declaration and be refined to Property
+        // with no `declaration` modifier. If `classify_use_site` were replaced
+        // with `return fallback` (Variable), this would fail. `ty_of` only
+        // returns the first (decl-site) match, so we inspect both occurrences.
+        let mut host = AnalysisHost::new();
+        let src = "export ledger cnt: Counter;\ncircuit f(): [] { cnt.increment(1); }";
+        let file = host.vfs_mut().file_id(std::path::Path::new("/t/u.compact"));
+        host.vfs_mut().set_overlay(file, src.to_string(), 1);
+        let ts = semantic_tokens(&mut host, file);
+        let cnts: Vec<_> = ts.iter().filter(|t| &src[t.range] == "cnt").collect();
+        assert_eq!(cnts.len(), 2, "expected decl + use occurrences of cnt");
+        // Declaration site (structural).
+        assert_eq!(cnts[0].ty, TokenType::Property);
+        assert!(cnts[0].mods.declaration);
+        // Use site (resolved via classify_use_site → SymbolKind::Ledger).
+        assert_eq!(cnts[1].ty, TokenType::Property);
+        assert!(!cnts[1].mods.declaration);
+    }
+
+    #[test]
+    fn stdlib_use_site_sets_default_library() {
+        // Guards the `default_library` modifier + the Item resolution branch:
+        // a use-site call to a stdlib circuit must resolve into the registered
+        // stub file → Function + default_library. Mirrors Task 4's stdlib
+        // fixture setup (tempdir + materialize + register_stdlib).
+        let dir = tempfile::tempdir().unwrap();
+        let std_path = analyzer_core::stdlib::materialize(dir.path()).unwrap();
+        let mut host = AnalysisHost::new();
+        host.register_stdlib(&std_path);
+        let src = "import CompactStandardLibrary;\n\
+                   circuit f(x: Field): Bytes<32> { return persistentHash<Field>(x); }";
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/main.compact"));
+        host.vfs_mut().set_overlay(file, src.to_string(), 1);
+        let ts = semantic_tokens(&mut host, file);
+        let ph = ts
+            .iter()
+            .find(|t| &src[t.range] == "persistentHash")
+            .unwrap();
+        assert_eq!(ph.ty, TokenType::Function);
+        assert!(ph.mods.default_library);
     }
 }

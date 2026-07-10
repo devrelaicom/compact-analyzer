@@ -50,16 +50,34 @@ fn exe_name() -> String {
 /// When `override_path` is given, it is the *only* source of candidates (a
 /// direct file path, or `<dir>/compact` if it names a directory) — no `PATH`
 /// fallback. When it is `None`, every `PATH` entry is tried.
+///
+/// An override candidate is kept only if it resolves to a concrete file that
+/// already exists on disk. This is load-bearing, not just a fast path: a bare
+/// relative override name with no path separator (e.g. `"compact"`) handed
+/// straight to `Command::new` would make the OS launcher (`execvp` on Unix,
+/// `CreateProcess` on Windows) run its *own* `PATH` search — silently
+/// reintroducing the very `PATH` fallback the override contract forbids. The
+/// `is_file` gate forces such an unresolvable override to `None` instead.
 fn candidates(override_path: Option<&Path>) -> Vec<PathBuf> {
     match override_path {
-        Some(path) if path.is_dir() => vec![path.join(exe_name())],
-        Some(path) => vec![path.to_path_buf()],
+        Some(path) if path.is_dir() => keep_if_file(path.join(exe_name())),
+        Some(path) => keep_if_file(path.to_path_buf()),
         None => match env::var_os("PATH") {
             Some(path_var) => env::split_paths(&path_var)
                 .map(|dir| dir.join(exe_name()))
                 .collect(),
             None => Vec::new(),
         },
+    }
+}
+
+/// One-element candidate list if `path` is an existing file, else empty — keeps
+/// an unresolvable override from reaching `Command::new` as a bare name.
+fn keep_if_file(path: PathBuf) -> Vec<PathBuf> {
+    if path.is_file() {
+        vec![path]
+    } else {
+        Vec::new()
     }
 }
 
@@ -187,5 +205,21 @@ exit 1\n"
         let missing = dir.path().join("does-not-exist");
 
         assert!(Toolchain::discover(Some(&missing)).is_none());
+    }
+
+    #[test]
+    fn discover_does_not_path_search_a_bare_name_override() {
+        // A bare relative name (no path separator) must NOT be handed to
+        // `Command::new` unresolved: the OS launcher (`execvp`/`CreateProcess`)
+        // would run its own PATH search and silently find the real `compact`
+        // installed on this machine, contradicting the "an override is never
+        // combined with a PATH fallback" invariant. An override that doesn't
+        // resolve to a concrete on-disk file must yield `None`.
+        assert!(Toolchain::discover(Some(Path::new("compact"))).is_none());
+    }
+
+    #[test]
+    fn discover_returns_none_for_nonexistent_absolute_override() {
+        assert!(Toolchain::discover(Some(Path::new("/nonexistent/compact"))).is_none());
     }
 }

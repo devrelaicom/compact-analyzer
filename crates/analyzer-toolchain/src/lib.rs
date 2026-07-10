@@ -12,10 +12,13 @@
 
 mod compile;
 mod discovery;
+mod format;
 mod locate;
 mod parse;
+mod process;
 
 pub use compile::{CompileOutcome, CompileStatus, compile_file};
 pub use discovery::Toolchain;
+pub use format::format_source;
 pub use locate::locate;
 pub use parse::{ParsedStderr, RawCompilerDiagnostic, parse_compiler_stderr};

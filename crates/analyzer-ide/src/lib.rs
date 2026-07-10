@@ -7,6 +7,7 @@ mod goto_definition;
 mod hover;
 mod references;
 mod rename;
+mod semantic_tokens;
 mod workspace_symbols;
 
 pub use completion::{CompletionItem, CompletionKind, completion};
@@ -15,6 +16,7 @@ pub use goto_definition::goto_definition;
 pub use hover::{HoverResult, hover};
 pub use references::{find_references, find_references_cancellable};
 pub use rename::{RenameError, SourceEdit, rename, rename_cancellable};
+pub use semantic_tokens::{SemToken, TokenMods, TokenType, semantic_tokens};
 pub use workspace_symbols::{WorkspaceSymbolItem, workspace_symbols};
 
 use analyzer_core::{FileId, TextRange};

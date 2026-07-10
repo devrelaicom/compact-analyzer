@@ -1,0 +1,371 @@
+//! Comprehensive, full-document semantic-token classification from the CST.
+
+use analyzer_core::{
+    AnalysisHost, Definition, FileId, FilePosition, SymbolKind, SyntaxKind, SyntaxNode,
+    SyntaxToken, TextRange,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenType {
+    Keyword,
+    Type,
+    Struct,
+    Enum,
+    EnumMember,
+    TypeParameter,
+    Parameter,
+    Variable,
+    Property,
+    Function,
+    Method,
+    Namespace,
+    Comment,
+    StringLit,
+    Number,
+    Operator,
+    Punctuation,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenMods {
+    pub declaration: bool,
+    pub default_library: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SemToken {
+    pub range: TextRange,
+    pub ty: TokenType,
+    pub mods: TokenMods,
+}
+
+/// All non-whitespace tokens classified, in document order.
+pub fn semantic_tokens(host: &mut AnalysisHost, file: FileId) -> Vec<SemToken> {
+    let root = match host.analyze(file) {
+        Some(a) => SyntaxNode::new_root(a.green.clone()),
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for tok in root
+        .descendants_with_tokens()
+        .filter_map(rowan::NodeOrToken::into_token)
+    {
+        let Some((ty, mods)) = classify_token(host, file, &tok) else {
+            continue;
+        };
+        out.push(SemToken {
+            range: tok.text_range(),
+            ty,
+            mods,
+        });
+    }
+    out
+}
+
+fn classify_token(
+    host: &mut AnalysisHost,
+    file: FileId,
+    tok: &SyntaxToken,
+) -> Option<(TokenType, TokenMods)> {
+    use SyntaxKind::*;
+    let mods = TokenMods::default();
+    let ty = match tok.kind() {
+        WHITESPACE | ERROR | EOF => return None,
+        LINE_COMMENT | BLOCK_COMMENT => TokenType::Comment,
+        STRING_LIT => TokenType::StringLit,
+        INT_LIT | HEX_LIT | OCT_LIT | BIN_LIT | VERSION_LIT => TokenType::Number,
+        BOOLEAN_KW | FIELD_KW | UINT_KW | BYTES_KW | OPAQUE_KW | VECTOR_KW | UNSIGNED_KW
+        | INTEGER_KW => TokenType::Type,
+        k if is_keyword(k) => TokenType::Keyword,
+        k if is_operator(k) => TokenType::Operator,
+        k if is_punct(k) => TokenType::Punctuation,
+        IDENT => return Some(classify_ident(host, file, tok)),
+        _ => return None,
+    };
+    Some((ty, mods))
+}
+
+fn is_keyword(k: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        k,
+        PRAGMA_KW
+            | INCLUDE_KW
+            | IMPORT_KW
+            | FROM_KW
+            | PREFIX_KW
+            | EXPORT_KW
+            | MODULE_KW
+            | LEDGER_KW
+            | CONSTRUCTOR_KW
+            | CIRCUIT_KW
+            | WITNESS_KW
+            | CONTRACT_KW
+            | STRUCT_KW
+            | ENUM_KW
+            | TYPE_KW
+            | CONST_KW
+            | RETURN_KW
+            | IF_KW
+            | ELSE_KW
+            | FOR_KW
+            | OF_KW
+            | ASSERT_KW
+            | AS_KW
+            | PURE_KW
+            | SEALED_KW
+            | NEW_KW
+            | MAP_KW
+            | FOLD_KW
+            | DEFAULT_KW
+            | DISCLOSE_KW
+            | PAD_KW
+            | SLICE_KW
+            | TRUE_KW
+            | FALSE_KW
+    )
+}
+
+fn is_operator(k: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        k,
+        EQ | PLUS_EQ
+            | MINUS_EQ
+            | EQ_EQ
+            | BANG_EQ
+            | LT
+            | LT_EQ
+            | GT
+            | GT_EQ
+            | AMP_AMP
+            | PIPE_PIPE
+            | PLUS
+            | MINUS
+            | STAR
+            | SLASH
+            | BANG
+            | QUESTION
+            | FAT_ARROW
+            | DOT
+            | DOT_DOT
+            | DOT_DOT_DOT
+    )
+}
+
+fn is_punct(k: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        k,
+        L_PAREN
+            | R_PAREN
+            | L_BRACE
+            | R_BRACE
+            | L_BRACKET
+            | R_BRACKET
+            | COMMA
+            | SEMICOLON
+            | COLON
+            | HASH
+    )
+}
+
+/// Classify an IDENT by its parent kind, resolving use-site names for refinement.
+fn classify_ident(
+    host: &mut AnalysisHost,
+    file: FileId,
+    tok: &SyntaxToken,
+) -> (TokenType, TokenMods) {
+    use SyntaxKind::*;
+    let mut mods = TokenMods::default();
+    let Some(parent) = tok.parent() else {
+        return (TokenType::Variable, mods);
+    };
+    match parent.kind() {
+        CIRCUIT_DEF | CIRCUIT_DECL | WITNESS_DECL => {
+            mods.declaration = true;
+            (TokenType::Function, mods)
+        }
+        CONTRACT_CIRCUIT => {
+            mods.declaration = true;
+            (TokenType::Method, mods)
+        }
+        STRUCT_DEF | CONTRACT_DECL => {
+            mods.declaration = true;
+            (TokenType::Struct, mods)
+        }
+        ENUM_DEF => {
+            mods.declaration = true;
+            (TokenType::Enum, mods)
+        }
+        MODULE_DEF => {
+            mods.declaration = true;
+            (TokenType::Namespace, mods)
+        }
+        TYPE_DECL => {
+            mods.declaration = true;
+            (TokenType::Type, mods)
+        }
+        LEDGER_DECL | STRUCT_FIELD => {
+            mods.declaration = true;
+            (TokenType::Property, mods)
+        }
+        ENUM_VARIANT => {
+            mods.declaration = true;
+            (TokenType::EnumMember, mods)
+        }
+        GENERIC_PARAM => {
+            mods.declaration = true;
+            (TokenType::TypeParameter, mods)
+        }
+        FOR_STMT => {
+            mods.declaration = true;
+            (TokenType::Variable, mods)
+        }
+        TYPE_REF => (TokenType::Type, mods),
+        STRUCT_EXPR => (TokenType::Struct, mods),
+        STRUCT_FIELD_INIT | MEMBER_EXPR => (TokenType::Property, mods),
+        PARAM => (TokenType::Parameter, mods),
+        IDENT_PAT => {
+            let is_param = parent.ancestors().any(|a| a.kind() == PARAM);
+            (
+                if is_param {
+                    TokenType::Parameter
+                } else {
+                    TokenType::Variable
+                },
+                mods,
+            )
+        }
+        IMPORT | IMPORT_SPECIFIER | PREFIX_DECL | PRAGMA => (TokenType::Namespace, mods),
+        NAME_EXPR => classify_use_site(host, file, tok, TokenType::Variable),
+        CALL_EXPR => {
+            // A DOT before the IDENT ⇒ method name; else a direct callee (F4).
+            let dot_before = parent
+                .children_with_tokens()
+                .filter_map(rowan::NodeOrToken::into_token)
+                .any(|t| t.kind() == DOT && t.text_range().end() <= tok.text_range().start());
+            if dot_before {
+                (TokenType::Method, mods)
+            } else {
+                classify_use_site(host, file, tok, TokenType::Function)
+            }
+        }
+        _ => (TokenType::Variable, mods),
+    }
+}
+
+/// Resolve a use-site identifier to refine its token type + `default_library`.
+fn classify_use_site(
+    host: &mut AnalysisHost,
+    file: FileId,
+    tok: &SyntaxToken,
+    fallback: TokenType,
+) -> (TokenType, TokenMods) {
+    let mut mods = TokenMods::default();
+    let pos = FilePosition {
+        file,
+        offset: tok.text_range().start(),
+    };
+    let Some(def) = host.resolve(pos) else {
+        return (fallback, mods);
+    };
+    if let Definition::Item { file: def_file, .. } = &def
+        && host.stdlib_file() == Some(*def_file)
+    {
+        mods.default_library = true;
+    }
+    let ty = match &def {
+        Definition::Local { detail, .. } => {
+            if detail.starts_with("generic ") {
+                TokenType::TypeParameter
+            } else if detail.contains(": ")
+                && !detail.starts_with("const ")
+                && !detail.starts_with("for ")
+            {
+                TokenType::Parameter
+            } else {
+                TokenType::Variable
+            }
+        }
+        Definition::Item {
+            file: def_file,
+            index,
+        } => {
+            match host
+                .analyze(*def_file)
+                .and_then(|a| a.item_tree.symbols.get(*index as usize).map(|s| s.kind))
+            {
+                Some(SymbolKind::Circuit)
+                | Some(SymbolKind::CircuitSig)
+                | Some(SymbolKind::Witness) => TokenType::Function,
+                Some(SymbolKind::Ledger) => TokenType::Property,
+                Some(SymbolKind::Struct) => TokenType::Struct,
+                Some(SymbolKind::Enum) => TokenType::Enum,
+                Some(SymbolKind::Module) => TokenType::Namespace,
+                Some(SymbolKind::TypeAlias) => TokenType::Type,
+                _ => fallback,
+            }
+        }
+    };
+    (ty, mods)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use analyzer_core::AnalysisHost;
+
+    fn toks(source: &str) -> Vec<(String, TokenType)> {
+        let mut host = AnalysisHost::new();
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/main.compact"));
+        host.vfs_mut().set_overlay(file, source.to_string(), 1);
+        let text = source.to_string();
+        semantic_tokens(&mut host, file)
+            .into_iter()
+            .map(|t| (text[t.range].to_string(), t.ty))
+            .collect()
+    }
+
+    fn ty_of<'a>(v: &'a [(String, TokenType)], text: &str) -> Option<&'a TokenType> {
+        v.iter().find(|(t, _)| t == text).map(|(_, k)| k)
+    }
+
+    #[test]
+    fn classifies_declaration_and_types() {
+        let v = toks("export circuit inc(x: Field): Field { return x + 1; }");
+        assert_eq!(ty_of(&v, "export"), Some(&TokenType::Keyword));
+        assert_eq!(ty_of(&v, "circuit"), Some(&TokenType::Keyword));
+        assert_eq!(ty_of(&v, "inc"), Some(&TokenType::Function));
+        assert_eq!(ty_of(&v, "x"), Some(&TokenType::Parameter));
+        assert_eq!(ty_of(&v, "Field"), Some(&TokenType::Type));
+        assert_eq!(ty_of(&v, "+"), Some(&TokenType::Operator));
+        assert_eq!(ty_of(&v, "1"), Some(&TokenType::Number));
+        assert_eq!(ty_of(&v, "("), Some(&TokenType::Punctuation));
+        assert_eq!(ty_of(&v, "return"), Some(&TokenType::Keyword));
+    }
+
+    #[test]
+    fn classifies_ledger_and_calls() {
+        let v =
+            toks("export ledger cnt: Counter;\ncircuit f(): [] { helper(); cnt.increment(1); }");
+        assert_eq!(ty_of(&v, "cnt"), Some(&TokenType::Property)); // ledger field decl + use
+        assert_eq!(ty_of(&v, "helper"), Some(&TokenType::Function)); // direct callee (unresolved → Function)
+        assert_eq!(ty_of(&v, "increment"), Some(&TokenType::Method)); // method after dot
+    }
+
+    #[test]
+    fn declaration_modifier_and_comment() {
+        let mut host = AnalysisHost::new();
+        let src = "// hi\ncircuit f(): [] { }";
+        let file = host.vfs_mut().file_id(std::path::Path::new("/t/m.compact"));
+        host.vfs_mut().set_overlay(file, src.to_string(), 1);
+        let ts = semantic_tokens(&mut host, file);
+        let f = ts.iter().find(|t| &src[t.range] == "f").unwrap();
+        assert_eq!(f.ty, TokenType::Function);
+        assert!(f.mods.declaration);
+        assert!(ts.iter().any(|t| t.ty == TokenType::Comment));
+    }
+}

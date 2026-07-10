@@ -205,6 +205,12 @@ fn first_expr_child(node: &SyntaxNode) -> Option<SyntaxNode> {
 /// token, so `node.text_range().start()` can point at whitespace rather than
 /// the identifier — callers that need a position resolvable via
 /// `ident_at_offset` must use this instead.
+///
+/// PRECONDITION: only valid for a **bare-identifier** node (`NAME_EXPR`). This
+/// descends the *entire* subtree (`descendants_with_tokens`), so for a compound
+/// node (`CALL_EXPR`/`INDEX_EXPR`/nested `MEMBER_EXPR`) it returns the offset of
+/// the *innermost-leftmost* identifier, not the receiver as a whole — callers
+/// must gate on `node.kind() == NAME_EXPR` before calling (see `push_member`).
 fn non_trivia_start(node: &SyntaxNode) -> TextSize {
     node.descendants_with_tokens()
         .filter_map(rowan::NodeOrToken::into_token)
@@ -521,6 +527,17 @@ fn push_member(
     receiver: &SyntaxNode,
     items: &mut Vec<CompletionItem>,
 ) {
+    // One-level-deep receiver typing only (F7 / spec §4): the receiver must be
+    // a bare identifier expression (`NAME_EXPR`, e.g. `cnt.⎸` / `Color.⎸`).
+    // Anything else — a `CALL_EXPR` (`tbl.lookup(k).⎸`), `INDEX_EXPR`
+    // (`arr[i].⎸`), a nested `MEMBER_EXPR`, etc. — needs type inference (v2),
+    // so we offer nothing. This gate is load-bearing: without it,
+    // `non_trivia_start` would descend into a compound receiver and resolve its
+    // *innermost* identifier (`tbl`, a ledger `Map` field), then dump the whole
+    // ADT surface after `.lookup(k).` — violating the invariant.
+    if receiver.kind() != SyntaxKind::NAME_EXPR {
+        return;
+    }
     // Resolve the receiver at its first non-trivia token's start offset.
     // `receiver.text_range().start()` is NOT safe here: leading trivia (e.g.
     // whitespace before `cnt` in `NAME_EXPR@45..49 { WHITESPACE " " IDENT
@@ -787,6 +804,25 @@ mod tests {
         );
         assert!(ls.contains(&"y".to_string()));
         assert!(!ls.contains(&"x".to_string()));
+    }
+
+    #[test]
+    fn member_on_chained_receiver_offers_nothing() {
+        // F7 / spec §4: one-level-deep receiver typing only. A chained /
+        // CALL_EXPR receiver (`tbl.lookup(k).⎸`, where `tbl` is a ledger `Map`
+        // field) is NOT a bare identifier — completing it would require type
+        // inference (v2). `push_member` must offer nothing here; in particular
+        // it must NOT resolve the inner `tbl` and dump the full `Map` surface.
+        let ls = labels(
+            "export ledger tbl: Map<Field, Field>;\n\
+             circuit f(): [] { const k = 1; tbl.lookup(k).$0 }",
+        );
+        for m in ["lookup", "insert", "member", "isEmpty", "size", "remove"] {
+            assert!(
+                !ls.contains(&m.to_string()),
+                "chained receiver leaked Map method `{m}`: {ls:?}"
+            );
+        }
     }
 
     #[test]

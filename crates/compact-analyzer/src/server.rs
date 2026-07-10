@@ -659,8 +659,19 @@ impl GlobalState {
         };
         self.host.vfs_mut().remove_overlay(file);
         self.pending_diagnostics.remove(&file);
-        // Drop any stored compiler diagnostics so they can't resurface on a
-        // later reopen (a stale result merged against fresh native ones).
+        // Treat close as a supersession event: bump the save generation FIRST
+        // (monotonically, keeping the entry — a later reopen+save must never
+        // reset the counter to a value an in-flight pre-close worker could
+        // coincidentally still match). A compile that finishes after this then
+        // sees `gens[file] != its captured generation` inside its critical
+        // section and drops without storing or publishing — so it can't
+        // re-insert a stale set that would resurface on reopen (`Vfs` interns
+        // the same path to the same `FileId`). Then drop the stored set.
+        // Separate lock acquisitions, same order the worker uses
+        // (`save_generations` → `compiler_diagnostics`).
+        lock(&self.save_generations)
+            .entry(file)
+            .and_modify(|g| *g += 1);
         lock(&self.compiler_diagnostics).remove(&file);
         // Clear this document's diagnostics in the editor.
         self.publish(PublishDiagnosticsParams {
@@ -947,24 +958,19 @@ impl CompileJob {
         let compiler =
             build_compiler_diagnostics(&outcome, &self.source, &self.line_index, &self.disk_path);
 
-        // Supersession + store, atomic w.r.t. `did_save`'s generation bump:
-        // holding `save_generations` across the store means a newer save can't
-        // slip in between "am I current?" and "store my result", so a stale
-        // worker can neither publish nor clobber the stored set.
-        {
-            let gens = lock(&self.save_generations);
-            if gens.get(&self.file).copied() != Some(self.generation) {
-                return; // superseded by a newer save
-            }
-            if self.shutdown.load(Ordering::Acquire) {
-                return; // shutting down; publish nothing, drop the sender
-            }
-            let mut store = lock(&self.compiler_diagnostics);
-            if compiler.is_empty() {
-                store.remove(&self.file);
-            } else {
-                store.insert(self.file, compiler.clone());
-            }
+        // Supersession + store, atomic w.r.t. `did_save`/`did_close` generation
+        // bumps (see `store_if_current`). If this result is no longer current
+        // (a newer save, or a close) or we're shutting down, drop it: store
+        // nothing, publish nothing.
+        if !store_if_current(
+            &self.save_generations,
+            &self.compiler_diagnostics,
+            &self.shutdown,
+            self.file,
+            self.generation,
+            &compiler,
+        ) {
+            return;
         }
 
         // Merge OUTSIDE the locks; never hold a lock across a `send`.
@@ -977,6 +983,43 @@ impl CompileJob {
         let not = Notification::new("textDocument/publishDiagnostics".to_string(), params);
         let _ = self.sender.send(Message::Notification(not));
     }
+}
+
+/// The supersession + store critical section, factored out of
+/// [`CompileJob::run`] so the guard is deterministically unit-testable.
+///
+/// Holds `save_generations` across the `compiler_diagnostics` store so a
+/// concurrent `did_save`/`did_close` generation bump can't slip between the
+/// currency check and the store (TOCTOU-closed). Lock order is always
+/// `save_generations` → `compiler_diagnostics`, matching every other acquirer.
+///
+/// Returns `true` iff `generation` is still current for `file` and we are not
+/// shutting down — in which case the compiler set was stored (or removed, if
+/// empty) and the caller should publish. Returns `false` (touching nothing)
+/// when superseded by a newer save, invalidated by a close (which bumps the
+/// generation), or shutting down; the caller must then drop its result.
+fn store_if_current(
+    save_generations: &Mutex<HashMap<FileId, u64>>,
+    compiler_diagnostics: &Mutex<HashMap<FileId, Vec<lsp_types::Diagnostic>>>,
+    shutdown: &AtomicBool,
+    file: FileId,
+    generation: u64,
+    compiler: &[lsp_types::Diagnostic],
+) -> bool {
+    let gens = lock(save_generations);
+    if gens.get(&file).copied() != Some(generation) {
+        return false; // superseded by a newer save, or invalidated by a close
+    }
+    if shutdown.load(Ordering::Acquire) {
+        return false; // shutting down; publish nothing, drop the sender
+    }
+    let mut store = lock(compiler_diagnostics);
+    if compiler.is_empty() {
+        store.remove(&file);
+    } else {
+        store.insert(file, compiler.to_vec());
+    }
+    true
 }
 
 /// Turns a [`CompileOutcome`] into tagged (`source = "compactc"`) LSP
@@ -1312,5 +1355,83 @@ mod tests {
         let yes = json!({ "capabilities": { "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": true } } } });
         assert!(client_supports_watch(&yes));
         assert!(!client_supports_watch(&json!({ "capabilities": {} })));
+    }
+
+    // --- Supersession guard (the close-during-compile fix) -----------------
+
+    #[test]
+    fn store_if_current_rejects_stale_generation_after_close_bump() {
+        // Regression test for close-during-compile: a compile that finishes
+        // AFTER `did_close` bumped the generation must not re-insert its stale
+        // set (which would resurface on reopen, since the path re-interns to
+        // the same `FileId`).
+        let mut vfs = analyzer_core::Vfs::new();
+        let file = vfs.file_id(std::path::Path::new("/tmp/x.compact"));
+
+        let gens: Mutex<HashMap<FileId, u64>> = Mutex::new(HashMap::from([(file, 5)]));
+        let store: Mutex<HashMap<FileId, Vec<lsp_types::Diagnostic>>> = Mutex::new(HashMap::new());
+        let shutdown = AtomicBool::new(false);
+        let compiler = vec![lsp_types::Diagnostic::default()];
+
+        // A worker whose captured generation (5) is still current stores its set.
+        assert!(store_if_current(
+            &gens, &store, &shutdown, file, 5, &compiler
+        ));
+        assert!(lock(&store).contains_key(&file));
+
+        // Simulate `did_close`: clear the stored set AND bump 5 -> 6 (monotonic,
+        // entry kept — exactly what `did_close` now does).
+        lock(&store).remove(&file);
+        lock(&gens).entry(file).and_modify(|g| *g += 1);
+
+        // The in-flight pre-close worker (still holding generation 5) is now
+        // stale: it must NOT re-insert its set and must NOT signal a publish.
+        assert!(!store_if_current(
+            &gens, &store, &shutdown, file, 5, &compiler
+        ));
+        assert!(
+            !lock(&store).contains_key(&file),
+            "a stale worker must not re-insert compiler diagnostics after close"
+        );
+    }
+
+    #[test]
+    fn store_if_current_rejects_during_shutdown() {
+        let mut vfs = analyzer_core::Vfs::new();
+        let file = vfs.file_id(std::path::Path::new("/tmp/y.compact"));
+        let gens: Mutex<HashMap<FileId, u64>> = Mutex::new(HashMap::from([(file, 1)]));
+        let store: Mutex<HashMap<FileId, Vec<lsp_types::Diagnostic>>> = Mutex::new(HashMap::new());
+        let shutdown = AtomicBool::new(true);
+        let compiler = vec![lsp_types::Diagnostic::default()];
+
+        assert!(!store_if_current(
+            &gens, &store, &shutdown, file, 1, &compiler
+        ));
+        assert!(lock(&store).is_empty(), "no store/publish during shutdown");
+    }
+
+    #[test]
+    fn did_close_bumps_generation_and_clears_compiler_set() {
+        let (tx, _keep_rx) = crossbeam_channel::unbounded::<Message>();
+        let (_keep_tx, rx) = crossbeam_channel::unbounded::<Message>();
+        let mut state = GlobalState::new(tx, rx);
+
+        let uri = Url::parse("file:///tmp/z.compact").unwrap();
+        let path = lsp_utils::abs_path_from_uri(&uri).unwrap();
+        let file = state.host.vfs_mut().file_id(&path);
+        state.open_files.insert(uri.clone(), file);
+        // A prior save left generation 3 and a stored compiler set.
+        lock(&state.save_generations).insert(file, 3);
+        lock(&state.compiler_diagnostics).insert(file, vec![lsp_types::Diagnostic::default()]);
+
+        state.did_close(DidCloseTextDocumentParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri },
+        });
+
+        // Close bumped the generation monotonically (entry KEPT, not removed)
+        // and cleared the stored compiler set — so a compile finishing after
+        // this close is superseded and reopen sees no stale compiler set.
+        assert_eq!(lock(&state.save_generations).get(&file).copied(), Some(4));
+        assert!(!lock(&state.compiler_diagnostics).contains_key(&file));
     }
 }

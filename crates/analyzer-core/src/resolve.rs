@@ -32,6 +32,232 @@ pub enum Definition {
     },
 }
 
+/// A local binding visible in some lexical scope (param, const, loop var,
+/// lambda param, generic). Produced by [`scope_bindings_at`] and consumed by
+/// the resolver (find one by name) and completion (enumerate all).
+#[derive(Clone, Debug)]
+pub struct Binding {
+    pub name: String,
+    pub name_range: TextRange,
+    pub detail: String,
+}
+
+/// Every local binding visible at `offset`, **nearest-and-latest first**:
+/// inner scopes precede outer ones, and within a block later `const`s precede
+/// earlier ones. `resolve_local_name` returns the first match (correct
+/// shadowing); completion collects all (dedup by name, first wins).
+pub fn scope_bindings_at(root: &SyntaxNode, offset: TextSize) -> Vec<Binding> {
+    let mut out = Vec::new();
+    let Some(token) = anchor_token(root, offset) else {
+        return out;
+    };
+    let Some(start) = token.parent() else {
+        return out;
+    };
+    for node in start.ancestors() {
+        collect_scope_bindings(&node, offset, &mut out);
+    }
+    out
+}
+
+/// The token to anchor the scope walk on: the IDENT at the cursor when present
+/// (so the resolver path is byte-identical to the old `ident_at_offset`-based
+/// walk), otherwise the token immediately left of the cursor (so completion
+/// works at non-IDENT positions such as `const x = ⎸`).
+fn anchor_token(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
+    match root.token_at_offset(offset) {
+        TokenAtOffset::None => None,
+        TokenAtOffset::Single(t) => Some(t),
+        TokenAtOffset::Between(l, r) => {
+            if r.kind() == SyntaxKind::IDENT {
+                Some(r)
+            } else {
+                Some(l)
+            }
+        }
+    }
+}
+
+/// Push the bindings that `node` introduces (if it is a scope), applying the
+/// same position-visibility rules the resolver has always used.
+fn collect_scope_bindings(node: &SyntaxNode, offset: TextSize, out: &mut Vec<Binding>) {
+    match node.kind() {
+        SyntaxKind::BLOCK => {
+            let Some(block) = compactp_ast::Block::cast(node.clone()) else {
+                return;
+            };
+            // Collect const/multi-const bindings that end before the cursor,
+            // then reverse so later bindings shadow earlier ones under
+            // find-first.
+            let mut block_bindings = Vec::new();
+            for stmt in block.stmts() {
+                let const_node = match stmt {
+                    compactp_ast::Stmt::Const(c) => c.syntax().clone(),
+                    // MULTI_CONST_STMT (`const a = 1, b = 2;`) has no AST
+                    // accessor; its patterns are direct children (F3).
+                    compactp_ast::Stmt::MultiConst(m) => m.syntax().clone(),
+                    _ => continue,
+                };
+                if const_node.text_range().end() > offset {
+                    break;
+                }
+                for child in const_node.children() {
+                    if let Some(pat) = compactp_ast::Pat::cast(child) {
+                        for tok in pattern_bindings(&pat) {
+                            block_bindings.push(Binding {
+                                name: tok.text().to_string(),
+                                name_range: tok.text_range(),
+                                detail: detail_for_binding(&tok),
+                            });
+                        }
+                    }
+                }
+            }
+            block_bindings.reverse();
+            out.extend(block_bindings);
+        }
+        SyntaxKind::FOR_STMT => {
+            if let Some(for_stmt) = compactp_ast::ForStmt::cast(node.clone())
+                && for_stmt
+                    .body()
+                    .is_some_and(|b| b.syntax().text_range().contains(offset))
+                && let Some(var) = for_stmt.var_name()
+            {
+                out.push(Binding {
+                    name: var.text().to_string(),
+                    name_range: var.text_range(),
+                    detail: format!("for {}", var.text()),
+                });
+            }
+        }
+        SyntaxKind::LAMBDA_EXPR => {
+            if let Some(lambda) = compactp_ast::expr::LambdaExpr::cast(node.clone())
+                && let Some(params) = lambda.param_list()
+                && offset >= params.syntax().text_range().end()
+            {
+                for child in params.syntax().children() {
+                    collect_lambda_param_bindings(&child, out);
+                }
+            }
+        }
+        SyntaxKind::CIRCUIT_DEF => {
+            if let Some(circuit) = compactp_ast::CircuitDef::cast(node.clone()) {
+                for param in circuit.params() {
+                    collect_param_bindings(&param, out);
+                }
+                collect_generic_bindings(circuit.generic_params(), out);
+            }
+        }
+        SyntaxKind::CONSTRUCTOR_DEF => {
+            if let Some(ctor) = compactp_ast::ConstructorDef::cast(node.clone()) {
+                for param in ctor.params() {
+                    collect_param_bindings(&param, out);
+                }
+            }
+        }
+        SyntaxKind::STRUCT_DEF => {
+            if let Some(s) = compactp_ast::StructDef::cast(node.clone()) {
+                collect_generic_bindings(s.generic_params(), out);
+            }
+        }
+        SyntaxKind::TYPE_DECL => {
+            if let Some(t) = compactp_ast::TypeDecl::cast(node.clone()) {
+                collect_generic_bindings(t.generic_params(), out);
+            }
+        }
+        SyntaxKind::MODULE_DEF => {
+            if let Some(m) = compactp_ast::ModuleDef::cast(node.clone()) {
+                collect_generic_bindings(m.generic_params(), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Bindings of a circuit/constructor `PARAM(pattern, type)`, detail `name: ty`.
+fn collect_param_bindings(param: &compactp_ast::Param, out: &mut Vec<Binding>) {
+    if let Some(pat) = param.pattern() {
+        let ty = render_ty(param.ty());
+        for tok in pattern_bindings(&pat) {
+            out.push(Binding {
+                name: tok.text().to_string(),
+                name_range: tok.text_range(),
+                detail: format!("{}: {ty}", tok.text()),
+            });
+        }
+    }
+}
+
+/// Bindings of one raw child of a lambda's PARAM_LIST — bare `Pat`,
+/// `PARAM(pattern, type)`, or a bare `IDENT` token (verified lambda shapes,
+/// mirrors the old `lambda_param_binding`).
+fn collect_lambda_param_bindings(node: &SyntaxNode, out: &mut Vec<Binding>) {
+    if let Some(pat) = Pat::cast(node.clone()) {
+        for tok in pattern_bindings(&pat) {
+            out.push(Binding {
+                name: tok.text().to_string(),
+                name_range: tok.text_range(),
+                detail: format!("{}: _", tok.text()),
+            });
+        }
+        return;
+    }
+    if let Some(param) = compactp_ast::Param::cast(node.clone()) {
+        if let Some(pat) = param.pattern() {
+            let ty = render_ty(param.ty());
+            for tok in pattern_bindings(&pat) {
+                out.push(Binding {
+                    name: tok.text().to_string(),
+                    name_range: tok.text_range(),
+                    detail: format!("{}: {ty}", tok.text()),
+                });
+            }
+            return;
+        }
+        if let Some(tok) = node
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| t.kind() == SyntaxKind::IDENT)
+        {
+            let ty = render_ty(param.ty());
+            out.push(Binding {
+                name: tok.text().to_string(),
+                name_range: tok.text_range(),
+                detail: format!("{}: {ty}", tok.text()),
+            });
+        }
+    }
+}
+
+/// Bindings introduced by a generic parameter list, detail `generic T` /
+/// `generic #n` (mirrors `generic_definition`).
+fn collect_generic_bindings(
+    params: Option<compactp_ast::GenericParamList>,
+    out: &mut Vec<Binding>,
+) {
+    let Some(params) = params else {
+        return;
+    };
+    for param in params.params() {
+        if let Some(token) = param.name() {
+            let numeric = param
+                .syntax()
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .any(|t| t.kind() == SyntaxKind::HASH);
+            out.push(Binding {
+                name: token.text().to_string(),
+                name_range: token.text_range(),
+                detail: if numeric {
+                    format!("generic #{}", token.text())
+                } else {
+                    format!("generic {}", token.text())
+                },
+            });
+        }
+    }
+}
+
 impl crate::AnalysisHost {
     /// Resolves the identifier at `pos` to its definition.
     pub fn resolve(&mut self, pos: FilePosition) -> Option<Definition> {
@@ -723,195 +949,15 @@ fn resolve_local_name(
     offset: TextSize,
     name: &str,
 ) -> Option<Definition> {
-    let token = ident_at_offset(root, offset)?;
-    let start = token.parent()?;
-    for node in start.ancestors() {
-        match node.kind() {
-            SyntaxKind::BLOCK => {
-                if let Some(block) = compactp_ast::Block::cast(node.clone()) {
-                    // Later consts shadow earlier ones: keep the LAST
-                    // binding that ends before the reference.
-                    let mut found: Option<SyntaxToken> = None;
-                    for stmt in block.stmts() {
-                        if let compactp_ast::Stmt::Const(c) = stmt {
-                            if c.syntax().text_range().end() > offset {
-                                break;
-                            }
-                            if let Some(pat) = c.pattern() {
-                                for binding in pattern_bindings(&pat) {
-                                    if binding.text() == name {
-                                        found = Some(binding);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(binding) = found {
-                        return Some(Definition::Local {
-                            file,
-                            name: name.to_string(),
-                            name_range: binding.text_range(),
-                            detail: detail_for_binding(&binding),
-                        });
-                    }
-                }
-            }
-            SyntaxKind::FOR_STMT => {
-                if let Some(for_stmt) = compactp_ast::ForStmt::cast(node.clone()) {
-                    let in_body = for_stmt
-                        .body()
-                        .is_some_and(|b| b.syntax().text_range().contains(offset));
-                    if in_body
-                        && let Some(var) = for_stmt.var_name()
-                        && var.text() == name
-                    {
-                        return Some(Definition::Local {
-                            file,
-                            name: name.to_string(),
-                            name_range: var.text_range(),
-                            detail: format!("for {name}"),
-                        });
-                    }
-                }
-            }
-            SyntaxKind::LAMBDA_EXPR => {
-                if let Some(lambda) = compactp_ast::expr::LambdaExpr::cast(node.clone())
-                    && let Some(params) = lambda.param_list()
-                {
-                    // In-body means past the parameter list (covers
-                    // both block- and expression-bodied lambdas).
-                    if offset >= params.syntax().text_range().end() {
-                        // Verified against compactp: unlike circuit/
-                        // constructor PARAM_LISTs, a lambda's
-                        // PARAM_LIST does not always wrap children in
-                        // PARAM nodes (an untyped param like `(x) =>`
-                        // is a bare IDENT_PAT), so walk raw children
-                        // instead of `ParamList::params()`.
-                        for child in params.syntax().children() {
-                            if let Some(def) = lambda_param_binding(file, &child, name) {
-                                return Some(def);
-                            }
-                        }
-                    }
-                }
-            }
-            SyntaxKind::CIRCUIT_DEF => {
-                if let Some(circuit) = compactp_ast::CircuitDef::cast(node.clone()) {
-                    for param in circuit.params() {
-                        if let Some(def) = param_binding(file, &param, name) {
-                            return Some(def);
-                        }
-                    }
-                    if let Some(def) = generic_binding(file, circuit.generic_params(), name) {
-                        return Some(def);
-                    }
-                }
-            }
-            SyntaxKind::CONSTRUCTOR_DEF => {
-                if let Some(ctor) = compactp_ast::ConstructorDef::cast(node.clone()) {
-                    for param in ctor.params() {
-                        if let Some(def) = param_binding(file, &param, name) {
-                            return Some(def);
-                        }
-                    }
-                }
-            }
-            SyntaxKind::STRUCT_DEF => {
-                if let Some(s) = compactp_ast::StructDef::cast(node.clone())
-                    && let Some(def) = generic_binding(file, s.generic_params(), name)
-                {
-                    return Some(def);
-                }
-            }
-            SyntaxKind::TYPE_DECL => {
-                if let Some(t) = compactp_ast::TypeDecl::cast(node.clone())
-                    && let Some(def) = generic_binding(file, t.generic_params(), name)
-                {
-                    return Some(def);
-                }
-            }
-            SyntaxKind::MODULE_DEF => {
-                if let Some(m) = compactp_ast::ModuleDef::cast(node.clone())
-                    && let Some(def) = generic_binding(file, m.generic_params(), name)
-                {
-                    return Some(def);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn param_binding(file: FileId, param: &compactp_ast::Param, name: &str) -> Option<Definition> {
-    let pat = param.pattern()?;
-    for binding in pattern_bindings(&pat) {
-        if binding.text() == name {
-            let ty = render_ty(param.ty());
-            return Some(Definition::Local {
-                file,
-                name: name.to_string(),
-                name_range: binding.text_range(),
-                detail: format!("{name}: {ty}"),
-            });
-        }
-    }
-    None
-}
-
-/// Resolves one raw child of a lambda's `PARAM_LIST` to a binding.
-///
-/// Verified against compactp: unlike `CircuitDef`/`ConstructorDef` params
-/// (always `PARAM(IDENT_PAT, TYPE)`), a lambda parameter list stores an
-/// untyped param as a bare `Pat` (no `PARAM` wrapper: `(x) => ...`) and a
-/// typed param as `PARAM` wrapping a bare `IDENT` token rather than an
-/// `IDENT_PAT` (`(x: Field) => ...`). Both shapes are handled directly
-/// since `ParamList::params()` and `Param::pattern()` only cover the
-/// circuit/constructor shape.
-fn lambda_param_binding(file: FileId, node: &SyntaxNode, name: &str) -> Option<Definition> {
-    if let Some(pat) = Pat::cast(node.clone()) {
-        for binding in pattern_bindings(&pat) {
-            if binding.text() == name {
-                return Some(Definition::Local {
-                    file,
-                    name: name.to_string(),
-                    name_range: binding.text_range(),
-                    detail: format!("{name}: _"),
-                });
-            }
-        }
-        return None;
-    }
-    let param = compactp_ast::Param::cast(node.clone())?;
-    if let Some(pat) = param.pattern() {
-        for binding in pattern_bindings(&pat) {
-            if binding.text() == name {
-                let ty = render_ty(param.ty());
-                return Some(Definition::Local {
-                    file,
-                    name: name.to_string(),
-                    name_range: binding.text_range(),
-                    detail: format!("{name}: {ty}"),
-                });
-            }
-        }
-        return None;
-    }
-    // No Pat child: the pattern is a bare IDENT token.
-    let token = node
-        .children_with_tokens()
-        .filter_map(|e| e.into_token())
-        .find(|t| t.kind() == SyntaxKind::IDENT)?;
-    if token.text() != name {
-        return None;
-    }
-    let ty = render_ty(param.ty());
-    Some(Definition::Local {
-        file,
-        name: name.to_string(),
-        name_range: token.text_range(),
-        detail: format!("{name}: {ty}"),
-    })
+    scope_bindings_at(root, offset)
+        .into_iter()
+        .find(|b| b.name == name)
+        .map(|b| Definition::Local {
+            file,
+            name: b.name,
+            name_range: b.name_range,
+            detail: b.detail,
+        })
 }
 
 /// Renders a type node's text, collapsing the leading/interior whitespace
@@ -924,20 +970,6 @@ fn render_ty(ty: Option<compactp_ast::Type>) -> String {
 
 fn collapse_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn generic_binding(
-    file: FileId,
-    params: Option<compactp_ast::GenericParamList>,
-    name: &str,
-) -> Option<Definition> {
-    for param in params?.params() {
-        let token = param.name()?;
-        if token.text() == name {
-            return Some(generic_definition(file, param.syntax(), &token));
-        }
-    }
-    None
 }
 
 /// All name tokens bound by a pattern (verified traversal per compactp AST).
@@ -988,6 +1020,7 @@ fn detail_for_binding(token: &SyntaxToken) -> String {
                 }
             }
             SyntaxKind::CONST_STMT => return format!("const {name}"),
+            SyntaxKind::MULTI_CONST_STMT => return format!("const {name}"),
             SyntaxKind::FOR_STMT => return format!("for {name}"),
             _ => {}
         }
@@ -1147,6 +1180,55 @@ mod tests {
     #[test]
     fn unknown_name_resolves_to_none_gracefully() {
         assert!(resolve_local("circuit f(): Field { return mystery$0; }").is_none());
+    }
+
+    #[test]
+    fn resolves_multi_const_binding() {
+        // `const a = 1, b = 2;` parses to MULTI_CONST_STMT (verified: compactp
+        // statements.rs const_stmt emits MULTI_CONST_STMT on a comma). Before the
+        // shared-enumeration refactor the resolver's BLOCK arm only handled
+        // Stmt::Const, so `b` here resolved to None — a latent bug. This test
+        // locks in the fix.
+        let (name, detail) =
+            resolve_local("circuit f(): Field {\n  const a = 1, b = 2;\n  return b$0;\n}").unwrap();
+        assert_eq!(name, "b");
+        assert_eq!(detail, "const b");
+        // And the first binding of the pair resolves too.
+        let (name_a, _) =
+            resolve_local("circuit f(): Field {\n  const a = 1, b = 2;\n  return a$0;\n}").unwrap();
+        assert_eq!(name_a, "a");
+    }
+
+    #[test]
+    fn multi_const_in_for_body_detail_is_const_not_for() {
+        // Regression: a MULTI_CONST_STMT binding whose block is a `for`-loop
+        // body has ancestor chain IDENT_PAT -> MULTI_CONST_STMT -> BLOCK ->
+        // FOR_STMT. `detail_for_binding` walks that chain; without an explicit
+        // MULTI_CONST_STMT arm it falls through CONST_STMT and lands on the
+        // FOR_STMT arm, yielding "for b" instead of "const b". This path is
+        // reachable only because MULTI_CONST_STMT bindings now resolve.
+        let (name, detail) = resolve_local(
+            "circuit f(): [] {\n  for (const i of 0..10) {\n    const a = 1, b = 2;\n    return b$0;\n  }\n}",
+        )
+        .unwrap();
+        assert_eq!(name, "b");
+        assert_eq!(detail, "const b");
+    }
+
+    #[test]
+    fn scope_bindings_enumerates_locals_nearest_first() {
+        // At the cursor, `x` (inner const) shadows the param `x`; both a param and
+        // an inner const named differently are all visible; nearest/ latest first.
+        let source = "circuit f(x: Field, y: Field): Field {\n  const z = 1;\n  return x$0;\n}";
+        let (clean, offset) = fixture::extract(source);
+        let result = compactp_parser::parse(&clean);
+        let root = SyntaxNode::new_root(result.green);
+        let names: Vec<String> = scope_bindings_at(&root, offset)
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        // Inner-block const `z` first, then params `x`, `y`.
+        assert_eq!(names, vec!["z", "x", "y"]);
     }
 
     // ---- Task 4: file scope + imports ----

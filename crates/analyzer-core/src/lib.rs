@@ -19,7 +19,7 @@ pub use compactp_diagnostics::{Diagnostic, DiagnosticCode, LabeledSpan, Severity
 pub use compactp_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 pub use item_tree::{ItemTree, Symbol, SymbolKind};
 pub use line_index::{LineCol, LineIndex};
-pub use resolve::{Definition, FilePosition};
+pub use resolve::{Binding, Definition, FilePosition, scope_bindings_at};
 pub use source_path::{find_source_pathname, path_module_name, string_lit_text};
 pub use text_size::{TextRange, TextSize};
 pub use vfs::{FileId, Vfs};

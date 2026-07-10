@@ -89,13 +89,26 @@ fn ledger_method_hover(host: &mut AnalysisHost, pos: FilePosition) -> Option<Hov
         .ledger_adt_methods(&adt)
         .iter()
         .find(|m| m.name == name)?;
-    Some(HoverResult {
-        markdown: format!("```compact\n{}\n```\n\n{}", m.sig, m.doc),
-    })
+    // CR3-M3: mirror the primary item-hover path's Some/None doc shape
+    // (sig-only when the doc is absent) instead of always appending
+    // `\n\n{doc}`. Latent today — every curated asset doc is non-empty —
+    // but keeps the two rendering paths symmetric.
+    let markdown = if m.doc.is_empty() {
+        format!("```compact\n{}\n```", m.sig)
+    } else {
+        format!("```compact\n{}\n```\n\n{}", m.sig, m.doc)
+    };
+    Some(HoverResult { markdown })
 }
 
 /// The IDENT at/adjacent to `offset` (prefer the right token at a boundary).
 fn ident_at(root: &SyntaxNode, offset: analyzer_core::TextSize) -> Option<SyntaxToken> {
+    // B1-core: rowan's `token_at_offset` asserts `offset <= range.end()` and
+    // PANICS otherwise. `hover`'s ledger-method fallback path calls this with
+    // the caller-supplied position directly (no upstream clamp), so a stale
+    // document version or a position past EOF would panic here. Clamping to
+    // `end()` is safe and preserves `hover`'s never-die contract.
+    let offset = offset.min(root.text_range().end());
     match root.token_at_offset(offset) {
         TokenAtOffset::None => None,
         TokenAtOffset::Single(t) => (t.kind() == SyntaxKind::IDENT).then_some(t),
@@ -143,6 +156,22 @@ mod tests {
     }
 
     #[test]
+    fn hover_on_item_without_doc_comment_shows_signature_only() {
+        // CR3-M5: covers the primary item-hover `None`-doc branch (hover.rs
+        // ~line 28) — previously only the `Some(doc)` arm was exercised
+        // (`hover_on_circuit_shows_signature_and_doc`, which has a leading
+        // `//` comment). No comment precedes `double` here, so `sym.doc` is
+        // `None` and the signature must render without a trailing blank
+        // paragraph.
+        let md = hover_md(
+            "circuit double(x: Field): Field { return x + x; }\n\
+             circuit m(): Field { return dou$0ble(1); }",
+        )
+        .unwrap();
+        assert_eq!(md, "```compact\ncircuit double(x: Field): Field\n```");
+    }
+
+    #[test]
     fn hover_on_stdlib_shows_bundled_doc() {
         let md = hover_md(
             "import CompactStandardLibrary;\ncircuit m(x: Field): Bytes<32> { return persistentHa$0sh<Field>(x); }",
@@ -170,6 +199,44 @@ mod tests {
         let md =
             hover_md("export ledger bal: Uint<64>;\ncircuit f(): [] { bal.wr$0ite(7); }").unwrap();
         assert!(md.contains("write(value: T): []"), "{md}");
+    }
+
+    #[test]
+    fn hover_at_right_boundary_of_ident_resolves_via_left_fallback() {
+        // CR3-M5: covers this module's own `ident_at`'s Between-left
+        // fallback (distinct from `resolve`'s `ident_at_offset`, which the
+        // ledger-method path does NOT go through for its own token pick).
+        // At the boundary between the method IDENT `increment` and the
+        // immediately following `(` (no whitespace between them),
+        // `token_at_offset` returns `Between(increment, "(")`: the right
+        // token isn't an IDENT, so `ident_at` must fall back to the left
+        // token rather than returning `None`.
+        let md = hover_md("export ledger cnt: Counter;\ncircuit f(): [] { cnt.increment$0(1); }")
+            .unwrap();
+        assert!(md.contains("increment(amount: Uint<16>): []"), "{md}");
+    }
+
+    // ---- B1-core: never-die offset clamp ----
+
+    #[test]
+    fn hover_at_offset_past_eof_returns_none_and_does_not_panic() {
+        // `pos.offset` can be stale (e.g. a client raced an edit) and land
+        // past the document's true end. rowan's `token_at_offset` `assert!`s
+        // `offset <= range.end()` and PANICS otherwise. `hover` reaches
+        // `token_at_offset` two ways: via `resolve` -> `ident_at_offset` /
+        // `anchor_token` (analyzer-core), and via this module's own
+        // `ident_at` in the ledger-method fallback. Both must clamp.
+        let source = "circuit f(): Field { return xyz; }";
+        let mut host = AnalysisHost::new();
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/main.compact"));
+        host.vfs_mut().set_overlay(file, source.to_string(), 1);
+        let past_eof = FilePosition {
+            file,
+            offset: analyzer_core::TextSize::from(9_999),
+        };
+        assert!(hover(&mut host, past_eof).is_none());
     }
 
     #[test]

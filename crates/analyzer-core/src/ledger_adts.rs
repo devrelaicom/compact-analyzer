@@ -86,6 +86,11 @@ impl crate::AnalysisHost {
             compactp_ast::Type::Ref(r) => r.name()?.text().to_string(),
             _ => return Some("Cell".to_string()), // builtin scalar type → Cell
         };
+        // R1-M7 (accepted limitation): this is a name match only, with no
+        // type information to disambiguate. A user type named identically to
+        // a builtin ADT head (e.g. `struct Map { ... }; ledger m: Map;`)
+        // will be mapped to that builtin's method surface instead of being
+        // treated as a plain struct-typed (implicit-Cell) field.
         const KNOWN: &[&str] = &[
             "Counter",
             "Cell",
@@ -162,6 +167,104 @@ mod tests {
             host.ledger_field_adt(&crate::Definition::Item {
                 file,
                 index: bal as u32
+            }),
+            Some("Cell".to_string())
+        );
+    }
+
+    // ---- R1-M5: previously-unexercised branches ----
+
+    #[test]
+    fn ledger_field_adt_local_definition_is_none() {
+        // A `Definition::Local` (param/const/loop var/lambda param/generic)
+        // is never a ledger field — the function's first pattern match must
+        // reject it before ever touching the item tree.
+        let mut host = crate::AnalysisHost::new();
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/local.compact"));
+        let local = crate::Definition::Local {
+            file,
+            name: "x".to_string(),
+            name_range: crate::TextRange::new(0.into(), 1.into()),
+            detail: "x: Field".to_string(),
+        };
+        assert_eq!(host.ledger_field_adt(&local), None);
+    }
+
+    #[test]
+    fn ledger_field_adt_non_ledger_item_is_none() {
+        // An `Item` `Definition` whose symbol kind isn't `Ledger` (here, a
+        // circuit) must also be rejected — only ledger fields have an ADT
+        // method surface.
+        let mut host = crate::AnalysisHost::new();
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/circuit.compact"));
+        host.vfs_mut().set_overlay(
+            file,
+            "circuit helper(): Field { return 0; }\n".to_string(),
+            1,
+        );
+        let tree = host.analyze(file).unwrap().item_tree.clone();
+        let idx = tree
+            .symbols
+            .iter()
+            .position(|s| s.name == "helper")
+            .unwrap();
+        assert_eq!(
+            host.ledger_field_adt(&crate::Definition::Item {
+                file,
+                index: idx as u32
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn ledger_field_adt_generic_head_maps_to_declared_adt() {
+        // `ledger m: Map<K, V>` exercises `TypeRef::name()` on a *generic*
+        // head (`Map<Field, Field>`, not a bare `Map`) — the head name must
+        // still read as "Map", not e.g. the full generic-arg text.
+        let mut host = crate::AnalysisHost::new();
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/generic_ledger.compact"));
+        host.vfs_mut()
+            .set_overlay(file, "export ledger m: Map<Field, Field>;\n".to_string(), 1);
+        let tree = host.analyze(file).unwrap().item_tree.clone();
+        let idx = tree.symbols.iter().position(|s| s.name == "m").unwrap();
+        assert_eq!(
+            host.ledger_field_adt(&crate::Definition::Item {
+                file,
+                index: idx as u32
+            }),
+            Some("Map".to_string())
+        );
+    }
+
+    #[test]
+    fn ledger_field_adt_user_struct_type_maps_to_cell() {
+        // A ledger field typed with a user-defined struct (not one of the
+        // known builtin ADT heads) falls through to the implicit-Cell arm,
+        // same as a plain scalar-typed field (R1-M7: this is also where a
+        // user type *named* `Map`/`Counter`/etc would be misidentified as
+        // that builtin instead — see the note by `KNOWN`).
+        let mut host = crate::AnalysisHost::new();
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/struct_ledger.compact"));
+        host.vfs_mut().set_overlay(
+            file,
+            "struct Foo { x: Field; }\nexport ledger f: Foo;\n".to_string(),
+            1,
+        );
+        let tree = host.analyze(file).unwrap().item_tree.clone();
+        let idx = tree.symbols.iter().position(|s| s.name == "f").unwrap();
+        assert_eq!(
+            host.ledger_field_adt(&crate::Definition::Item {
+                file,
+                index: idx as u32
             }),
             Some("Cell".to_string())
         );

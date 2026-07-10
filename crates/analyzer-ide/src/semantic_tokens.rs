@@ -253,8 +253,12 @@ fn classify_ident(
         TYPE_REF => (TokenType::Type, mods),
         STRUCT_EXPR => (TokenType::Struct, mods),
         STRUCT_FIELD_INIT | MEMBER_EXPR => (TokenType::Property, mods),
-        PARAM => (TokenType::Parameter, mods),
+        PARAM => {
+            mods.declaration = true;
+            (TokenType::Parameter, mods)
+        }
         IDENT_PAT => {
+            mods.declaration = true;
             let is_param = parent.ancestors().any(|a| a.kind() == PARAM);
             (
                 if is_param {
@@ -387,7 +391,7 @@ mod tests {
     #[test]
     fn declaration_modifier_and_comment() {
         let mut host = AnalysisHost::new();
-        let src = "// hi\ncircuit f(): [] { }";
+        let src = "// hi\ncircuit f(x: Field): [] { const y = 1; }";
         let file = host.vfs_mut().file_id(std::path::Path::new("/t/m.compact"));
         host.vfs_mut().set_overlay(file, src.to_string(), 1);
         let ts = semantic_tokens(&mut host, file);
@@ -395,6 +399,16 @@ mod tests {
         assert_eq!(f.ty, TokenType::Function);
         assert!(f.mods.declaration);
         assert!(ts.iter().any(|t| t.ty == TokenType::Comment));
+        // CR3-M1: a param's and a `const` local's definition-site name token
+        // also carry `declaration == true` — every other def-site arm
+        // (FOR_STMT, GENERIC_PARAM, item defs, LEDGER_DECL/STRUCT_FIELD,
+        // ENUM_VARIANT) already did; PARAM/IDENT_PAT were the odd ones out.
+        let x = ts.iter().find(|t| &src[t.range] == "x").unwrap();
+        assert_eq!(x.ty, TokenType::Parameter);
+        assert!(x.mods.declaration);
+        let y = ts.iter().find(|t| &src[t.range] == "y").unwrap();
+        assert_eq!(y.ty, TokenType::Variable);
+        assert!(y.mods.declaration);
     }
 
     // ---- Fix #2: member-access `.` is punctuation (spec §5) ----
@@ -467,6 +481,33 @@ mod tests {
         // Use site (resolved via classify_use_site → SymbolKind::Ledger).
         assert_eq!(cnts[1].ty, TokenType::Property);
         assert!(!cnts[1].mods.declaration);
+    }
+
+    #[test]
+    fn use_site_param_reference_resolves_to_parameter() {
+        // CR3-M4: E6 (above) only covered the resolved-Item branches of
+        // `classify_use_site`; this covers the resolved-`Definition::Local`
+        // heuristic — `resolve.rs`'s detail string `"x: Field"` (contains
+        // `": "`, doesn't start with `"const "`/`"for "`) must be read back
+        // as `Parameter`. A drift in `resolve.rs`'s detail-string format
+        // (e.g. dropping the `": "` separator, or a `"const "` prefix
+        // collision) would silently regress this to `Variable` without a
+        // guard here.
+        let mut host = AnalysisHost::new();
+        let src = "circuit f(x: Field): Field { return x + x; }";
+        let file = host.vfs_mut().file_id(std::path::Path::new("/t/p.compact"));
+        host.vfs_mut().set_overlay(file, src.to_string(), 1);
+        let ts = semantic_tokens(&mut host, file);
+        let xs: Vec<_> = ts.iter().filter(|t| &src[t.range] == "x").collect();
+        assert_eq!(xs.len(), 3, "expected decl + two use occurrences of x");
+        // Declaration site (structural, IDENT_PAT arm under PARAM).
+        assert_eq!(xs[0].ty, TokenType::Parameter);
+        assert!(xs[0].mods.declaration);
+        // Use sites (resolved via classify_use_site → Definition::Local).
+        assert_eq!(xs[1].ty, TokenType::Parameter);
+        assert!(!xs[1].mods.declaration);
+        assert_eq!(xs[2].ty, TokenType::Parameter);
+        assert!(!xs[2].mods.declaration);
     }
 
     #[test]

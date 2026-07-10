@@ -60,11 +60,36 @@ pub fn scope_bindings_at(root: &SyntaxNode, offset: TextSize) -> Vec<Binding> {
     out
 }
 
-/// The token to anchor the scope walk on: the IDENT at the cursor when present
-/// (so the resolver path is byte-identical to the old `ident_at_offset`-based
-/// walk), otherwise the token immediately left of the cursor (so completion
-/// works at non-IDENT positions such as `const x = ⎸`).
+/// The token to anchor the scope walk on: the IDENT at the cursor when present,
+/// otherwise the token immediately left of the cursor (so completion works at
+/// non-IDENT positions such as `const x = ⎸`).
+///
+/// This differs from `ident_at_offset`: `ident_at_offset` returns `None`
+/// unless an IDENT is at/adjacent to `offset`, whereas `anchor_token` always
+/// returns *some* token, falling back to the left neighbor at a non-IDENT
+/// boundary. The two coincide only on the resolver's own calls
+/// (`resolve_local_name`, reached from `resolve()` via `resolve_name_at`):
+/// `resolve()` has already anchored on an IDENT token via `ident_at_offset`
+/// before `offset` reaches here, so whichever token `ident_at_offset` picked
+/// — the boundary's `r` if it was an IDENT, else `l` — is exactly the token
+/// `anchor_token`'s own `r.kind() == IDENT` check finds too. Getting this
+/// right matters: for a reference immediately followed by a delimiter with
+/// no intervening whitespace (e.g. the `x` in `(x: Field) => x, xs`, where
+/// `x` abuts `,`), a bare right-biased-then-left-biased pick that ignored
+/// IDENT-ness would choose the delimiter token, whose parent is the *outer*
+/// node (e.g. `MAP_EXPR`), skipping straight past the enclosing `LAMBDA_EXPR`
+/// in the ancestor chain and reporting the lambda param unresolved. Anchoring
+/// on the IDENT's own parent instead always starts the walk inside the
+/// innermost expression, so the enclosing scope (lambda body, block, etc.)
+/// is never skipped.
 fn anchor_token(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
+    // rowan's `token_at_offset` asserts `offset <= root.text_range().end()`
+    // and PANICS otherwise (B1-core): a stale document version or a
+    // position past EOF can hand this a way-out-of-range offset. Clamping to
+    // `end()` is safe (that boundary is already handled by `TokenAtOffset`)
+    // and preserves the never-die contract for every caller reached through
+    // `scope_bindings_at` (`resolve`, `resolve_local_name`, completion).
+    let offset = offset.min(root.text_range().end());
     match root.token_at_offset(offset) {
         TokenAtOffset::None => None,
         TokenAtOffset::Single(t) => Some(t),
@@ -894,6 +919,11 @@ fn import_specifier_alias(spec: &compactp_ast::ImportSpecifier) -> Option<String
 /// Finds the IDENT token at/beside `offset`. Between two tokens, prefers
 /// the identifier.
 fn ident_at_offset(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
+    // Same B1-core guard as `anchor_token`: this is `resolve()`'s own
+    // `token_at_offset` call, reached directly from `hover`/`goto_definition`
+    // /`rename`/`references` with a caller-supplied offset that may be past
+    // EOF (stale document version, etc). Clamp rather than panic.
+    let offset = offset.min(root.text_range().end());
     let pick = |t: SyntaxToken| (t.kind() == SyntaxKind::IDENT).then_some(t);
     match root.token_at_offset(offset) {
         TokenAtOffset::None => None,
@@ -928,21 +958,10 @@ fn local_from_pattern_site(file: FileId, token: &SyntaxToken) -> Option<Definiti
     })
 }
 
-/// Walks outward from `offset` collecting the nearest binding of `name`.
-///
-/// Uses the same token-pick as `ident_at_offset` (prefer the IDENT at a
-/// token boundary) rather than a bare right-biased-then-left-biased pick.
-/// The two must agree: `resolve()` already anchored `name`/`offset` on the
-/// IDENT token via `ident_at_offset`, so re-deriving a *different* token
-/// here can land the ancestor walk in the wrong subtree. Concretely: for a
-/// reference immediately followed by a delimiter with no intervening
-/// whitespace (e.g. the `x` in `(x: Field) => x, xs`, where `x` abuts `,`),
-/// the old right-biased pick chose the delimiter token, whose parent is the
-/// *outer* node (e.g. `MAP_EXPR`), skipping straight past the enclosing
-/// `LAMBDA_EXPR` in the ancestor chain and causing the lambda param to be
-/// reported unresolved. Anchoring on the IDENT's own parent instead always
-/// starts the walk inside the innermost expression, so the enclosing scope
-/// (lambda body, block, etc.) is never skipped.
+/// Walks outward from `offset` collecting the nearest binding of `name`, via
+/// `scope_bindings_at` (anchored on `anchor_token` — see its doc comment for
+/// why that token-pick is safe for the resolver's own calls even though it
+/// differs from `ident_at_offset` in general).
 fn resolve_local_name(
     file: FileId,
     root: &SyntaxNode,

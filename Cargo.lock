@@ -21,6 +21,8 @@ dependencies = [
  "compactp_syntax",
  "ignore",
  "rowan",
+ "serde",
+ "serde_json",
  "tempfile",
  "text-size",
 ]

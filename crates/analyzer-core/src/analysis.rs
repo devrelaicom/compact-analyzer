@@ -33,6 +33,7 @@ pub struct AnalysisHost {
     stdlib: Option<FileId>,
     import_search_path: Vec<PathBuf>,
     workspace: crate::workspace::WorkspaceIndex,
+    ledger_adts: crate::ledger_adts::LedgerAdtTable,
 }
 
 impl AnalysisHost {
@@ -43,7 +44,15 @@ impl AnalysisHost {
             stdlib: None,
             import_search_path: Vec::new(),
             workspace: crate::workspace::WorkspaceIndex::default(),
+            ledger_adts: crate::ledger_adts::LedgerAdtTable::load(),
         }
+    }
+
+    /// Access to the curated ledger-ADT method table (owned by the
+    /// `ledger_adts` module, which implements the public accessors on top of
+    /// this private getter).
+    pub(crate) fn ledger_adts_table(&self) -> &crate::ledger_adts::LedgerAdtTable {
+        &self.ledger_adts
     }
 
     pub fn vfs(&self) -> &Vfs {

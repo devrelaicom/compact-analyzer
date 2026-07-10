@@ -1,0 +1,86 @@
+{
+  "_meta": {
+    "language_version": "0.23",
+    "compiler": "compactc-0.31.0",
+    "ledger": "8.0.2",
+    "source": "LFDT-Minokawa/compact compiler/midnight-ledger.ss (declare-ledger-adt) + standard-library.compact",
+    "note": "In-circuit methods only. js-only (root/iter/history/path_for_leaf/first_free/find_path_for_leaf) and coin-conditional (writeCoin/insertCoin/pushFrontCoin) methods are intentionally omitted. Refresh procedure: re-read midnight-ledger.ss at the target compiler tag; confirm each via `compact compile --skip-zk` probes."
+  },
+  "Counter": [
+    { "name": "read", "sig": "read(): Uint<64>", "doc": "Retrieves the current value of the counter." },
+    { "name": "lessThan", "sig": "lessThan(threshold: Uint<64>): Boolean", "doc": "Returns whether the counter is less than the given threshold." },
+    { "name": "increment", "sig": "increment(amount: Uint<16>): []", "doc": "Increments the counter by the given amount." },
+    { "name": "decrement", "sig": "decrement(amount: Uint<16>): []", "doc": "Decrements the counter; going below zero is a run-time error." },
+    { "name": "resetToDefault", "sig": "resetToDefault(): []", "doc": "Resets this Counter to its default value of 0." }
+  ],
+  "Cell": [
+    { "name": "read", "sig": "read(): T", "doc": "Returns the current contents of this Cell." },
+    { "name": "write", "sig": "write(value: T): []", "doc": "Overwrites the content of this Cell with the given value." },
+    { "name": "resetToDefault", "sig": "resetToDefault(): []", "doc": "Resets this Cell to the default value of its type." }
+  ],
+  "Map": [
+    { "name": "isEmpty", "sig": "isEmpty(): Boolean", "doc": "Returns if this Map is the empty map." },
+    { "name": "size", "sig": "size(): Uint<64>", "doc": "Returns the number of entries in this Map." },
+    { "name": "member", "sig": "member(key: K): Boolean", "doc": "Returns if a key is contained within this Map." },
+    { "name": "lookup", "sig": "lookup(key: K): V", "doc": "Looks up the value of a key; the value may itself be an ADT." },
+    { "name": "insert", "sig": "insert(key: K, value: V): []", "doc": "Updates this Map to include a new value at a given key." },
+    { "name": "insertDefault", "sig": "insertDefault(key: K): []", "doc": "Inserts the value type's default value at a given key." },
+    { "name": "remove", "sig": "remove(key: K): []", "doc": "Updates this Map to not include a given key." },
+    { "name": "resetToDefault", "sig": "resetToDefault(): []", "doc": "Resets this Map to the empty map." }
+  ],
+  "Set": [
+    { "name": "isEmpty", "sig": "isEmpty(): Boolean", "doc": "Returns whether this Set is the empty set." },
+    { "name": "size", "sig": "size(): Uint<64>", "doc": "Returns the number of unique entries." },
+    { "name": "member", "sig": "member(elem: T): Boolean", "doc": "Returns if an element is in this Set." },
+    { "name": "insert", "sig": "insert(elem: T): []", "doc": "Updates this Set to include a given element." },
+    { "name": "remove", "sig": "remove(elem: T): []", "doc": "Updates this Set to not include a given element." },
+    { "name": "resetToDefault", "sig": "resetToDefault(): []", "doc": "Resets this Set to the empty set." }
+  ],
+  "List": [
+    { "name": "isEmpty", "sig": "isEmpty(): Boolean", "doc": "Returns if this List is the empty list." },
+    { "name": "length", "sig": "length(): Uint<64>", "doc": "Returns the number of elements." },
+    { "name": "head", "sig": "head(): Maybe<T>", "doc": "Retrieves the head as a Maybe (safe on an empty list)." },
+    { "name": "pushFront", "sig": "pushFront(value: T): []", "doc": "Pushes a new element onto the front." },
+    { "name": "popFront", "sig": "popFront(): []", "doc": "Removes the first element from the front." },
+    { "name": "resetToDefault", "sig": "resetToDefault(): []", "doc": "Resets this List to the empty list." }
+  ],
+  "MerkleTree": [
+    { "name": "isFull", "sig": "isFull(): Boolean", "doc": "Returns if the tree is full and no further items can be directly inserted." },
+    { "name": "checkRoot", "sig": "checkRoot(rt: MerkleTreeDigest): Boolean", "doc": "Tests if rt is the current root of this tree." },
+    { "name": "insert", "sig": "insert(item: T): []", "doc": "Inserts a new leaf at the first free index." },
+    { "name": "insertIndex", "sig": "insertIndex(item: T, index: Uint<64>): []", "doc": "Inserts a new leaf at a specific index." },
+    { "name": "insertHash", "sig": "insertHash(hash: Bytes<32>): []", "doc": "Inserts a leaf with a given hash at the first free index." },
+    { "name": "insertHashIndex", "sig": "insertHashIndex(hash: Bytes<32>, index: Uint<64>): []", "doc": "Inserts a leaf with a given hash at a specific index." },
+    { "name": "insertIndexDefault", "sig": "insertIndexDefault(index: Uint<64>): []", "doc": "Inserts a default-value leaf at an index (emulates removal)." },
+    { "name": "resetToDefault", "sig": "resetToDefault(): []", "doc": "Resets to the empty Merkle tree." }
+  ],
+  "HistoricMerkleTree": [
+    { "name": "isFull", "sig": "isFull(): Boolean", "doc": "Returns if the tree is full." },
+    { "name": "checkRoot", "sig": "checkRoot(rt: MerkleTreeDigest): Boolean", "doc": "Tests if rt is one of the past roots of this tree." },
+    { "name": "insert", "sig": "insert(item: T): []", "doc": "Inserts a leaf at the first free index and records the new root in history." },
+    { "name": "insertIndex", "sig": "insertIndex(item: T, index: Uint<64>): []", "doc": "Inserts a leaf at a specific index and records the new root." },
+    { "name": "insertHash", "sig": "insertHash(hash: Bytes<32>): []", "doc": "Inserts a leaf with a given hash at the first free index." },
+    { "name": "insertHashIndex", "sig": "insertHashIndex(hash: Bytes<32>, index: Uint<64>): []", "doc": "Inserts a leaf with a given hash at a specific index." },
+    { "name": "insertIndexDefault", "sig": "insertIndexDefault(index: Uint<64>): []", "doc": "Inserts a default-value leaf at an index." },
+    { "name": "resetHistory", "sig": "resetHistory(): []", "doc": "Resets the history, leaving only the current root valid." },
+    { "name": "resetToDefault", "sig": "resetToDefault(): []", "doc": "Resets to the empty Merkle tree." }
+  ],
+  "Kernel": [
+    { "name": "self", "sig": "self(): ContractAddress", "doc": "Returns the current contract's address." },
+    { "name": "checkpoint", "sig": "checkpoint(): []", "doc": "Marks execution up to this point as one atomic unit." },
+    { "name": "claimZswapNullifier", "sig": "claimZswapNullifier(nul: Bytes<32>): []", "doc": "Requires the nullifier's presence in the tx, claimed by no other call." },
+    { "name": "claimZswapCoinSpend", "sig": "claimZswapCoinSpend(note: Bytes<32>): []", "doc": "Requires a commitment in the tx claimed as a spend by no other call." },
+    { "name": "claimZswapCoinReceive", "sig": "claimZswapCoinReceive(note: Bytes<32>): []", "doc": "Requires a commitment in the tx claimed as a receive by no other call." },
+    { "name": "claimContractCall", "sig": "claimContractCall(addr: Bytes<32>, entry_point: Bytes<32>, comm: Field): []", "doc": "Requires a matching contract-to-contract call in the tx, unclaimed by others." },
+    { "name": "mintShielded", "sig": "mintShielded(domain_sep: Bytes<32>, amount: Uint<64>): []", "doc": "Mints shielded coins of a token type derived from the contract address + domain sep." },
+    { "name": "mintUnshielded", "sig": "mintUnshielded(domain_sep: Bytes<32>, amount: Uint<64>): []", "doc": "Mints unshielded coins of a derived token type." },
+    { "name": "claimUnshieldedCoinSpend", "sig": "claimUnshieldedCoinSpend(token_type: Either<Bytes<32>, Bytes<32>>, address: Either<ContractAddress, UserAddress>, amount: Uint<128>): []", "doc": "Authorizes an unshielded coin of the given type to be transferred to an address." },
+    { "name": "incUnshieldedOutputs", "sig": "incUnshieldedOutputs(token_type: Either<Bytes<32>, Bytes<32>>, amount: Uint<128>): []", "doc": "Increments unshielded output for a token type (used when sending)." },
+    { "name": "incUnshieldedInputs", "sig": "incUnshieldedInputs(token_type: Either<Bytes<32>, Bytes<32>>, amount: Uint<128>): []", "doc": "Increments unshielded input for a token type (used when receiving)." },
+    { "name": "balance", "sig": "balance(token_type: Either<Bytes<32>, Bytes<32>>): Uint<128>", "doc": "Returns the contract's unshielded balance of a token type." },
+    { "name": "balanceLessThan", "sig": "balanceLessThan(token_type: Either<Bytes<32>, Bytes<32>>, amount: Uint<128>): Boolean", "doc": "Whether the balance of a token type is less than the given amount." },
+    { "name": "balanceGreaterThan", "sig": "balanceGreaterThan(token_type: Either<Bytes<32>, Bytes<32>>, amount: Uint<128>): Boolean", "doc": "Whether the balance of a token type is greater than the given amount." },
+    { "name": "blockTimeLessThan", "sig": "blockTimeLessThan(time: Uint<64>): Boolean", "doc": "Whether current block time is less than time (seconds since the Unix epoch)." },
+    { "name": "blockTimeGreaterThan", "sig": "blockTimeGreaterThan(time: Uint<64>): Boolean", "doc": "Whether current block time is greater than time." }
+  ]
+}

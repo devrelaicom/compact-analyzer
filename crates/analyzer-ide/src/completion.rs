@@ -200,6 +200,19 @@ fn first_expr_child(node: &SyntaxNode) -> Option<SyntaxNode> {
         .find(|c| compactp_ast::Expr::can_cast(c.kind()))
 }
 
+/// The start offset of the first non-trivia token under `node`. Some nodes
+/// (e.g. `NAME_EXPR`) carry their leading trivia as their own first child
+/// token, so `node.text_range().start()` can point at whitespace rather than
+/// the identifier — callers that need a position resolvable via
+/// `ident_at_offset` must use this instead.
+fn non_trivia_start(node: &SyntaxNode) -> TextSize {
+    node.descendants_with_tokens()
+        .filter_map(rowan::NodeOrToken::into_token)
+        .find(|t| !t.kind().is_trivia())
+        .map(|t| t.text_range().start())
+        .unwrap_or_else(|| node.text_range().start())
+}
+
 /// The enclosing STRUCT_EXPR iff the cursor is at a field-name position (left
 /// token is `{` or `,`, i.e. not inside a field value after `:`).
 fn enclosing_struct_literal(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxNode> {
@@ -503,18 +516,108 @@ fn push_imported_items(
 }
 
 fn push_member(
-    _host: &mut AnalysisHost,
-    _pos: FilePosition,
-    _receiver: &SyntaxNode,
-    _items: &mut Vec<CompletionItem>,
+    host: &mut AnalysisHost,
+    pos: FilePosition,
+    receiver: &SyntaxNode,
+    items: &mut Vec<CompletionItem>,
 ) {
+    // Resolve the receiver at its first non-trivia token's start offset.
+    // `receiver.text_range().start()` is NOT safe here: leading trivia (e.g.
+    // whitespace before `cnt` in `NAME_EXPR@45..49 { WHITESPACE " " IDENT
+    // "cnt" }`) is a child of the receiver node itself, so the node's raw
+    // range start can land on whitespace rather than the identifier —
+    // `host.resolve` (via `ident_at_offset`) requires the offset to be at/
+    // adjacent to an IDENT token and returns `None` otherwise.
+    let recv_pos = FilePosition {
+        file: pos.file,
+        offset: non_trivia_start(receiver),
+    };
+    let Some(def) = host.resolve(recv_pos) else {
+        return;
+    };
+    // Ledger field → ADT (or implicit Cell) methods.
+    if let Some(adt) = host.ledger_field_adt(&def) {
+        for m in host.ledger_adt_methods(&adt) {
+            items.push(CompletionItem {
+                label: m.name.clone(),
+                kind: CompletionKind::LedgerMethod,
+                detail: Some(m.sig.clone()),
+                documentation: Some(m.doc.clone()),
+            });
+        }
+        return;
+    }
+    // Enum receiver → variants.
+    if let analyzer_core::Definition::Item { file, index } = &def
+        && let Some(analysis) = host.analyze(*file)
+    {
+        let tree = analysis.item_tree.clone();
+        if tree
+            .symbols
+            .get(*index as usize)
+            .is_some_and(|s| s.kind == analyzer_core::SymbolKind::Enum)
+        {
+            for (_, sym) in tree.children_of(*index) {
+                if sym.kind == analyzer_core::SymbolKind::EnumVariant && !sym.name.is_empty() {
+                    items.push(CompletionItem {
+                        label: sym.name.clone(),
+                        kind: CompletionKind::EnumVariant,
+                        detail: Some(sym.signature.clone()),
+                        documentation: sym.doc.clone(),
+                    });
+                }
+            }
+        }
+    }
 }
+
 fn push_struct_fields(
-    _host: &mut AnalysisHost,
-    _pos: FilePosition,
-    _struct_expr: &SyntaxNode,
-    _items: &mut Vec<CompletionItem>,
+    host: &mut AnalysisHost,
+    pos: FilePosition,
+    struct_expr: &SyntaxNode,
+    items: &mut Vec<CompletionItem>,
 ) {
+    let Some(se) = compactp_ast::expr::StructExpr::cast(struct_expr.clone()) else {
+        return;
+    };
+    let Some(name_tok) = se.name() else { return };
+    // Fields already written in this literal.
+    let provided: std::collections::HashSet<String> = se
+        .field_inits()
+        .filter_map(|fi| fi.name().map(|t| t.text().to_string()))
+        .collect();
+    // Resolve the struct type from its name token position.
+    let def = host.resolve(FilePosition {
+        file: pos.file,
+        offset: name_tok.text_range().start(),
+    });
+    let Some(analyzer_core::Definition::Item { file, index }) = def else {
+        return;
+    };
+    let Some(analysis) = host.analyze(file) else {
+        return;
+    };
+    let tree = analysis.item_tree.clone();
+    if tree
+        .symbols
+        .get(index as usize)
+        .is_none_or(|s| s.kind != analyzer_core::SymbolKind::Struct)
+    {
+        return;
+    }
+    for (_, sym) in tree.children_of(index) {
+        if sym.kind == analyzer_core::SymbolKind::StructField
+            && !sym.name.is_empty()
+            && !provided.contains(&sym.name)
+        {
+            items.push(CompletionItem {
+                label: sym.name.clone(),
+                kind: CompletionKind::StructField,
+                detail: Some(sym.signature.clone()),
+                documentation: sym.doc.clone(),
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -631,5 +734,78 @@ mod tests {
         // (nearest/const wins over the param via the `seen` dedup set).
         let ls = labels("circuit f(x: Field): Field { const x = 1; return $0 }");
         assert_eq!(ls.iter().filter(|l| *l == "x").count(), 1);
+    }
+
+    #[test]
+    fn member_on_ledger_field_offers_adt_methods() {
+        let ls = labels("export ledger cnt: Counter;\ncircuit f(): [] { cnt.$0 }");
+        assert!(ls.contains(&"increment".to_string()));
+        assert!(ls.contains(&"resetToDefault".to_string()));
+        // increment's detail carries the probe-confirmed Uint<16> signature.
+        // (label-only assert here; detail checked below)
+    }
+
+    #[test]
+    fn member_on_plain_ledger_field_offers_cell_methods() {
+        let ls = labels("export ledger bal: Uint<64>;\ncircuit f(): [] { bal.$0 }");
+        assert!(ls.contains(&"read".to_string()));
+        assert!(ls.contains(&"write".to_string()));
+    }
+
+    #[test]
+    fn member_on_enum_offers_variants() {
+        let ls = labels("enum Color { red, blue }\ncircuit f(): [] { const c = Color.$0 }");
+        assert!(ls.contains(&"red".to_string()));
+        assert!(ls.contains(&"blue".to_string()));
+    }
+
+    #[test]
+    fn struct_literal_offers_remaining_fields() {
+        let ls = labels(
+            "struct Point { x: Field; y: Field; }\n\
+             circuit f(): [] { const p = Point { x: 1, $0 }; }",
+        );
+        assert!(ls.contains(&"y".to_string()));
+        // x already provided — not re-offered.
+        assert!(!ls.contains(&"x".to_string()));
+    }
+
+    // CARRY-OVER (Task 3 review): `enclosing_struct_literal` takes the LEFT
+    // token on `TokenAtOffset::Between`, unlike the sibling classifiers which
+    // prefer a RIGHT IDENT. This exercises the `Between` path directly (comma
+    // immediately followed by `}`, no whitespace between them, so the cursor
+    // sits exactly on the token boundary rather than inside trivia) to
+    // confirm it still classifies correctly and offers the right field.
+    // `STRUCT_EXPR`'s children are flat (comma and `}` are both direct
+    // children of `STRUCT_EXPR`), so either token's parent resolves to the
+    // same `STRUCT_EXPR` — the left-vs-right choice is genuinely inert here.
+    #[test]
+    fn struct_literal_between_token_boundary_still_classifies() {
+        let ls = labels(
+            "struct Point { x: Field; y: Field; }\n\
+             circuit f(): [] { const p = Point { x: 1,$0} }",
+        );
+        assert!(ls.contains(&"y".to_string()));
+        assert!(!ls.contains(&"x".to_string()));
+    }
+
+    #[test]
+    fn ledger_method_detail_uses_probe_confirmed_signature() {
+        let (clean, offset) =
+            fixture::extract("export ledger cnt: Counter;\ncircuit f(): [] { cnt.$0 }");
+        let mut host = AnalysisHost::new();
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/main.compact"));
+        host.vfs_mut().set_overlay(file, clean, 1);
+        let inc = completion(&mut host, FilePosition { file, offset })
+            .into_iter()
+            .find(|c| c.label == "increment")
+            .unwrap();
+        assert_eq!(
+            inc.detail.as_deref(),
+            Some("increment(amount: Uint<16>): []")
+        );
+        assert_eq!(inc.kind, CompletionKind::LedgerMethod);
     }
 }

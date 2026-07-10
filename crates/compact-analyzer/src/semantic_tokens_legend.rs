@@ -92,6 +92,14 @@ pub(crate) fn encode_semantic_tokens(tokens: &[SemToken], li: &LineIndex) -> Vec
         if length == 0 {
             continue;
         }
+        // Precondition: `tokens` must be sorted non-decreasing by document
+        // position (analyzer-ide yields them in `descendants_with_tokens()`
+        // order). The delta math below subtracts `prev_*` from `start_*` as
+        // u32 — out-of-order input would panic (debug) or wrap (release).
+        debug_assert!(
+            start.line > prev_line || (start.line == prev_line && start.col >= prev_col),
+            "semantic tokens must be in non-decreasing document order"
+        );
         let delta_line = start.line - prev_line;
         let delta_start = if delta_line == 0 {
             start.col - prev_col
@@ -109,4 +117,93 @@ pub(crate) fn encode_semantic_tokens(tokens: &[SemToken], li: &LineIndex) -> Vec
         prev_col = start.col;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Independent oracle for the legend↔index correspondence (the plan's
+    /// highest-risk invariant). Rust match-exhaustiveness catches an *added*
+    /// `TokenType` variant, but NOT a *reordered* one — swapping two arms in
+    /// `token_type_index` while leaving `legend_types()` untouched compiles
+    /// clean and silently mis-colors every token. This test enumerates all 17
+    /// variants and their expected legend entry explicitly (NOT loop-derived
+    /// from the mapping under test), asserting both directions: the mapping
+    /// returns the expected index, AND the legend at that index is the
+    /// expected `SemanticTokenType`.
+    #[test]
+    fn legend_matches_index_mapping() {
+        let types = legend_types();
+        let cases: [(TokenType, u32, SemanticTokenType); 17] = [
+            (TokenType::Keyword, 0, SemanticTokenType::KEYWORD),
+            (TokenType::Type, 1, SemanticTokenType::TYPE),
+            (TokenType::Struct, 2, SemanticTokenType::STRUCT),
+            (TokenType::Enum, 3, SemanticTokenType::ENUM),
+            (TokenType::EnumMember, 4, SemanticTokenType::ENUM_MEMBER),
+            (
+                TokenType::TypeParameter,
+                5,
+                SemanticTokenType::TYPE_PARAMETER,
+            ),
+            (TokenType::Parameter, 6, SemanticTokenType::PARAMETER),
+            (TokenType::Variable, 7, SemanticTokenType::VARIABLE),
+            (TokenType::Property, 8, SemanticTokenType::PROPERTY),
+            (TokenType::Function, 9, SemanticTokenType::FUNCTION),
+            (TokenType::Method, 10, SemanticTokenType::METHOD),
+            (TokenType::Namespace, 11, SemanticTokenType::NAMESPACE),
+            (TokenType::Comment, 12, SemanticTokenType::COMMENT),
+            (TokenType::StringLit, 13, SemanticTokenType::STRING),
+            (TokenType::Number, 14, SemanticTokenType::NUMBER),
+            (TokenType::Operator, 15, SemanticTokenType::OPERATOR),
+            (
+                TokenType::Punctuation,
+                16,
+                SemanticTokenType::new("punctuation"),
+            ),
+        ];
+        assert_eq!(
+            types.len(),
+            cases.len(),
+            "legend size must match case count"
+        );
+        for (ty, expected_idx, expected_type) in cases {
+            assert_eq!(
+                token_type_index(ty),
+                expected_idx,
+                "token_type_index({ty:?}) must be {expected_idx}"
+            );
+            assert_eq!(
+                types[expected_idx as usize], expected_type,
+                "legend_types()[{expected_idx}] must be {expected_type:?} (for {ty:?})"
+            );
+        }
+    }
+
+    /// Independent oracle for the modifier bitset↔legend correspondence.
+    #[test]
+    fn legend_matches_modifier_bitset() {
+        let mods = legend_modifiers();
+        assert_eq!(mods.len(), 2);
+        assert_eq!(mods[0], SemanticTokenModifier::DECLARATION, "bit 0");
+        assert_eq!(mods[1], SemanticTokenModifier::DEFAULT_LIBRARY, "bit 1");
+
+        let none = TokenMods::default();
+        let decl = TokenMods {
+            declaration: true,
+            default_library: false,
+        };
+        let lib = TokenMods {
+            declaration: false,
+            default_library: true,
+        };
+        let both = TokenMods {
+            declaration: true,
+            default_library: true,
+        };
+        assert_eq!(token_mods_bitset(none), 0);
+        assert_eq!(token_mods_bitset(decl), 1, "declaration => bit 0");
+        assert_eq!(token_mods_bitset(lib), 2, "default_library => bit 1");
+        assert_eq!(token_mods_bitset(both), 3, "both bits set");
+    }
 }

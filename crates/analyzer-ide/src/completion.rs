@@ -211,7 +211,7 @@ fn first_expr_child(node: &SyntaxNode) -> Option<SyntaxNode> {
 /// node (`CALL_EXPR`/`INDEX_EXPR`/nested `MEMBER_EXPR`) it returns the offset of
 /// the *innermost-leftmost* identifier, not the receiver as a whole — callers
 /// must gate on `node.kind() == NAME_EXPR` before calling (see `push_member`).
-fn non_trivia_start(node: &SyntaxNode) -> TextSize {
+pub(crate) fn non_trivia_start(node: &SyntaxNode) -> TextSize {
     node.descendants_with_tokens()
         .filter_map(rowan::NodeOrToken::into_token)
         .find(|t| !t.kind().is_trivia())

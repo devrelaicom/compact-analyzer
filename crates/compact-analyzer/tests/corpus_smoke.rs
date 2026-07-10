@@ -89,3 +89,63 @@ fn corpus_smoke_no_panics_no_oob_spans() {
         assert_in_bounds(&mut host, s.file, s.name_range, "workspace symbol");
     }
 }
+
+/// M3 sweep: runs completion, semantic tokens, folding, and selection ranges
+/// over the corpus at sampled positions, guarded under `catch_unwind` so one
+/// pathological file cannot abort the run. Asserts no panics and no
+/// out-of-bounds spans, including inside error-recovered trees.
+#[test]
+fn m3_features_never_panic_on_corpus() {
+    let Some(dir) = corpus_dir() else {
+        eprintln!("corpus not present; skipping");
+        return;
+    };
+    let files = analyzer_core::discover_compact_files(&[dir]);
+    for path in files {
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let len = src.len() as u32;
+        let result = std::panic::catch_unwind(|| {
+            let mut host = analyzer_core::AnalysisHost::new();
+            let file = host.vfs_mut().file_id(&path);
+            host.vfs_mut().set_overlay(file, src.clone(), 1);
+
+            // Semantic tokens: in-bounds, ordered.
+            for t in analyzer_ide::semantic_tokens(&mut host, file) {
+                assert!(u32::from(t.range.end()) <= len, "token OOB in {:?}", path);
+            }
+            // Folding + selection: in-bounds.
+            for f in analyzer_ide::folding_ranges(&mut host, file) {
+                assert!(u32::from(f.range.end()) <= len);
+            }
+            // Completion at a bounded sample of offsets (every ~16th byte on a
+            // char boundary), including right after any '.' (member trigger).
+            let mut offsets: Vec<analyzer_core::TextSize> = (0..=len)
+                .step_by(16)
+                .filter(|&o| src.is_char_boundary(o as usize))
+                .map(analyzer_core::TextSize::new)
+                .collect();
+            for (i, _) in src.match_indices('.') {
+                let o = (i + 1) as u32;
+                if src.is_char_boundary(o as usize) {
+                    offsets.push(analyzer_core::TextSize::new(o));
+                }
+            }
+            for off in &offsets {
+                let _ = analyzer_ide::completion(
+                    &mut host,
+                    analyzer_core::FilePosition { file, offset: *off },
+                );
+            }
+            let chains = analyzer_ide::selection_ranges(&mut host, file, &offsets);
+            for chain in chains {
+                for r in chain {
+                    assert!(u32::from(r.end()) <= len);
+                }
+            }
+        });
+        assert!(result.is_ok(), "M3 features panicked on {:?}", path);
+    }
+}

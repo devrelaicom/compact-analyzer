@@ -398,13 +398,12 @@ impl crate::AnalysisHost {
     ) -> Option<Definition> {
         let source_file = compactp_ast::SourceFile::cast(root.clone())?;
         let from_dir = self.vfs().path(file).parent()?.to_path_buf();
-        let search = self.import_search_path();
         // Collect target FileIds first (avoids a borrow across the loop body).
         let mut targets = Vec::new();
         for inc in source_file.includes() {
             if let Some(tok) = inc.path() {
                 let raw = crate::string_lit_text(tok.text());
-                if let Some(path) = crate::find_source_pathname(&from_dir, &search, &raw) {
+                if let Some(path) = self.cached_source_pathname(&from_dir, &raw) {
                     targets.push(self.vfs_mut().file_id(&path));
                 }
             }
@@ -533,8 +532,7 @@ impl crate::AnalysisHost {
         expected_module: &str,
         target_name: &str,
     ) -> Option<Definition> {
-        let search = self.import_search_path();
-        let path = crate::find_source_pathname(from_dir, &search, raw)?;
+        let path = self.cached_source_pathname(from_dir, raw)?;
         let file = self.vfs_mut().file_id(&path);
         let tree = self.analyze(file)?.item_tree.clone();
         let (module_idx, module_sym) = single_top_level_module(&tree)?;
@@ -767,7 +765,7 @@ impl crate::AnalysisHost {
                 {
                     continue; // satisfied by an in-scope module
                 }
-                match crate::find_source_pathname(&from_dir, &search, &nm) {
+                match self.cached_source_pathname(&from_dir, &nm) {
                     None => diags.push(unresolved_import_diag(
                         &nm,
                         &from_dir,
@@ -787,7 +785,7 @@ impl crate::AnalysisHost {
                 let Some(expected) = crate::path_module_name(&raw) else {
                     continue;
                 };
-                match crate::find_source_pathname(&from_dir, &search, &raw) {
+                match self.cached_source_pathname(&from_dir, &raw) {
                     None => diags.push(unresolved_import_diag(&raw, &from_dir, &search, span)),
                     Some(path) => {
                         let target = self.vfs_mut().file_id(&path);
@@ -801,7 +799,7 @@ impl crate::AnalysisHost {
         for inc in sf.includes() {
             if let Some(tok) = inc.path() {
                 let raw = crate::string_lit_text(tok.text());
-                if crate::find_source_pathname(&from_dir, &search, &raw).is_none() {
+                if self.cached_source_pathname(&from_dir, &raw).is_none() {
                     diags.push(unresolved_include_diag(
                         &raw,
                         &from_dir,
@@ -1659,5 +1657,169 @@ mod tests {
         let diags = host.resolution_diagnostics(file);
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("cannot resolve include"));
+    }
+
+    // ---- CR-3: cached source-path resolution ----
+    //
+    // These four tests exercise the memo behind `cached_source_pathname`
+    // through the observable `resolution_diagnostics` surface (an import
+    // resolves ⇒ 0 diagnostics; it does not ⇒ 1 "cannot resolve import"). The
+    // first proves the probe is memoized; the other three prove each of the
+    // three invalidation hooks. Every invalidation test is written to go RED if
+    // its specific hook is deleted (see report for the confirmation runs).
+
+    const FOO_MODULE: &str = "module Foo { export circuit f(): Field { return 0; } }";
+
+    /// Memoization: after the target is deleted from disk WITHOUT notifying the
+    /// host (no generation bump, no `forget_file`), resolution still serves the
+    /// cached `Some(...)`, proving the second probe did not re-hit disk. A raw,
+    /// uncached probe (asserted alongside) sees the file is gone. Goes RED with
+    /// no memo at all: the second call would re-probe and report the import
+    /// unresolved.
+    #[test]
+    fn source_path_probe_is_memoized_within_an_epoch() {
+        let (mut host, dir, file) = diag_host(
+            &[
+                ("Foo.compact", FOO_MODULE),
+                (
+                    "main.compact",
+                    "import Foo;\ncircuit m(): Field { return 0; }",
+                ),
+            ],
+            "main.compact",
+        );
+        // First probe resolves and caches Some(Foo.compact).
+        assert!(host.resolution_diagnostics(file).is_empty());
+
+        // Delete the target out-of-band: nothing tells the host, so from the
+        // host's disk model nothing that could change the result has happened.
+        let foo = dir.path().join("Foo.compact");
+        std::fs::remove_file(&foo).unwrap();
+        // A fresh, uncached probe would now say None...
+        assert!(!foo.exists());
+        assert!(crate::find_source_pathname(dir.path(), &[], "Foo").is_none());
+        // ...but the memoized probe still serves the old Some ⇒ still no diag.
+        assert!(
+            host.resolution_diagnostics(file).is_empty(),
+            "memoized probe must not re-hit disk within an epoch"
+        );
+    }
+
+    /// Generation hook: a watched-file CREATE is signalled via `invalidate_disk`
+    /// (which bumps the generation). That must invalidate a cached `None` so the
+    /// now-present import resolves. Goes RED if the generation-change clear is
+    /// removed: the stale `None` survives and the import still reports
+    /// unresolved.
+    #[test]
+    fn create_invalidates_cached_none_via_generation() {
+        let (mut host, dir, file) = diag_host(
+            &[(
+                "main.compact",
+                "import Foo;\ncircuit m(): Field { return 0; }",
+            )],
+            "main.compact",
+        );
+        // Foo.compact does not exist yet ⇒ unresolved, caches None.
+        assert_eq!(host.resolution_diagnostics(file).len(), 1);
+
+        // Create the file and signal it the way the watcher does: CREATE →
+        // invalidate_disk → generation bump.
+        let foo = dir.path().join("Foo.compact");
+        std::fs::write(&foo, FOO_MODULE).unwrap();
+        let foo_id = host.vfs_mut().file_id(&foo);
+        let gen_before = host.generation();
+        host.vfs_mut().invalidate_disk(foo_id);
+        assert!(
+            host.generation() > gen_before,
+            "invalidate_disk must bump the generation"
+        );
+
+        // The generation changed ⇒ cache cleared ⇒ the import now resolves.
+        assert!(
+            host.resolution_diagnostics(file).is_empty(),
+            "a generation bump must invalidate the cached None"
+        );
+    }
+
+    /// `forget_file` hook: a watched-file DELETE routes through
+    /// `remove_workspace_file` → `forget_file` and does NOT bump the
+    /// generation — the exact case that makes a generation-keyed-ALONE cache
+    /// incorrect. The cached `Some` must be dropped so the import goes
+    /// unresolved. Goes RED if the `forget_file` clear is removed: the stale
+    /// `Some` survives the deletion.
+    #[test]
+    fn delete_invalidates_cached_some_via_forget_file() {
+        let (mut host, dir, file) = diag_host(
+            &[
+                ("Foo.compact", FOO_MODULE),
+                (
+                    "main.compact",
+                    "import Foo;\ncircuit m(): Field { return 0; }",
+                ),
+            ],
+            "main.compact",
+        );
+        // Resolves and caches Some(Foo.compact).
+        assert!(host.resolution_diagnostics(file).is_empty());
+
+        // Delete the file and signal it the way the watcher does: DELETE →
+        // remove_workspace_file → forget_file. This does NOT bump generation.
+        let foo = dir.path().join("Foo.compact");
+        let foo_id = host.vfs_mut().file_id(&foo);
+        std::fs::remove_file(&foo).unwrap();
+        let gen_before = host.generation();
+        host.remove_workspace_file(foo_id);
+        assert_eq!(
+            host.generation(),
+            gen_before,
+            "a DELETE must not bump the generation (this is why forget_file must clear)"
+        );
+
+        // The cached Some must have been invalidated ⇒ import now unresolved.
+        let diags = host.resolution_diagnostics(file);
+        assert_eq!(
+            diags.len(),
+            1,
+            "forget_file must invalidate the cached Some"
+        );
+        assert!(diags[0].message.contains("cannot resolve import"));
+    }
+
+    /// `set_import_search_path` hook: the search path is an implicit part of
+    /// every probe key and changing it does NOT bump the generation. The cached
+    /// `None` (computed under the empty search path) must be dropped so the
+    /// now-reachable import resolves. Goes RED if that clear is removed.
+    #[test]
+    fn search_path_change_invalidates_cache() {
+        let (mut host, dir, file) = diag_host(
+            &[
+                (
+                    "libs/Bar.compact",
+                    "module Bar { export circuit g(): Field { return 0; } }",
+                ),
+                (
+                    "main.compact",
+                    "import Bar;\ncircuit m(): Field { return 0; }",
+                ),
+            ],
+            "main.compact",
+        );
+        // Bar lives only under libs/, which is not searched yet ⇒ unresolved,
+        // caches None.
+        assert_eq!(host.resolution_diagnostics(file).len(), 1);
+
+        let gen_before = host.generation();
+        host.set_import_search_path(vec![dir.path().join("libs")]);
+        assert_eq!(
+            host.generation(),
+            gen_before,
+            "changing the search path must not bump the generation"
+        );
+
+        // The memo cleared on the config change ⇒ Bar now resolves.
+        assert!(
+            host.resolution_diagnostics(file).is_empty(),
+            "set_import_search_path must invalidate the cache"
+        );
     }
 }

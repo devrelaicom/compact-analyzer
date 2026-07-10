@@ -99,13 +99,15 @@ fn compile_on_save_publishes_merged_compactc_diagnostic() {
 /// literally in flight against a hung/adversarial compiler. A `compact` shim
 /// answers the version probes `Toolchain::discover` makes at initialize (so the
 /// server accepts it as the toolchain) but SLEEPS on the real compile
-/// invocation — a stand-in for a compiler that never returns. Its 60s sleep far
-/// exceeds both this test's 5s patience AND the server's 30s `COMPILE_TIMEOUT`,
-/// so the server can only exit within the bound if shutdown actively KILLS the
-/// in-flight child (Task 6b): the worker threads `GlobalState.shutdown` into
+/// invocation — a stand-in for a compiler that never returns. Its 8s sleep
+/// exceeds this test's 5s patience; absent the cancel-kill, the in-flight
+/// compile would only end at `min(8s shim sleep, 30s COMPILE_TIMEOUT) = 8s`,
+/// still overshooting the 5s bound, so a pass still proves the in-flight
+/// child was actively killed rather than merely outrun by a short sleep. The
+/// mechanism (Task 6b): the worker threads `GlobalState.shutdown` into
 /// `compile_file` as a cancel token, the poll loop observes it within a tick,
 /// kills the child's process group, and drops its `sender` so `io_threads.join()`
-/// returns. Without the kill, `io_threads.join()` would block ~30s and
+/// returns. Without the kill, `io_threads.join()` would block ~8s and
 /// `wait_with_timeout(5s)` would fail. `#[cfg(unix)]` (shell shim + chmod).
 #[cfg(unix)]
 #[test]
@@ -119,7 +121,7 @@ fn shutdown_is_prompt_with_a_hung_compile_in_flight() {
         "#!/bin/sh\n",
         "if [ \"$1\" = \"compile\" ] && [ \"$2\" = \"--version\" ]; then echo 9.9.9-shim; exit 0; fi\n",
         "if [ \"$1\" = \"compile\" ] && [ \"$2\" = \"--language-version\" ]; then echo 0.0.0-shim; exit 0; fi\n",
-        "sleep 60\n",
+        "sleep 8\n",
     );
     std::fs::write(&shim_path, script).unwrap();
     std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -165,7 +167,7 @@ fn shutdown_is_prompt_with_a_hung_compile_in_flight() {
     assert!(
         elapsed < Duration::from_secs(5),
         "shutdown took {elapsed:?}; a killed in-flight compile should exit in well under the \
-         5s bound (and far under the shim's 60s sleep / the 30s COMPILE_TIMEOUT)"
+         5s bound (and far under the shim's 8s sleep / the 30s COMPILE_TIMEOUT)"
     );
 }
 

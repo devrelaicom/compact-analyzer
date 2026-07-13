@@ -12,6 +12,7 @@ esbuild.mjs
 eslint.config.mjs
 .gitignore
 .vscodeignore
+.nvmrc
 
 # Dependencies and lockfile
 node_modules/**

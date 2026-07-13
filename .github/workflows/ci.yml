@@ -89,3 +89,55 @@ jobs:
 
       - run: cargo test -p analyzer-toolchain --locked
       - run: cargo test -p compact-analyzer --test lsp_toolchain --locked
+
+  # Builds, checks, and smoke-packages the VS Code extension. Node 22 is used
+  # deliberately — NOT the extension's 20.19 runtime floor (`engines.node`) —
+  # because the dev-time test tooling (@vscode/test-cli / @vscode/test-electron)
+  # declares `engines.node >= 22`; `npm ci` on Node 22 installs it cleanly.
+  extension:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+      # `--no-dependencies`: the runtime dependency is inlined into dist/ by
+      # esbuild, so vsce must not walk node_modules.
+      - run: npx vsce package --no-dependencies
+
+  # Runs the activation smoke E2E in a real VS Code host under Xvfb. Node 22 is
+  # required for the same reason as the `extension` job. The E2E resolves the
+  # server via `serverPath` = the freshly built debug binary (the harness throws
+  # a clear error if it is absent), so the Rust build runs before the E2E.
+  extension-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Xvfb provides the virtual display the headless VS Code host renders into.
+      - name: Install Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+      # The E2E harness (.vscode-test.mjs) points `serverPath` at this binary.
+      - name: Build the language server (debug)
+        run: cargo build -p compact-analyzer --locked
+      - name: Install extension dependencies
+        working-directory: editors/vscode
+        run: npm ci
+      - name: Run the activation E2E under Xvfb
+        working-directory: editors/vscode
+        run: xvfb-run -a npm run test:e2e

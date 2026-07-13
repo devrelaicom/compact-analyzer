@@ -1,0 +1,118 @@
+# Lockstep VSIX release pipeline.
+#
+# Ordering problem this solves: the published extension must embed the FINAL
+# server-artifact checksums, which only exist once `dist` (the generated
+# `release.yml`) has built and hashed the archives and attached them to a
+# GitHub Release. So this workflow is DECOUPLED from `release.yml`: it fires
+# after the release is published, reads that release's checksum assets, bakes
+# `server-manifest.json`, packages the VSIX against those real checksums, and
+# uploads it to the same release. Being separate makes it independently
+# re-runnable if a publish leg fails, without rebuilding the server artifacts.
+#
+# The marketplace / Open VSX publish legs are DORMANT by design: each is gated
+# on a human-owned secret and no-ops until that secret exists. This workflow
+# never creates a tag and never publishes without those secrets.
+name: Extension Release
+
+on:
+  release:
+    types: [published]
+  # Manual re-run / rehearsal. Defaults to a dry run: it bakes the manifest and
+  # packages the VSIX, but skips the release upload and every publish leg, so it
+  # is a safe end-to-end rehearsal against an already-published tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build the extension for (e.g. v0.1.0)."
+        required: true
+        type: string
+      dry_run:
+        description: "Build + package only; skip the release upload and all publishing."
+        type: boolean
+        default: true
+
+# `gh release upload` writes an asset back to the release.
+permissions:
+  contents: write
+
+jobs:
+  package-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Job-level env indirection for the secret guards. `secrets.*` cannot be
+      # referenced in a step-level `if:` (per GitHub's docs), so the publish
+      # tokens are surfaced here as env vars and each publish step is gated on
+      # `env.<VAR> != ''`. An unset secret resolves to an empty string, so the
+      # guarded steps stay dormant until the human-owned secrets are created.
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      # Open VSX token. The secret is named OVSX_TOKEN (human-owned); it is
+      # surfaced as OVSX_PAT because that is the environment variable the `ovsx`
+      # CLI reads automatically (see ovsx/lib/util.js), mirroring how `vsce`
+      # reads VSCE_PAT. Guarding on env.OVSX_PAT is therefore equivalent to
+      # guarding on the secret's presence.
+      OVSX_PAT: ${{ secrets.OVSX_TOKEN }}
+      # The release tag: the `release` event carries it; `workflow_dispatch`
+      # supplies it as an input.
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      # Dry run only for a manual dispatch that requests it; a real published
+      # release always uploads (and publishes, subject to the secret guards).
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Grab the release's checksum assets: the aggregate `sha256.sum` and the
+      # per-artifact `*.tar.gz.sha256` files both match this glob. The generator
+      # parses whichever are present.
+      - name: Download the release's checksum assets
+        run: |
+          mkdir -p checksums
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir checksums \
+            --pattern '*sha256*'
+
+      # Regenerate the committed dev-placeholder manifest in place, now with the
+      # real checksums for this tag. The version is derived from the tag.
+      - name: Bake server-manifest.json from the release checksums
+        run: |
+          node scripts/gen-server-manifest.mjs \
+            --checksums checksums \
+            --tag "$RELEASE_TAG" \
+            --out editors/vscode/server-manifest.json
+          echo "Baked manifest:"
+          cat editors/vscode/server-manifest.json
+
+      # `--no-dependencies`: the runtime dependency (vscode-languageclient) is
+      # inlined into dist/ by esbuild, so vsce must not walk node_modules.
+      - name: Install, build, and package the VSIX
+        working-directory: editors/vscode
+        run: |
+          npm ci
+          npm run build
+          npx vsce package --no-dependencies
+
+      - name: Upload the VSIX to the release
+        if: env.DRY_RUN != 'true'
+        working-directory: editors/vscode
+        run: gh release upload "$RELEASE_TAG" ./*.vsix --repo "$GITHUB_REPOSITORY" --clobber
+
+      # DORMANT until VSCE_PAT exists. `vsce publish` reads the token from the
+      # VSCE_PAT environment variable automatically; `--packagePath` publishes
+      # the already-built VSIX rather than re-packaging.
+      - name: Publish to the VS Code Marketplace
+        if: env.DRY_RUN != 'true' && env.VSCE_PAT != ''
+        working-directory: editors/vscode
+        run: npx vsce publish --no-dependencies --packagePath ./*.vsix
+
+      # DORMANT until OVSX_TOKEN exists. `ovsx publish` reads the token from the
+      # OVSX_PAT environment variable automatically.
+      - name: Publish to Open VSX
+        if: env.DRY_RUN != 'true' && env.OVSX_PAT != ''
+        working-directory: editors/vscode
+        run: npx ovsx publish --no-dependencies ./*.vsix

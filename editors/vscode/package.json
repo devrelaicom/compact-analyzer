@@ -22,8 +22,17 @@
     "directory": "editors/vscode"
   },
   "main": "./dist/extension.js",
-  "activationEvents": [],
+  "activationEvents": [
+    "onLanguage:compact"
+  ],
   "contributes": {
+    "commands": [
+      {
+        "command": "compact-analyzer.restartServer",
+        "title": "Restart Server",
+        "category": "Compact Analyzer"
+      }
+    ],
     "languages": [
       {
         "id": "compact",

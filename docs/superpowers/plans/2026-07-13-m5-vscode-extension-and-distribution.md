@@ -510,7 +510,10 @@ export function* tarEntries(buf: Uint8Array): Generator<TarEntry> {
 
 _(During execution: when a fixture/API/flag turns out wrong, fix it empirically, record the correction here with task number and root cause, and COMMIT the Errata edit promptly. Expected heavy hitters: V1 languageclient shapes (Task 9), V6 dist naming (Task 3 → 5/6/11), V3 vsce/ovsx flags (Task 11).)_
 
-- _(none yet)_
+- **Task 1 / V2 (manifest rules):** `activationEvents` is MANDATORY at `engines.vscode: ^1.91.0` whenever `main` is present — `vsce` hard-errors ("Manifest needs the 'activationEvents' property, given it has a 'main' property") without it. Auto-generation from `contributes` does not remove the requirement when `contributes` is empty. Scaffold ships `"activationEvents": []`; later tasks add `onLanguage:compact`.
+- **Task 1 / V3 (vsce, partial — full at Task 11):** `.vscodeignore` is exclude-only (gitignore-style); everything unmatched ships. `vsce` bundles production-dependency `node_modules` by default, so `node_modules/**` MUST be excluded for an esbuild-bundled extension. `vsce package` runs the `vscode:prepublish` npm script first (wired to `npm run build` → dist always fresh). Missing LICENSE is a non-blocking WARNING at `package` time (LICENSE lands in Task 2). `--no-dependencies` is the right `vsce package` flag for a bundled extension (Task 11).
+- **Task 1 / V4 (extension-host Node):** VS Code 1.91.0 bundles Electron 29.4.0 → Node **20.9.0** (Chromium 122). So the extension RUNTIME floor is Node 20.9 — global `fetch` (stable ≥18), `node:crypto`, `node:zlib` are ALL available (unblocks Tasks 6–7 without polyfills). Dev-tooling floor is higher — Node **20.19** — because `eslint@10.7.0` engines are `^20.19.0 || ^22.13.0 || >=24`; pinned via `engines.node >=20.19.0` + `.nvmrc`.
+- **Task 1 / toolchain deviation:** `typescript` pinned **6.0.3** (not latest 7.0.2): `typescript-eslint@8.63.0` peer-caps `typescript >=4.8.4 <6.1.0`; no stable typescript-eslint supports TS7 yet. `eslint@10.7.0` (major) is in-range for typescript-eslint's `eslint ^8.57||^9||^10` peer. `engines.node` is empirically vsce-safe (no reject/warn; VSIX file-list unchanged).
 
 ## Definition of Done
 

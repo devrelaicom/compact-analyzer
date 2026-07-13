@@ -1,0 +1,142 @@
+{
+  "pragma": {
+    "prefix": "pragma",
+    "body": [
+      "pragma language_version ${1:0.23};",
+      "$0"
+    ],
+    "description": "Require a specific version of the Compact language.",
+    "scope": "compact"
+  },
+  "ledger": {
+    "prefix": ["ledger", "state"],
+    "body": [
+      "ledger ${1:x}: ${2:Field};",
+      "$0"
+    ],
+    "description": "Declare a field of the contract's public ledger state.",
+    "scope": "compact"
+  },
+  "constructor": {
+    "prefix": "constructor",
+    "body": [
+      "constructor(${1:x}: ${2:Field}) {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Initialise the public ledger state.",
+    "scope": "compact"
+  },
+  "circuit": {
+    "prefix": "circuit",
+    "body": [
+      "${1|export circuit,circuit|} ${2:foo}(${3:x}: ${4:Field}): ${5:Field} {",
+      "\treturn ${6:x};",
+      "}",
+      "$0"
+    ],
+    "description": "Define a circuit.",
+    "scope": "compact"
+  },
+  "witness": {
+    "prefix": ["witness", "private"],
+    "body": [
+      "witness ${1:foo}(${2:x}: ${3:Field}): ${4:Field};",
+      "$0"
+    ],
+    "description": "Declare a witness (private off-chain computation).",
+    "scope": "compact"
+  },
+  "enum": {
+    "prefix": "enum",
+    "body": [
+      "enum ${1:State} { ${2:Idle}, ${3:Active} }",
+      "$0"
+    ],
+    "description": "Define an enum.",
+    "scope": "compact"
+  },
+  "stdlib": {
+    "prefix": ["import", "stdlib", "std"],
+    "body": [
+      "import CompactStandardLibrary;",
+      "$0"
+    ],
+    "description": "Import the Compact standard library.",
+    "scope": "compact"
+  },
+  "if": {
+    "prefix": "if",
+    "body": [
+      "if (${1:condition}) {",
+      "\t$0",
+      "}"
+    ],
+    "description": "if statement.",
+    "scope": "compact"
+  },
+  "map": {
+    "prefix": "map",
+    "body": [
+      "map(${1:fn}, ${2:vector});",
+      "$0"
+    ],
+    "description": "Map a function over a vector.",
+    "scope": "compact"
+  },
+  "fold": {
+    "prefix": "fold",
+    "body": [
+      "fold(${1:fn}, ${2:base}, ${3:vector});",
+      "$0"
+    ],
+    "description": "Fold a function with a base value over a vector.",
+    "scope": "compact"
+  },
+  "module": {
+    "prefix": "module",
+    "body": [
+      "module ${1:M} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Define a module.",
+    "scope": "compact"
+  },
+  "struct": {
+    "prefix": "struct",
+    "body": [
+      "struct ${1:Name} {",
+      "\t${2:field}: ${3:Field}",
+      "}",
+      "$0"
+    ],
+    "description": "Define a struct.",
+    "scope": "compact"
+  },
+  "assert": {
+    "prefix": "assert",
+    "body": [
+      "assert(${1:condition}, \"${2:message}\");",
+      "$0"
+    ],
+    "description": "Assert a condition, failing the transition with the given message.",
+    "scope": "compact"
+  },
+  "new smart contract": {
+    "prefix": "compact",
+    "body": [
+      "pragma language_version 0.23;",
+      "import CompactStandardLibrary;",
+      "",
+      "export ledger ${1:value}: ${2:Field};",
+      "",
+      "export circuit ${3:set_value}(${4:x}: ${2:Field}): [] {",
+      "\t${1:value} = disclose(${4:x});",
+      "}",
+      ""
+    ],
+    "description": "A minimal Compact smart contract file.",
+    "isFileTemplate": true
+  }
+}

@@ -6,6 +6,11 @@
 # TypeScript sources and tests (compiled into dist/extension.js)
 src/**
 
+# Development-only language-asset inputs and audit notes. The runtime assets
+# (language-configuration.json, syntaxes/, snippets/) live outside assets/ and
+# ARE shipped; only the regeneration inputs and notes are excluded here.
+assets/**
+
 # Tooling and configuration
 tsconfig.json
 esbuild.mjs

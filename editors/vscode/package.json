@@ -23,7 +23,34 @@
   },
   "main": "./dist/extension.js",
   "activationEvents": [],
-  "contributes": {},
+  "contributes": {
+    "languages": [
+      {
+        "id": "compact",
+        "aliases": [
+          "Compact",
+          "compact"
+        ],
+        "extensions": [
+          ".compact"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "compact",
+        "scopeName": "source.compact",
+        "path": "./syntaxes/compact.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "compact",
+        "path": "./snippets/compact.code-snippets"
+      }
+    ]
+  },
   "scripts": {
     "build": "node esbuild.mjs",
     "check": "tsc --noEmit",

@@ -39,28 +39,43 @@ export type ConfigReader = <T>(key: string) => T | undefined;
 export function buildInitOptions(read: ConfigReader): InitOptions {
   const options: InitOptions = {};
 
-  const importSearchPath = read<string[]>("importSearchPath");
+  // Every read is shape-guarded before use. This module runs inside
+  // `activate()`, so it must NEVER throw and must NEVER forward a wrong-typed
+  // value: a mistyped setting (e.g. `null`, or a bare string where an array is
+  // expected) is treated as absent rather than crashing activation or sending
+  // the server garbage. This mirrors the server's own tolerant
+  // `as_array()`/`as_str()`/`as_bool()` posture and keeps us robust even if VS
+  // Code's schema validation is bypassed.
+
+  const importSearchPath: unknown = read("importSearchPath");
   // G2 (load-bearing): an explicitly-sent `importSearchPath: []` tells the
   // server to use NO search path, which SUPPRESSES its `COMPACT_PATH` env
-  // fallback. An ABSENT key means "fall back to COMPACT_PATH". So when the
-  // setting is empty we omit the key entirely rather than helpfully sending
-  // `[]`.
-  if (importSearchPath !== undefined && importSearchPath.length > 0) {
-    options.importSearchPath = importSearchPath;
+  // fallback. An ABSENT key means "fall back to COMPACT_PATH". So we omit the
+  // key entirely for undefined/null/non-array/empty rather than helpfully
+  // sending `[]`. Non-string members are dropped, mirroring the server's
+  // `filter_map(as_str)`.
+  if (Array.isArray(importSearchPath)) {
+    const paths = importSearchPath.filter((entry): entry is string => typeof entry === "string");
+    if (paths.length > 0) {
+      options.importSearchPath = paths;
+    }
   }
 
-  const toolchainPath = read<string>("toolchainPath");
-  // Omitted when blank so the server keeps its own toolchain discovery; a
-  // non-empty value hands the server an explicit file-or-directory path.
-  if (toolchainPath !== undefined && toolchainPath !== "") {
+  const toolchainPath: unknown = read("toolchainPath");
+  // Omitted when blank/mistyped so the server keeps its own toolchain
+  // discovery; a non-empty string hands it an explicit file-or-directory path.
+  if (typeof toolchainPath === "string" && toolchainPath !== "") {
     options.toolchainPath = toolchainPath;
   }
 
   // `compileOnSave`/`formatting` are sent EXPLICITLY (even at their default
   // `true`) to decouple the client's defaults from the server's own defaults.
-  // `??` fills only the unset case; a configured `false` is preserved.
-  options.compileOnSave = read<boolean>("compileOnSave") ?? true;
-  options.formatting = read<boolean>("formatting") ?? true;
+  // A configured `false` is preserved; anything non-boolean (unset or
+  // mistyped) defaults to `true`.
+  const compileOnSave: unknown = read("compileOnSave");
+  options.compileOnSave = typeof compileOnSave === "boolean" ? compileOnSave : true;
+  const formatting: unknown = read("formatting");
+  options.formatting = typeof formatting === "boolean" ? formatting : true;
 
   return options;
 }
@@ -70,6 +85,8 @@ export function buildInitOptions(read: ConfigReader): InitOptions {
  * `undefined`. This drives server acquisition and is NEVER sent to the server.
  */
 export function readServerPath(read: ConfigReader): string | undefined {
-  const serverPath = read<string>("serverPath");
-  return serverPath !== undefined && serverPath !== "" ? serverPath : undefined;
+  // Shape-guarded like the rest: a mistyped `serverPath` reads back as `undefined`
+  // rather than propagating a non-string into server acquisition.
+  const serverPath: unknown = read("serverPath");
+  return typeof serverPath === "string" && serverPath !== "" ? serverPath : undefined;
 }

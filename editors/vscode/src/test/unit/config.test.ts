@@ -45,6 +45,34 @@ describe("buildInitOptions", () => {
     expect(result.compileOnSave).toBe(false);
     expect(result.formatting).toBe(false);
   });
+
+  // Shape-guards: mistyped settings must never throw at the activation path and
+  // must never forward a wrong-typed value to the server.
+  it("omits importSearchPath when it reads back as null (no throw)", () => {
+    const result = buildInitOptions(fakeReader({ importSearchPath: null }));
+    expect(Object.keys(result).sort()).toEqual(["compileOnSave", "formatting"]);
+    expect(result.importSearchPath).toBeUndefined();
+  });
+
+  it("omits importSearchPath when it is a bare string, not an array", () => {
+    const result = buildInitOptions(fakeReader({ importSearchPath: "not-an-array" }));
+    expect(result.importSearchPath).toBeUndefined();
+  });
+
+  it("drops non-string members of importSearchPath", () => {
+    const result = buildInitOptions(fakeReader({ importSearchPath: ["a", 1, null, "b"] }));
+    expect(result.importSearchPath).toEqual(["a", "b"]);
+  });
+
+  it("omits a non-string toolchainPath", () => {
+    const result = buildInitOptions(fakeReader({ toolchainPath: 123 }));
+    expect(result.toolchainPath).toBeUndefined();
+  });
+
+  it("defaults a non-boolean compileOnSave to true", () => {
+    const result = buildInitOptions(fakeReader({ compileOnSave: "yes" }));
+    expect(result.compileOnSave).toBe(true);
+  });
 });
 
 describe("readServerPath", () => {
@@ -54,5 +82,10 @@ describe("readServerPath", () => {
     );
     expect(readServerPath(fakeReader({ serverPath: "" }))).toBeUndefined();
     expect(readServerPath(fakeReader({}))).toBeUndefined();
+  });
+
+  it("returns undefined for a mistyped (non-string) serverPath", () => {
+    expect(readServerPath(fakeReader({ serverPath: 42 }))).toBeUndefined();
+    expect(readServerPath(fakeReader({ serverPath: null }))).toBeUndefined();
   });
 });

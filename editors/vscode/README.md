@@ -60,11 +60,11 @@ channel to see whether the toolchain was discovered.
 
 ## Troubleshooting
 
-Open the **Output** panel and select **"Compact Analyzer"**. The server logs a
-startup line there — which binary is running and whether the toolchain was
-found — for example `compact-analyzer <version>: compact toolchain <version> ...
-at <path>`, or `no compact toolchain found; compile-on-save disabled`. That line
-is the first thing to check when a feature is missing.
+Open the **Output** panel and select **"Compact Analyzer"**. The server logs
+startup lines there — including which toolchain was found — for example
+`compact-analyzer: compact toolchain <version> ... at <path>`, or
+`no compact toolchain found; compile-on-save disabled`. That toolchain line is
+the first thing to check when a feature is missing.
 
 ## macOS Gatekeeper (unsigned binaries)
 

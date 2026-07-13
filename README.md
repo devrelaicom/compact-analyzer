@@ -67,7 +67,8 @@ first use; you can also point it at your own binary with
 For editors other than VS Code — or to override the extension's bundled
 server — install the `compact-analyzer` binary directly:
 
-- **Homebrew** (macOS/Linux):
+- **Homebrew** (macOS/Linux) — available once the first release is published
+  (the tap formula is created by the release pipeline):
 
   ```sh
   brew install aaronbassett/homebrew-tap/compact-analyzer
@@ -172,13 +173,13 @@ After allowing the binary, point the extension at it with
 
 ## Troubleshooting
 
-On startup the server writes a single status line to stderr, which the VS Code
+On startup the server writes a few status lines to stderr, which the VS Code
 extension pipes into its **"Compact Analyzer"** output channel (open the Output
-panel and pick "Compact Analyzer" from the dropdown). It reports the resolved
-toolchain, for example:
+panel and pick "Compact Analyzer" from the dropdown). One of them reports the
+resolved toolchain, for example:
 
 ```
-compact-analyzer <version>: compact toolchain <version> (language <version>) at <path>
+compact-analyzer: compact toolchain <version> (language <version>) at <path>
 ```
 
 or, when no toolchain was found:

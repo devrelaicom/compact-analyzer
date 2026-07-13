@@ -67,6 +67,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// most this much, never indefinitely.
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
+/// Maximum number of spawn attempts when the OS momentarily reports the target
+/// executable as busy for writing (`ETXTBSY`) — see [`spawn_retrying_etxtbsy`]
+/// for why that transient can occur at all.
+const ETXTBSY_MAX_ATTEMPTS: u32 = 40;
+
+/// Delay between those attempts. The whole budget
+/// (`ETXTBSY_MAX_ATTEMPTS * ETXTBSY_RETRY_DELAY`, ~80ms) is a deliberately
+/// tight upper bound: it cannot wedge, and it stays far below any caller
+/// timeout and the shim tests' own promptness assertions.
+const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(2);
+
 /// Outcome of a [`run_with_timeout`] call. Every variant carries whatever
 /// stderr was captured (lossily decoded as UTF-8) before the outcome was
 /// known, except [`ProcessResult::SpawnFailed`], where the process never ran
@@ -128,7 +139,7 @@ pub(crate) fn run_with_timeout(
         .stderr(Stdio::piped());
     isolate_process_group(&mut command);
 
-    let mut child = match command.spawn() {
+    let mut child = match spawn_retrying_etxtbsy(|| command.spawn()) {
         Ok(child) => child,
         Err(err) => {
             let program = command.get_program().to_string_lossy().into_owned();
@@ -171,6 +182,52 @@ pub(crate) fn run_with_timeout(
             },
         },
     }
+}
+
+/// Runs `spawn` — a `Command::spawn`/`Command::output` call — retrying a
+/// bounded number of times when it fails with `ETXTBSY` ("text file busy"),
+/// and returning any other outcome (success or a different error) immediately.
+///
+/// On Linux, `execve` fails with `ETXTBSY` if the target file is open for
+/// writing by *any* process at that instant. In production this never fires:
+/// the real `compact` binary resolved on `PATH` is not being written, so the
+/// first attempt always succeeds and this wrapper costs nothing. It earns its
+/// keep only under this crate's OWN tests, which fabricate a throwaway
+/// `compact` shim on disk and then exec it. Those tests run as threads in a
+/// single process, and `Command::spawn` forks: at the fork instant the whole
+/// file-descriptor table is copied into the transient child, so a *different*
+/// test thread's momentarily-open write handle to some just-created shim is
+/// briefly present — as an inherited, still-open-for-write descriptor — in
+/// that child until it `execve`s (the descriptor is `CLOEXEC`, but the
+/// fork→exec window is not instantaneous). During that sub-millisecond window
+/// the shim counts as busy for writing, so a concurrent exec of it hits
+/// `ETXTBSY`. That is a genuine transient, reliably cleared by a short retry.
+///
+/// Only the spawn call itself is retried — never any subsequent wait — so this
+/// is entirely orthogonal to [`run_with_timeout`]'s deadline and cancellation
+/// handling: `ETXTBSY` is a failure to *start* the child, observed before it
+/// runs at all.
+pub(crate) fn spawn_retrying_etxtbsy<T>(
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    for _ in 1..ETXTBSY_MAX_ATTEMPTS {
+        match spawn() {
+            Err(err) if is_text_file_busy(&err) => std::thread::sleep(ETXTBSY_RETRY_DELAY),
+            result => return result,
+        }
+    }
+    // Final attempt: its result is surfaced as-is, so an `ETXTBSY` that somehow
+    // never clears degrades to exactly today's behaviour (a reported spawn
+    // failure) rather than looping forever.
+    spawn()
+}
+
+/// Whether `err` is the platform's "text file busy" (`ETXTBSY`) spawn failure.
+/// `ETXTBSY` is errno `26` on the Unixes this crate targets (Linux and macOS
+/// alike); on platforms that never raise it for this case the check simply
+/// never matches, leaving [`spawn_retrying_etxtbsy`] a no-op.
+fn is_text_file_busy(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(26)
 }
 
 /// Why [`poll_until_exit_or_deadline`] stopped waiting on the child.

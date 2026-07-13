@@ -115,13 +115,17 @@ fn query_version(candidate: &Path, flag: &str) -> Option<String> {
 /// inheriting our own stdio (critical: our stdout may be an LSP JSON-RPC
 /// channel). Returns `None` on any spawn failure instead of propagating.
 fn run(candidate: &Path, args: &[&str]) -> Option<Output> {
-    Command::new(candidate)
+    let mut command = Command::new(candidate);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()
+        .stderr(Stdio::piped());
+    // Retry a transient `ETXTBSY` around the spawn: see
+    // [`crate::process::spawn_retrying_etxtbsy`] for why a just-created shim
+    // can be momentarily busy for writing under this crate's parallel tests.
+    // A no-op in production, where the resolved `compact` is never mid-write.
+    crate::process::spawn_retrying_etxtbsy(|| command.output()).ok()
 }
 
 #[cfg(test)]

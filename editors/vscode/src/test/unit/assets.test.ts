@@ -77,8 +77,12 @@ function stripJsonc(input: string): string {
     i += 1;
   }
 
-  // Drop trailing commas that precede a closing brace/bracket. Strings have
-  // already been emitted intact above, so this only touches structural commas.
+  // Drop trailing commas that precede a closing brace/bracket. NB: this pass
+  // runs over the whole assembled output, not only structural regions — the
+  // string-aware scan above does NOT shield it, so a literal ",}" or ",]"
+  // inside a string value would be rewritten too. That is safe here only
+  // because no string value in the shipped asset files contains that byte
+  // sequence. Fold this into the scan loop if that assumption ever breaks.
   return out.replace(/,(\s*[}\]])/g, '$1');
 }
 

@@ -14,7 +14,10 @@ support in the `LFDT-Minokawa/compact` monorepo.
 - **Upstream path:** `editor-support/vsc/compact/`
 - **Pinned commit:** `fdfc61cf8b1311ca9fc5f8d155e1017d483a8acd`
 - **Licence:** Apache License, Version 2.0
-- **Licence text:** https://www.apache.org/licenses/LICENSE-2.0
+- **Licence text:** bundled with this extension as `LICENSE-Apache-2.0.txt`
+  (a verbatim copy of the upstream `editor-support/vsc/compact/LICENSE` at the
+  pinned commit), satisfying Apache-2.0 §4(a). The canonical text is also
+  published at https://www.apache.org/licenses/LICENSE-2.0.
 
 ### Files adapted from upstream
 
@@ -23,6 +26,7 @@ support in the `LFDT-Minokawa/compact` monorepo.
 | `language-configuration.json` | `editor-support/vsc/compact/language-configuration.json` | Copied verbatim. |
 | `syntaxes/compact.tmLanguage.json` | `editor-support/vsc/compact/syntaxes/compact.tmLanguage.json` | Adapted: keyword/type alternations updated for Compact language 0.23; JavaScript-reserved-word pattern removed. |
 | `snippets/compact.code-snippets` | `editor-support/vsc/compact/compact.code-snippets` | Adapted: snippet bodies audited and updated for Compact language 0.23. |
+| `package.json` (`contributes.languages`) | `editor-support/vsc/compact/package.json` | Language `aliases` set to `["Compact", "compact"]` (upstream: `["compact"]`) so the display name appears first in the language picker. |
 
 The upstream `scopeName` (`source.compact`) is preserved so existing colour
 themes that target Compact continue to apply.
@@ -33,8 +37,10 @@ carried; see `assets/NOTES.md` for the rationale.
 
 The upstream `editor-support/vsc/compact/LICENSE` is the standard Apache-2.0
 licence text with no project-specific copyright line and no accompanying
-`NOTICE` file. As permitted by Apache-2.0 §4, this notice provides the required
-attribution for the adapted material.
+`NOTICE` file. Its verbatim copy ships as `LICENSE-Apache-2.0.txt` (Apache-2.0
+§4(a)), and this notice — together with the change table above — provides the
+attribution and the statement of modifications required by Apache-2.0 §4(b–d)
+for the adapted material.
 
 ## Related distribution repository (not an asset source)
 

@@ -84,6 +84,14 @@ export function checkServerInfoCompatibility(
   if (typeof version !== "string" || version === "") {
     return { kind: "unknown" };
   }
+  // Present but not a parseable major.minor.patch (e.g. "dev", "unknown", a git
+  // hash): the authoritative pre-spawn `--version` probe in `acquire.ts` already
+  // accepted this binary, so an unparseable build string is `unknown` (accept +
+  // log), NOT a mismatch. Only a present-AND-parseable-AND-incompatible version
+  // is a hard `incompatible`. This prefix mirrors `version.ts`'s own parser.
+  if (!/^\d+\.\d+\.\d+/.test(version)) {
+    return { kind: "unknown" };
+  }
   if (!isCompatible(version, pinned)) {
     return {
       kind: "incompatible",

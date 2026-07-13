@@ -40,6 +40,21 @@ let client: LanguageClient | undefined;
 let status: "running" | "unavailable" = "unavailable";
 let source: ServerSource | null = null;
 
+// Every lifecycle transition (initial start, restart, deactivate teardown) runs
+// through this single serial chain, so overlapping invocations — e.g. two rapid
+// "Restart server" clicks, or a restart racing deactivate — can never leave a
+// started server orphaned. A rejected op never wedges the chain (the tail is
+// caught), while the returned promise still surfaces that op's own outcome.
+let lifecycle: Promise<void> = Promise.resolve();
+function enqueue(op: () => Promise<void>): Promise<void> {
+  const run = lifecycle.then(op, op);
+  lifecycle = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /**
@@ -66,19 +81,23 @@ async function showAcquireFailure(failure: AcquireFailure): Promise<void> {
 }
 
 /**
- * Acquire a server binary and, on success, start a fresh stdio LanguageClient,
- * setting the module status/source. The acquire-failure path shows one message
- * and returns (never throws); a thrown `start()` propagates to the caller.
+ * Acquire a server binary and, on success, start a fresh stdio LanguageClient.
+ * Fully self-contained: it NEVER throws, sets the module status/source itself,
+ * and adopts `client` ONLY after `start()` resolves AND the compatibility gate
+ * passes — so a rejected start or an incompatible server leaves `client`
+ * undefined and shows exactly one message. Always run via `enqueue`.
  */
 async function startServer(
   context: vscode.ExtensionContext,
   manifest: ServerManifest,
   out: vscode.LogOutputChannel,
 ): Promise<void> {
-  // Wrap the whole acquire so a last-resort download surfaces progress; the
-  // common (already-installed) path resolves before the notification lingers.
+  // Neutral title: acquire only downloads as a last resort, so the common
+  // already-installed path (a settings/PATH/storage probe, no download) must not
+  // claim to be "downloading". A real download still surfaces under this same
+  // progress notification.
   const result = await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: `Downloading compact-analyzer ${PINNED_SERVER_VERSION}…` },
+    { location: vscode.ProgressLocation.Notification, title: "Starting compact-analyzer…" },
     () =>
       acquireServer({
         configuredPath: configuredServerPath(),
@@ -103,48 +122,69 @@ async function startServer(
     outputChannel: out,
   };
   const lc = new LanguageClient("compact-analyzer", "Compact Analyzer", executable, options);
-  client = lc;
-  await lc.start();
+
+  // Do NOT adopt `lc` before start() resolves: a binary can pass the pre-spawn
+  // --version probe yet still crash/hang on LSP `initialize`, rejecting start().
+  // Adopting first would leave a StartFailed client that deactivate cannot stop.
+  try {
+    await lc.start();
+  } catch (error) {
+    await lc.dispose().catch(() => {}); // a StartFailed client rejects on dispose
+    client = undefined;
+    status = "unavailable";
+    source = null;
+    out.error(`The language server failed to start: ${describe(error)}`);
+    void vscode.window.showErrorMessage(
+      `Compact Analyzer's language server failed to start. ${describe(error)} ` +
+        'Run "Compact Analyzer: Restart Server" once the problem is resolved.',
+    );
+    return;
+  }
 
   // Belt-and-braces beyond the pre-spawn probe: re-check the negotiated version.
   const check = checkServerInfoCompatibility(lc.initializeResult?.serverInfo, PINNED_SERVER_VERSION);
   if (check.kind === "incompatible") {
     out.error(check.message);
-    await lc.stop();
-    client = undefined;
+    await lc.stop().catch(() => {}); // never let a teardown rejection escape
+    client = undefined; // never adopted; keep it that way
     status = "unavailable";
     source = null;
     void vscode.window.showErrorMessage(check.message);
     return;
   }
   if (check.kind === "unknown") {
-    out.warn("The language server did not report its version during initialize; skipping the post-handshake check.");
+    out.warn(
+      "The language server did not report a parseable version during initialize; skipping the post-handshake check.",
+    );
   }
+
+  // Success: adopt the client only now.
+  client = lc;
   status = "running";
   source = result.source;
 }
 
-/** Dispose the current client, RE-acquire (settings may have changed), then start afresh. */
+/** Dispose the current client (if any), resetting state. Never throws. */
+async function disposeCurrentClient(): Promise<void> {
+  const previous = client;
+  client = undefined;
+  status = "unavailable";
+  source = null;
+  if (previous) {
+    // dispose() fully tears the old client down before a fresh one is built; a
+    // StartFailed/already-stopped client rejects, so the rejection is swallowed.
+    await previous.dispose().catch(() => {});
+  }
+}
+
+/** Restart: dispose the current client, RE-acquire (settings may have changed), start afresh. */
 async function restartServer(
   context: vscode.ExtensionContext,
   manifest: ServerManifest,
   out: vscode.LogOutputChannel,
 ): Promise<void> {
-  try {
-    if (client) {
-      const previous = client;
-      client = undefined;
-      await previous.dispose();
-    }
-    status = "unavailable";
-    source = null;
-    await startServer(context, manifest, out);
-  } catch (error) {
-    status = "unavailable";
-    source = null;
-    out.error(`Restart failed: ${describe(error)}`);
-    void vscode.window.showErrorMessage(`Compact Analyzer: restart failed. ${describe(error)}`);
-  }
+  await disposeCurrentClient();
+  await startServer(context, manifest, out);
 }
 
 /** Nudge (once) that the sunsetted official extension can be uninstalled (OQ10). */
@@ -169,12 +209,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
     context.subscriptions.push(out);
     const manifest = loadManifest(context);
 
-    await startServer(context, manifest, out);
-
-    // The restart command is registered even when acquisition failed, so a user
-    // who installs the server afterwards can pick it up without reloading.
+    // Register the restart command and config listener UNCONDITIONALLY and BEFORE
+    // the first acquire/start, so they ALWAYS exist regardless of its outcome —
+    // making restart the reliable in-session recovery path even after a failed
+    // initial start (otherwise a palette "Restart Server" would error with
+    // "command not found" and only a window reload could recover).
     context.subscriptions.push(
-      vscode.commands.registerCommand(RESTART_COMMAND, () => restartServer(context, manifest, out)),
+      vscode.commands.registerCommand(RESTART_COMMAND, () =>
+        enqueue(() => restartServer(context, manifest, out)),
+      ),
     );
 
     // G3: the server reads its configuration ONLY at startup and has no
@@ -195,20 +238,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
       }),
     );
 
-    void maybeOfferCoexistenceHint(context);
+    // Initial start, serialised on the same lifecycle chain. startServer never
+    // throws, so a failed acquire/start degrades to "unavailable" and returns.
+    await enqueue(() => startServer(context, manifest, out));
+
+    // One-time coexistence nudge, guarded so a globalState rejection can never
+    // become an unhandled rejection.
+    void maybeOfferCoexistenceHint(context).catch(() => {});
   } catch (error) {
-    // Never let activation throw: degrade to unavailable with one message.
+    // Belt-and-braces: nothing above is expected to throw, but activation must
+    // never propagate one. Degrade to unavailable with a single message.
     status = "unavailable";
     source = null;
-    void vscode.window.showErrorMessage(
-      `Compact Analyzer failed to start its language server. ${describe(error)}`,
-    );
+    void vscode.window.showErrorMessage(`Compact Analyzer failed to activate. ${describe(error)}`);
   }
 
   return api;
 }
 
-export function deactivate(): Thenable<void> | undefined {
-  // The server has a FAST-EXIT shutdown, so a plain stop needs no timeout.
-  return client?.stop();
+export function deactivate(): Thenable<void> {
+  // Serialised teardown: waits for any in-flight start/restart, then stops the
+  // current client. Safe when `client` is undefined (resolves as a no-op). The
+  // server has a FAST-EXIT shutdown, so a plain stop needs no timeout.
+  return enqueue(async () => {
+    const previous = client;
+    client = undefined;
+    status = "unavailable";
+    source = null;
+    if (previous) {
+      await previous.stop().catch(() => {});
+    }
+  });
 }

@@ -75,6 +75,15 @@ describe("checkServerInfoCompatibility", () => {
     });
     expect(checkServerInfoCompatibility({ version: "" }, "0.1.0")).toEqual({ kind: "unknown" });
   });
+
+  it("treats a present-but-unparseable version as unknown, NOT incompatible", () => {
+    // The authoritative pre-spawn --version probe already accepted the binary,
+    // so a non-semver build string must not stop an otherwise-working server.
+    expect(checkServerInfoCompatibility({ version: "dev" }, "0.1.0")).toEqual({ kind: "unknown" });
+    expect(checkServerInfoCompatibility({ version: "unknown" }, "0.1.0")).toEqual({ kind: "unknown" });
+    expect(checkServerInfoCompatibility({ version: "0.1" }, "0.1.0")).toEqual({ kind: "unknown" });
+    expect(checkServerInfoCompatibility({ version: "abc123" }, "0.1.0")).toEqual({ kind: "unknown" });
+  });
 });
 
 describe("shouldOfferCoexistenceHint", () => {

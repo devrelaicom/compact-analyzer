@@ -1,4 +1,8 @@
-# compact-analyzer
+<p align="center">
+  <img src="assets/compact-analyzer-logo.svg" alt="compact-analyzer logo" width="128" height="128">
+</p>
+
+<h1 align="center">compact-analyzer</h1>
 
 A [rust-analyzer](https://rust-analyzer.github.io/)-style language server for
 the [Compact](https://docs.midnight.network/compact) smart contract language

@@ -49,7 +49,52 @@
         "language": "compact",
         "path": "./snippets/compact.code-snippets"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Compact Analyzer",
+      "properties": {
+        "compact-analyzer.serverPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Absolute path to a `compact-analyzer` language server binary. When set, the extension launches this binary instead of discovering or downloading one; leave blank to use the built-in acquisition (settings path, then `PATH`, then the download cache, then the pinned download). This setting is client-side only and is not sent to the server."
+        },
+        "compact-analyzer.importSearchPath": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Additional directories the server searches when resolving Compact `import` statements, sent to the server as `initializationOptions.importSearchPath`. When left empty, the setting is not sent and the server falls back to the `COMPACT_PATH` environment variable."
+        },
+        "compact-analyzer.toolchainPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the Compact toolchain — either the toolchain executable itself or a directory containing it. The server refers to this as `toolchainPath` in its `initializationOptions`. When set, the server never searches `PATH` for the toolchain. If the value cannot be resolved, toolchain features are silently disabled and a single informational notice is shown."
+        },
+        "compact-analyzer.compileOnSave": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Compile Compact files on save, sent to the server as `initializationOptions.compileOnSave`."
+        },
+        "compact-analyzer.formatting": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Enable server-provided formatting for Compact files, sent to the server as `initializationOptions.formatting`."
+        },
+        "compact-analyzer.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "scope": "window",
+          "markdownDescription": "Traces the communication between VS Code and the Compact language server. This setting is client-side only and is not sent to the server."
+        }
+      }
+    }
   },
   "scripts": {
     "build": "node esbuild.mjs",

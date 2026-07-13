@@ -11,6 +11,12 @@ publish = false
 name = "compact-analyzer"
 path = "src/main.rs"
 
+# cargo-dist discovers distable packages by their binaries, but `publish = false`
+# hides this crate from that search. Opting in explicitly restores it as the sole
+# dist app without publishing anything to crates.io.
+[package.metadata.dist]
+dist = true
+
 [dependencies]
 analyzer-core.workspace = true
 analyzer-ide.workspace = true

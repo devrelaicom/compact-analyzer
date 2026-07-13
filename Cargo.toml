@@ -41,3 +41,8 @@ ignore = "0.4"
 analyzer-core = { path = "crates/analyzer-core" }
 analyzer-ide = { path = "crates/analyzer-ide" }
 analyzer-toolchain = { path = "crates/analyzer-toolchain" }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

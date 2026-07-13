@@ -95,7 +95,7 @@ jobs:
   # because the dev-time test tooling (@vscode/test-cli / @vscode/test-electron)
   # declares `engines.node >= 22`; `npm ci` on Node 22 installs it cleanly.
   extension:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     defaults:
       run:
@@ -119,7 +119,7 @@ jobs:
   # server via `serverPath` = the freshly built debug binary (the harness throws
   # a clear error if it is absent), so the Rust build runs before the E2E.
   extension-e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

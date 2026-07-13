@@ -210,6 +210,7 @@ pub(crate) fn run_with_timeout(
 pub(crate) fn spawn_retrying_etxtbsy<T>(
     mut spawn: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
+    // 39 retries in the loop + 1 final attempt below = ETXTBSY_MAX_ATTEMPTS total.
     for _ in 1..ETXTBSY_MAX_ATTEMPTS {
         match spawn() {
             Err(err) if is_text_file_busy(&err) => std::thread::sleep(ETXTBSY_RETRY_DELAY),
@@ -223,11 +224,22 @@ pub(crate) fn spawn_retrying_etxtbsy<T>(
 }
 
 /// Whether `err` is the platform's "text file busy" (`ETXTBSY`) spawn failure.
+///
 /// `ETXTBSY` is errno `26` on the Unixes this crate targets (Linux and macOS
-/// alike); on platforms that never raise it for this case the check simply
-/// never matches, leaving [`spawn_retrying_etxtbsy`] a no-op.
+/// alike). The check is `unix`-gated so the retry is provably a no-op off-unix:
+/// on Windows errno `26` is an unrelated error (`ERROR_NOT_DOS_DISK`) that a
+/// spawn never raises as a "busy" signal, and gating it avoids ever mistaking
+/// that for one and burning the retry budget on it.
 fn is_text_file_busy(err: &std::io::Error) -> bool {
-    err.raw_os_error() == Some(26)
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(26)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
 }
 
 /// Why [`poll_until_exit_or_deadline`] stopped waiting on the child.
@@ -426,4 +438,75 @@ fn spawn_stderr_capture(pipe: Option<ChildStderr>) -> Receiver<String> {
         });
     }
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spawn_retrying_etxtbsy;
+    use std::io;
+
+    /// Contract test for the ETXTBSY spawn-retry, driven by an injectable
+    /// closure over a call counter rather than a real subprocess — so it runs
+    /// on every platform and pins down the exact retry arithmetic (the
+    /// off-by-one bound) and the no-second-call-on-success guarantee, which the
+    /// indirect shim tests can't observe and which never exercise the retry
+    /// branch on macOS at all.
+    #[test]
+    fn spawn_retrying_etxtbsy_contract() {
+        // Success on the first attempt: invoked exactly once, never retried.
+        let mut calls = 0u32;
+        let result: io::Result<()> = spawn_retrying_etxtbsy(|| {
+            calls += 1;
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls, 1, "a successful spawn must not be retried");
+
+        // A non-ETXTBSY error returns immediately, unretried, on every platform
+        // (errno 2 is `ENOENT`). Off-unix this is the whole story: the errno
+        // check is a no-op there, so NOTHING is ever retried.
+        let mut calls = 0u32;
+        let result: io::Result<()> = spawn_retrying_etxtbsy(|| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(2))
+        });
+        assert_eq!(calls, 1, "a non-busy error must not be retried");
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(2));
+
+        // The retry path only fires on unix — that is where the kernel raises
+        // ETXTBSY (errno 26) and where `is_text_file_busy` matches it.
+        #[cfg(unix)]
+        {
+            // Every attempt reports ETXTBSY: retried up to the bound, then the
+            // final error is surfaced — not swallowed, not looped forever.
+            let mut calls = 0u32;
+            let result: io::Result<()> = spawn_retrying_etxtbsy(|| {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(26))
+            });
+            assert_eq!(
+                calls,
+                super::ETXTBSY_MAX_ATTEMPTS,
+                "a never-clearing ETXTBSY must be attempted exactly the bounded number of times"
+            );
+            assert_eq!(
+                result.unwrap_err().raw_os_error(),
+                Some(26),
+                "the final ETXTBSY must surface rather than be swallowed"
+            );
+
+            // A transient that clears: two ETXTBSYs, then success on the third.
+            let mut calls = 0u32;
+            let result: io::Result<()> = spawn_retrying_etxtbsy(|| {
+                calls += 1;
+                if calls < 3 {
+                    Err(io::Error::from_raw_os_error(26))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_ok());
+            assert_eq!(calls, 3, "must succeed on the third attempt");
+        }
+    }
 }

@@ -359,8 +359,12 @@ export async function acquireServer(deps: {
       notes.push(`PATH candidate ${candidate} ${describeValidation(v)}`);
     }
 
-    // 3) Storage cache — exactly where a prior download landed the binary.
-    const cachePath = path.join(deps.storageDir, PINNED_SERVER_VERSION, basename);
+    // 3) Storage cache — exactly where a prior download landed the binary. The
+    //    version segment is taken from `deps.manifest.version`, the SAME value
+    //    `downloadAndInstall` writes under, so the read and write can never
+    //    disagree even if the baked manifest version drifts from the pinned
+    //    package version.
+    const cachePath = path.join(deps.storageDir, deps.manifest.version, basename);
     if (isFile(cachePath)) {
       const v = await probeVersion(exec, cachePath);
       if (v.status === "ok") {
@@ -417,7 +421,10 @@ export async function acquireServer(deps: {
     }
     return {
       ok: false,
-      reason: `The server was downloaded to "${installedPath}" but failed the version handshake: it ${describeValidation(v)}.`,
+      reason: withNotes(
+        `The server was downloaded to "${installedPath}" but failed the version handshake: it ${describeValidation(v)}.`,
+        notes,
+      ),
       userGuidance: MANUAL_INSTALL_GUIDANCE,
     };
   } catch (cause) {

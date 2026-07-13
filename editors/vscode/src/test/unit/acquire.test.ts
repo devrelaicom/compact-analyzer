@@ -152,29 +152,6 @@ describe.skipIf(isWindows)("acquireServer — real-binary resolution", () => {
     expect(noFetch.calls()).toBe(0);
   });
 
-  it("(b) rejects an incompatible configured serverPath and never downloads", async () => {
-    // Wrong minor: pre-1.0 the minor is the breaking axis, so 0.2.0 is incompatible.
-    const bin = makeFakeServer(tempDir("ca-acq-b-"), basename, "0.2.0");
-    const noFetch = makeNoFetch();
-
-    const result = await acquireServer({
-      configuredPath: bin,
-      storageDir: tempDir("ca-acq-b-store-"),
-      manifest: emptyManifest,
-      env: {},
-      fetchImpl: noFetch.fetchImpl,
-    });
-
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      // The reason must name BOTH the observed version and the setting.
-      expect(result.reason).toContain("0.2.0");
-      expect(result.reason).toContain("compact-analyzer.serverPath");
-    }
-    // D5: an explicit path never silently falls through to a download.
-    expect(noFetch.calls()).toBe(0);
-  });
-
   it("(c) finds a compatible binary on PATH as source 'path'", async () => {
     const pathDir = tempDir("ca-acq-c-");
     const bin = makeFakeServer(pathDir, basename, "0.1.4");
@@ -202,7 +179,9 @@ describe.skipIf(isWindows)("acquireServer — real-binary resolution", () => {
     makeFakeServer(pathDir, basename, "0.2.0"); // incompatible: logged, fall through
 
     const storageDir = tempDir("ca-acq-d-store-");
-    const cacheDir = path.join(storageDir, PINNED_SERVER_VERSION);
+    // The cache lives under the manifest's version segment — the same value the
+    // acquisition code derives the cache key from.
+    const cacheDir = path.join(storageDir, emptyManifest.version);
     mkdirSync(cacheDir, { recursive: true });
     const cacheBin = makeFakeServer(cacheDir, basename, "0.1.0"); // compatible
     const noFetch = makeNoFetch();
@@ -223,7 +202,86 @@ describe.skipIf(isWindows)("acquireServer — real-binary resolution", () => {
     }
     expect(noFetch.calls()).toBe(0);
   });
+
+  it("probes the storage cache under the MANIFEST version segment, not the pinned constant", async () => {
+    // A manifest whose version has DRIFTED from the pinned package version.
+    // downloadAndInstall writes under <manifest.version>/, so acquisition must
+    // read from the same segment; reading <PINNED_SERVER_VERSION>/ would be a
+    // silent, permanent cache miss (re-download every launch).
+    const driftedVersion = "9.9.9";
+    const manifest: ServerManifest = { version: driftedVersion, artifacts: {} };
+    const storageDir = tempDir("ca-acq-drift-store-");
+    const cacheDir = path.join(storageDir, driftedVersion);
+    mkdirSync(cacheDir, { recursive: true });
+    // Reports a pinned-compatible version (0.1.x); only the directory segment
+    // is drifted.
+    const cacheBin = makeFakeServer(cacheDir, basename, "0.1.0");
+    const noFetch = makeNoFetch();
+
+    const result = await acquireServer({
+      configuredPath: undefined,
+      storageDir,
+      manifest,
+      env: {},
+      fetchImpl: noFetch.fetchImpl,
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.source).toBe("storage");
+      expect(result.binaryPath).toBe(cacheBin);
+    }
+    expect(noFetch.calls()).toBe(0);
+  });
 });
+
+// ---------------------------------------------------------------------------
+// (b) D5 hard-fail: an incompatible configured path must NOT fall through to a
+// download. Gated on a DOWNLOADABLE platform so the "no download" tripwire is
+// non-vacuous — a D5 regression would reach the throwing fetchImpl (with a
+// valid artefact present, the download would get as far as the network call).
+// ---------------------------------------------------------------------------
+
+describe.skipIf(isWindows || currentTarget() === null)(
+  "acquireServer — configured path D5 hard-fail",
+  () => {
+    it("(b) rejects an incompatible configured serverPath and never downloads", async () => {
+      const target = currentTarget()!; // non-null: guarded by skipIf
+      // Wrong minor: pre-1.0 the minor is the breaking axis, so 0.2.0 is incompatible.
+      const bin = makeFakeServer(tempDir("ca-acq-b-"), basename, "0.2.0");
+      const noFetch = makeNoFetch();
+      // A VALID artefact for this platform: were D5 to (wrongly) fall through,
+      // the download would proceed past the artefact lookup and actually call
+      // `noFetch`, tripping the call counter below.
+      const manifest: ServerManifest = {
+        version: PINNED_SERVER_VERSION,
+        artifacts: {
+          [target.rustTriple]: {
+            name: `compact-analyzer-${target.rustTriple}.tar.gz`,
+            sha256: "0".repeat(64),
+          },
+        },
+      };
+
+      const result = await acquireServer({
+        configuredPath: bin,
+        storageDir: tempDir("ca-acq-b-store-"),
+        manifest,
+        env: {},
+        fetchImpl: noFetch.fetchImpl,
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        // The reason must name BOTH the observed version and the setting.
+        expect(result.reason).toContain("0.2.0");
+        expect(result.reason).toContain("compact-analyzer.serverPath");
+      }
+      // D5 tripwire: an explicit path must never reach a download.
+      expect(noFetch.calls()).toBe(0);
+    });
+  },
+);
 
 // ---------------------------------------------------------------------------
 // (e) Nothing anywhere -> download the pinned artefact, then re-validate it.
@@ -348,6 +406,56 @@ describe("acquireServer — timed-out probe", () => {
     });
 
     // The key property: acquisition resolves (never wedges) to a clean failure.
+    expect(result.ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A REJECTING injected exec must be converted, never propagated: acquireServer
+// keeps its no-throw guarantee (acceptance item 5).
+// ---------------------------------------------------------------------------
+
+describe("acquireServer — rejecting exec probe", () => {
+  const rejectingExec: ExecProbe = async () => {
+    throw new Error("boom");
+  };
+
+  it("treats a configured path as a hard failure when the probe rejects", async () => {
+    const noFetch = makeNoFetch();
+
+    const result = await acquireServer({
+      configuredPath: "/some/configured/compact-analyzer",
+      storageDir: tempDir("ca-acq-rej1-store-"),
+      manifest: emptyManifest,
+      env: {},
+      exec: rejectingExec,
+      fetchImpl: noFetch.fetchImpl,
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("compact-analyzer.serverPath");
+    }
+    expect(noFetch.calls()).toBe(0);
+  });
+
+  it("converts a rejecting probe on a PATH candidate into a clean fall-through failure", async () => {
+    const pathDir = tempDir("ca-acq-rej2-path-");
+    // A plain file is enough to become a PATH candidate; the INJECTED probe
+    // (not a real spawn) is what rejects when asked to validate it.
+    writeFileSync(path.join(pathDir, basename), "not really a binary\n");
+
+    const result = await acquireServer({
+      configuredPath: undefined,
+      storageDir: tempDir("ca-acq-rej2-store-"),
+      manifest: emptyManifest, // no artefact -> download fails cleanly
+      env: { PATH: pathDir },
+      exec: rejectingExec,
+      fetchImpl: serve404,
+    });
+
+    // The reject is swallowed and converted to a soft miss; PATH falls through
+    // and acquisition still resolves cleanly to a failure (never throws).
     expect(result.ok).toBe(false);
   });
 });

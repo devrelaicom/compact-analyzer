@@ -1,0 +1,48 @@
+{
+  "name": "compact-analyzer",
+  "displayName": "Compact Analyzer",
+  "description": "Language support for the Compact smart contract language — the community successor to the sunsetted official Compact extension.",
+  "version": "0.1.0",
+  "publisher": "aaronbassett",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "compact",
+    "midnight"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/devrelaicom/compact-analyzer.git",
+    "directory": "editors/vscode"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {},
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "check": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run",
+    "test:e2e": "echo \"e2e placeholder\"",
+    "vscode:prepublish": "npm run build",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "@types/vscode": "1.91.0",
+    "@vscode/vsce": "3.9.2",
+    "esbuild": "0.28.1",
+    "eslint": "10.7.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.63.0",
+    "vitest": "4.1.10"
+  }
+}

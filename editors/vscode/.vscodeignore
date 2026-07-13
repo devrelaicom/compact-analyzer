@@ -1,0 +1,18 @@
+# The published VSIX ships only the bundled output (dist/) plus static
+# assets and metadata. Everything listed here is excluded from the package.
+# The runtime dependency (vscode-languageclient) is inlined into dist/ by
+# esbuild, so node_modules must NOT be shipped.
+
+# TypeScript sources and tests (compiled into dist/extension.js)
+src/**
+
+# Tooling and configuration
+tsconfig.json
+esbuild.mjs
+eslint.config.mjs
+.gitignore
+.vscodeignore
+
+# Dependencies and lockfile
+node_modules/**
+package-lock.json

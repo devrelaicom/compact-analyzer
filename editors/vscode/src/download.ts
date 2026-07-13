@@ -99,6 +99,12 @@ const MANUAL_INSTALL_GUIDANCE =
  * comparison uses `timingSafeEqual` for a constant-time-ish check.
  */
 export function verifySha256(data: Uint8Array, expectedHex: string): boolean {
+  // Defensive: a malformed baked manifest could supply a non-string here
+  // (e.g. a number or `undefined`). Fail closed rather than throwing a raw
+  // `TypeError` from `.trim()`.
+  if (typeof expectedHex !== "string") {
+    return false;
+  }
   const expected = expectedHex.trim().toLowerCase();
   // Anything that is not a full-length lowercased hex digest cannot match; the
   // regex both normalises and forecloses truncated/prefix values.
@@ -236,6 +242,19 @@ export async function downloadAndInstall(opts: {
       MANUAL_INSTALL_GUIDANCE,
     );
   }
+  // Validate the baked entry's shape. A corrupt manifest (wrong types) must
+  // yield a clean, user-actionable error, never a raw crash mid-pipeline; the
+  // checks are fail-closed, so we never proceed to fetch/extract/write.
+  if (
+    typeof artifact.name !== "string" ||
+    artifact.name.length === 0 ||
+    typeof artifact.sha256 !== "string"
+  ) {
+    throw new DownloadError(
+      `The server manifest entry for target "${target.rustTriple}" is malformed: expected a non-empty "name" and a "sha256" string.`,
+      MANUAL_INSTALL_GUIDANCE,
+    );
+  }
 
   // Defence-in-depth: refuse anything that is not HTTPS before fetching. The
   // default base is HTTPS; this guards a caller that overrides `baseUrl`.
@@ -304,12 +323,25 @@ export async function downloadAndInstall(opts: {
   // Only now, on a verified archive, decompress and locate the binary.
   const binaryBytes = extractArchive(archiveBytes, target.binaryName);
 
+  // Defence-in-depth: refuse a binary name that contains a path separator, so
+  // the install can only ever write inside `destDir` regardless of caller
+  // discipline. Not reachable via the current platform.ts, but this keeps the
+  // write-inside-destDir safety independent of it.
+  if (path.basename(target.binaryName) !== target.binaryName) {
+    throw new DownloadError(
+      `Refusing to install: binary name "${target.binaryName}" contains a path separator.`,
+      MANUAL_INSTALL_GUIDANCE,
+    );
+  }
+
   // Atomic install: write to a uniquely-named temp file inside the version dir
   // (same filesystem, so `rename` is atomic), set the executable bit on Unix,
-  // then rename into place. A failure at any step cleans up the temp file, so
-  // the final path is either the fully-installed binary or nothing.
+  // then rename into place. The whole block — directory creation included — is
+  // guarded so ANY filesystem failure (e.g. EACCES/ENOSPC on a read-only or
+  // full storage dir) surfaces as a `DownloadError` carrying the manual-install
+  // guidance, and every throw path cleans up the temp file. The final path is
+  // therefore either the fully-installed binary or nothing.
   const versionDir = path.join(destDir, manifest.version);
-  mkdirSync(versionDir, { recursive: true });
   const finalPath = path.join(versionDir, target.binaryName);
   const tmpPath = path.join(
     versionDir,
@@ -317,17 +349,23 @@ export async function downloadAndInstall(opts: {
   );
 
   try {
+    mkdirSync(versionDir, { recursive: true });
     writeFileSync(tmpPath, binaryBytes, { mode: 0o755 });
     // V9: make the binary executable on Unix; skip on Windows, where the mode
     // bits are not meaningful and `.exe` is handled via `target.binaryName`.
     if (process.platform !== "win32") {
       chmodSync(tmpPath, 0o755);
     }
-    // `rename` replaces an existing destination on both POSIX and Windows,
-    // which also makes re-install idempotent.
+    // `rename` replaces an existing destination on POSIX, which makes re-install
+    // idempotent. On Windows it also replaces, EXCEPT when the old binary is
+    // currently executing (locked) — then it fails with EPERM/EBUSY, which the
+    // catch below converts into a `DownloadError` (fails safe: the running
+    // binary is left intact and no partial file remains).
     renameSync(tmpPath, finalPath);
   } catch (cause) {
     // Best-effort cleanup so no partial temp file lingers next to the target.
+    // `force: true` ignores ENOENT, so this is safe even if mkdir/write never
+    // created the temp file.
     try {
       rmSync(tmpPath, { force: true });
     } catch {

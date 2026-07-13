@@ -7,6 +7,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -88,6 +89,53 @@ function makeFixture(triple: string, binaryName: string): Fixture {
       "-C",
       buildDir,
       // README first, binary second — order is load-bearing (see header note).
+      `${stem}/README.md`,
+      `${stem}/${binaryName}`,
+    ],
+    { stdio: "pipe" },
+  );
+
+  const archiveBytes = new Uint8Array(readFileSync(archivePath));
+  const sha256 = createHash("sha256").update(archiveBytes).digest("hex");
+  return {
+    triple,
+    binaryName,
+    archiveName: `compact-analyzer-${triple}.tar.gz`,
+    archiveBytes,
+    sha256,
+    binaryBody: BINARY_BODY,
+  };
+}
+
+/**
+ * Build a fixture whose only entry matching `binaryName` is a SYMLINK (tar
+ * typeflag '2'), not a regular file — plus a real sibling README. There is NO
+ * regular-file binary of that name. A correct extractor skips the symlink via
+ * its typeflag filter and finds no binary, so it must throw. This locks in the
+ * defence against a future refactor that drops the typeflag check.
+ */
+function makeSymlinkFixture(triple: string, binaryName: string): Fixture {
+  const buildDir = mkdtempSync(path.join(tmpdir(), "ca-dl-sl-"));
+  buildDirs.push(buildDir);
+
+  const stem = `compact-analyzer-${triple}`;
+  const stemDir = path.join(buildDir, stem);
+  mkdirSync(stemDir, { recursive: true });
+  writeFileSync(path.join(stemDir, "README.md"), README_BODY);
+  // A symlink whose basename equals the wanted binary, pointing at a sensitive
+  // path. Nothing reads the target — the extractor must never even reach it.
+  symlinkSync("/etc/passwd", path.join(stemDir, binaryName));
+
+  const archivePath = path.join(buildDir, "fixture.tar.gz");
+  execFileSync(
+    "tar",
+    [
+      "--format",
+      "ustar",
+      "-czf",
+      archivePath,
+      "-C",
+      buildDir,
       `${stem}/README.md`,
       `${stem}/${binaryName}`,
     ],
@@ -488,3 +536,49 @@ describe("extractArchive", () => {
     ).toThrow(DownloadError);
   });
 });
+
+// ---------------------------------------------------------------------------
+// (I2) Symlink / non-regular-entry traversal defence.
+//
+// A malicious archive could carry a symlink (or hardlink/directory) whose
+// basename equals the wanted binary, pointing at a sensitive path. The minimal
+// reader's typeflag filter must skip such entries: only a REGULAR file may be
+// installed. Gated off Windows, where creating the symlink fixture needs
+// elevated privileges. Verified non-vacuous: removing the typeflag filter makes
+// the reader yield the symlink, so these assertions fail.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(process.platform === "win32")(
+  "symlink-entry defence",
+  () => {
+    let symlinkFx: Fixture;
+    beforeAll(() => {
+      symlinkFx = makeSymlinkFixture("aarch64-apple-darwin", "compact-analyzer");
+    });
+
+    it("extractArchive ignores a symlink whose basename matches the binary", () => {
+      expect(() =>
+        extractArchive(symlinkFx.archiveBytes, "compact-analyzer"),
+      ).toThrow(DownloadError);
+      expect(() =>
+        extractArchive(symlinkFx.archiveBytes, "compact-analyzer"),
+      ).toThrow(/did not contain the expected binary/);
+    });
+
+    it("downloadAndInstall throws and installs nothing when only a symlink matches", async () => {
+      const target = targetFor("aarch64-apple-darwin", "compact-analyzer");
+      const finalPath = path.join(destDir, "0.1.0", "compact-analyzer");
+
+      await expect(
+        downloadAndInstall({
+          manifest: manifestFor(symlinkFx),
+          target,
+          destDir,
+          baseUrl: "https://example.test/download/",
+          fetchImpl: serve(symlinkFx.archiveBytes),
+        }),
+      ).rejects.toThrow(DownloadError);
+      expect(existsSync(finalPath)).toBe(false);
+    });
+  },
+);

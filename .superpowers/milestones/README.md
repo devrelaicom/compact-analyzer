@@ -17,7 +17,7 @@ that plan supersedes the file here; update the status line and treat the plan as
 | M2b — cross-file resolution + workspace | **Done** (merged to main 2026-07-07) | plan + errata: `docs/superpowers/plans/2026-07-07-m2b-cross-file-and-workspace.md`; spec: `docs/superpowers/specs/2026-07-07-m2b-cross-file-and-workspace-design.md` |
 | M3 — completion + CST-derived features | **Done** (merged to main 2026-07-10) | plan + errata: `docs/superpowers/plans/2026-07-08-m3-completion-and-cst-features.md`; spec: `docs/superpowers/specs/2026-07-08-m3-completion-and-cst-features-design.md` |
 | M4 — toolchain integration | **Done** (merged to main 2026-07-10) | plan: `docs/superpowers/plans/2026-07-10-m4-toolchain-integration.md` |
-| M5 — VS Code extension + distribution | Future | [m5-vscode-extension-and-distribution.md](m5-vscode-extension-and-distribution.md) |
+| M5 — VS Code extension + distribution | **Done** (code merged to main 2026-07-13; publish legs H-gated + dormant, first `v0.1.0` tag + dogfood human-owned) | plan + errata: `docs/superpowers/plans/2026-07-13-m5-vscode-extension-and-distribution.md` |
 | M6 — upstream automation (version watch, drift detection, agent-driven updates) | Future (version-watch CI can land any time) | [m6-upstream-automation.md](m6-upstream-automation.md) |
 | v2 — native type checking | Post-v1 direction | [v2-native-type-checking.md](v2-native-type-checking.md) |
 | v3 — native disclosure analysis | Post-v1 direction (flagship) | [v3-disclosure-analysis.md](v3-disclosure-analysis.md) |

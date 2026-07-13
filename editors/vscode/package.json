@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "publisher": "aaronbassett",
   "license": "MIT",
+  "icon": "icon.png",
   "engines": {
     "vscode": "^1.91.0",
     "node": ">=20.19.0"

@@ -19,6 +19,15 @@ eslint.config.mjs
 .vscodeignore
 .nvmrc
 
+# E2E test harness: config, compiled test output, and the downloaded-VS-Code
+# cache. The e2e TypeScript sources live under src/** (already excluded above);
+# these are the extra artefacts the harness adds. The @vscode/test-* devDeps are
+# never packaged because node_modules/ is excluded below.
+.vscode-test.mjs
+vitest.config.ts
+out/**
+.vscode-test/**
+
 # Dependencies and lockfile
 node_modules/**
 package-lock.json

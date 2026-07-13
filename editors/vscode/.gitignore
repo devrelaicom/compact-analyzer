@@ -1,3 +1,10 @@
 node_modules/
 dist/
 *.vsix
+
+# E2E build output and the downloaded-VS-Code cache
+out/
+.vscode-test/
+
+# Machine-specific serverPath injected by .vscode-test.mjs at runtime
+src/test/e2e/fixture/.vscode/

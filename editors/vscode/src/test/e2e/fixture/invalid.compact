@@ -1,0 +1,4 @@
+// The colon after `count` is missing, so the native analyser reports E0001
+// ("expected COLON") with source "compact-analyzer". This is a pure parse
+// error — it needs no Compact toolchain, so the smoke test stays hermetic.
+ledger count Field;

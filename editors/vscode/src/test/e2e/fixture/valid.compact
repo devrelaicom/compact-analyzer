@@ -1,0 +1,4 @@
+// A syntactically valid Compact ledger declaration. The native analyser
+// parses this cleanly and publishes zero diagnostics — this fixture exists so
+// the smoke test opens at least one well-formed document.
+ledger count: Field;

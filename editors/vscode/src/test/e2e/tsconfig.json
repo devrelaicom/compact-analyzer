@@ -1,0 +1,23 @@
+{
+  // Dedicated build for the activation smoke E2E. `@vscode/test-cli` runs Mocha
+  // over COMPILED JavaScript in the real extension host — it does not transpile
+  // TypeScript — so these sources are emitted to `out/e2e/` and the harness's
+  // `files` glob points there. The root `tsconfig.json` excludes this directory
+  // (its `types: ["node"]` pass would choke on the Mocha globals), so the E2E is
+  // type-checked here instead; `npm run check` runs both passes.
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": {
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "types": ["node", "mocha"],
+    "rootDir": ".",
+    "outDir": "../../../out/e2e",
+    "noEmit": false,
+    "sourceMap": true
+  },
+  "include": ["**/*.ts"],
+  // Override the base config's `exclude` (which lists this very directory so the
+  // root check skips it); without this the inherited exclude would leave no
+  // inputs for this dedicated build.
+  "exclude": []
+}

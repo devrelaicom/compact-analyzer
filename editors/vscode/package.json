@@ -107,10 +107,10 @@
   },
   "scripts": {
     "build": "node esbuild.mjs",
-    "check": "tsc --noEmit",
+    "check": "tsc --noEmit && tsc --noEmit -p src/test/e2e/tsconfig.json",
     "lint": "eslint src",
     "test": "vitest run",
-    "test:e2e": "echo \"e2e placeholder\"",
+    "test:e2e": "tsc -p src/test/e2e/tsconfig.json && vscode-test",
     "vscode:prepublish": "npm run build",
     "package": "vsce package"
   },
@@ -120,6 +120,8 @@
   "devDependencies": {
     "@types/node": "20.19.43",
     "@types/vscode": "1.91.0",
+    "@vscode/test-cli": "0.0.15",
+    "@vscode/test-electron": "3.0.0",
     "@vscode/vsce": "3.9.2",
     "esbuild": "0.28.1",
     "eslint": "10.7.0",

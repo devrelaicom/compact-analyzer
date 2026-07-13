@@ -290,6 +290,17 @@ mod tests {
         // rather than awaited to completion.
         file.write_all(b"#!/bin/sh\nsleep 5\n")
             .expect("write shim script");
+        // Close the write handle BEFORE `compile_file` execs the shim below.
+        // On Linux, `execve` on a file still open for writing by ANY process
+        // fails with ETXTBSY ("Text file busy", os error 26), which would
+        // turn the legitimate TimedOut this test asserts into a spurious
+        // InvocationError; macOS does not enforce that rule, which is why the
+        // bug only bit on CI. A plain close (drop) is deliberate and
+        // sufficient: `execve` reads through the page cache, so the script is
+        // fully visible without an fsync — and an fsync would only widen the
+        // window in which this write handle (or a copy inherited by another
+        // test thread's concurrent fork) keeps the file busy.
+        drop(file);
         let mut perms = std::fs::metadata(&shim_path)
             .expect("stat shim")
             .permissions();
@@ -363,6 +374,17 @@ mod tests {
         );
         file.write_all(script.as_bytes())
             .expect("write shim script");
+        // Close the write handle BEFORE `compile_file` execs the shim below.
+        // On Linux, `execve` on a file still open for writing by ANY process
+        // fails with ETXTBSY ("Text file busy", os error 26), which would
+        // turn the legitimate Cancelled this test asserts into a spurious
+        // InvocationError; macOS does not enforce that rule, which is why the
+        // bug only bit on CI. A plain close (drop) is deliberate and
+        // sufficient: `execve` reads through the page cache, so the script is
+        // fully visible without an fsync — and an fsync would only widen the
+        // window in which this write handle (or a copy inherited by another
+        // test thread's concurrent fork) keeps the file busy.
+        drop(file);
         let mut perms = std::fs::metadata(&shim_path)
             .expect("stat shim")
             .permissions();

@@ -110,6 +110,7 @@
     "check": "tsc --noEmit && tsc --noEmit -p src/test/e2e/tsconfig.json",
     "lint": "eslint src",
     "test": "vitest run",
+    "pretest:e2e": "npm run build",
     "test:e2e": "tsc -p src/test/e2e/tsconfig.json && vscode-test",
     "vscode:prepublish": "npm run build",
     "package": "vsce package",

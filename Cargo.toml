@@ -22,6 +22,7 @@ compactp_syntax = "0.1.0-beta.1"
 compactp_diagnostics = "0.1.0-beta.1"
 rowan = "0.16"
 text-size = "1"
+salsa = "0.28"
 
 # LSP
 lsp-server = "0.8"

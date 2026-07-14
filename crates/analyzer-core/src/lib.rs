@@ -5,6 +5,7 @@
 //! the `compact-analyzer` binary.
 
 mod analysis;
+mod db;
 pub mod fixture;
 mod item_tree;
 mod ledger_adts;

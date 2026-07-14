@@ -148,6 +148,24 @@ mod tests {
     }
 
     #[test]
+    fn editing_one_file_does_not_recompute_another() {
+        use salsa::Setter;
+
+        let mut db = CompactDatabase::default();
+        let a = SourceText::new(&db, Arc::from("ledger a: Field;"));
+        let b = SourceText::new(&db, Arc::from("ledger b: Field;"));
+
+        let _ = crate::db::parsed(&db, a);
+        let _ = crate::db::parsed(&db, b);
+        let a_diag = crate::db::parsed(&db, a).diagnostics;
+
+        // Edit b; a's memo must survive (same Arc allocation).
+        b.set_text(&mut db).to(Arc::from("ledger b2: Field;"));
+        let a_diag_again = crate::db::parsed(&db, a).diagnostics;
+        assert!(Arc::ptr_eq(&a_diag, &a_diag_again));
+    }
+
+    #[test]
     fn raw_imports_filters_stdlib_and_local_modules() {
         let db = CompactDatabase::default();
         let text = "import CompactStandardLibrary;\nimport Foo;\nmodule Foo {}\nimport \"bar/baz\";\n";

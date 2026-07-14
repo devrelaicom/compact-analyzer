@@ -1,5 +1,21 @@
 # M6 — Upstream automation (version watch, drift detection, agent-driven updates)
 
+> **Split and resequenced as of 2026-07-14** (v2 program design:
+> `docs/superpowers/specs/2026-07-14-v2-native-type-checking-design.md` §7). This
+> supersedes the "natural slot after M4, alongside M5" note below.
+>
+> - **Detection half → `M6-detect`, early and independent:** version-watch cron, drift
+>   report (stdlib/ADT/stderr), scheduled differential fuzzing. Cheap, fully mechanical,
+>   already useful (0.31.1 drift exists today). Not gated on v2 — land any time.
+> - **Heavy half → `v2-M6`, the final phase of the v2 program:** regeneration scripts,
+>   the repo-local agent-update skill, headless PR automation. Deferred to the tail of
+>   v2 so it also covers v2b's new upstream-mirroring surface — the **type-rule tables** —
+>   alongside the existing stdlib/ADT/stderr surfaces. Building it before those tables
+>   exist would automate an incomplete surface.
+>
+> Everything below still holds; the only change is *when* each half lands and that the
+> regeneration + gates extend to the type tables.
+
 ## Goal
 
 Automate the "new Compact release" maintenance loop as far as it can safely go:

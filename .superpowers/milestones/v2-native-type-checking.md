@@ -1,7 +1,22 @@
-# v2 — Native type checking (post-v1 direction)
+# v2 — Native type checking (committed program)
 
-> Direction, not commitment (spec §9). Scope will be re-planned after v1 ships and
-> dogfooding shows where type errors hurt most.
+> **Committed and decomposed** as of 2026-07-14. Program design:
+> `docs/superpowers/specs/2026-07-14-v2-native-type-checking-design.md` — treat it as
+> truth; this file is the lean context behind it.
+>
+> Decomposed into four sub-milestones plus an early, independent detection slice:
+> **v2a** salsa engine swap (behavior-preserving) → **v2b** type system (core +
+> distinctive rules + type-aware diagnostics) → **v2c** type-aware UX (completion,
+> signature help, inlay hints) → **v2-M6** upstream-automation tail (the heavy half of
+> M6, now covering v2's type-rule tables). **M6-detect** (version-watch + drift report +
+> differential fuzz) lands early and independently, outside this chain — see
+> [m6-upstream-automation.md](m6-upstream-automation.md).
+>
+> Settled decisions: salsa is adopted **up front** as v2a, before any type code, so the
+> dense type-dependency graph is salsa-tracked from day one rather than hand-rolled and
+> later ripped out; **all four** UX features are in-scope; the release bar requires
+> differential agreement with `compactc` over the corpus **and** in-editor integration
+> in the VS Code extension.
 
 ## Goal
 
@@ -43,8 +58,10 @@ batch-error UX.
   verify-first discipline as the resolver: extract the actual rules from source, build
   a compiler-differential test suite (native checker vs `compactc` verdicts over the
   corpus) before trusting any rule from docs or training data.
-- Type-bearing queries must stay memoized-recompute-shaped (the spec's Approach A kept
-  query-shaped APIs precisely so salsa could slot in if type checking makes
-  recomputation too hot — this is the milestone where that decision gets re-examined).
+- **The salsa swap is settled: it happens up front, as v2a, behavior-preserving.** The
+  spec's Approach A kept query-shaped APIs precisely so salsa could slot in; v2 exercises
+  that option before any type code lands, because the type layer's dense cross-declaration
+  dependency graph would otherwise be hand-rolled and painful to replace later. v3
+  inherits the salsa engine.
 - Diagnostic wording should track compiler wording where practical, so users see one
   vocabulary across native and on-save diagnostics.

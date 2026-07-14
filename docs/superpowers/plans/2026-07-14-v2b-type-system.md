@@ -76,6 +76,25 @@ M2 resolver (`crates/analyzer-core/src/resolve.rs`, `item_tree.rs`).
 8. **Type-aware diagnostics + VS Code integration.** Diagnostics emerge as rules land;
    this phase closes the loop into the extension and the native-vs-compiler toggle.
 
+## Carry-forwards from v2a's implementation (final-review findings, 2026-07-14)
+
+- **Depend type queries on a new `PartialEq`-able `item_tree` query, NOT on `parsed`.**
+  v2a's `parsed` tracked query uses salsa `no_eq` — and this is *semantically free*, not a
+  workaround: `parsed`'s output (`FileAnalysis`) embeds the full `green` CST, which reflects
+  every source byte including trivia, so `parsed` could never backdate even if it were
+  `PartialEq`. The backdating firewall therefore has to live in a projection that discards
+  trivia. **Highest-value cheap foundation improvement for v2b:** derive `PartialEq` on
+  `Symbol`/`ItemTree` (all fields — `String`, `SymbolKind`, `TextRange`, `bool`,
+  `Option<u32>` — are already comparable, so it's a trivial derive) and add an
+  `item_tree(src) -> Arc<ItemTree>` tracked query with normal `eq`. Type queries depend on
+  *that*; then whitespace/comment-only edits (which don't change items) backdate and skip
+  re-checking. v2a's existing `file_symbols`/`raw_imports` show the pattern but project away
+  too much to serve type-checking.
+- **Salsa inputs are never GC'd.** v2a's `forget_file` orphans a file's `SourceText` input
+  and its memos (salsa has no input reclamation); long-lived sessions with delete/recreate
+  churn grow storage unbounded. When this matters, add explicit input removal / an LRU —
+  v2b territory, not v2a's.
+
 ## Key open questions to resolve at plan time
 
 - **Type modelling on salsa:** interned `Ty` vs tracked structs vs a plain arena — depends

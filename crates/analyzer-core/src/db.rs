@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use compactp_ast::AstNode;
+
 use crate::FileAnalysis;
 use crate::item_tree::ItemTree;
 use crate::line_index::LineIndex;
@@ -61,6 +63,75 @@ pub fn parsed(db: &dyn Db, src: SourceText) -> FileAnalysis {
     }
 }
 
+/// An import/include target as it appears in source, before filesystem
+/// resolution. `CompactStandardLibrary` and imports satisfied by an in-scope
+/// module are already filtered out.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct RawDep {
+    pub raw: String,
+    pub is_include: bool,
+}
+
+/// Non-empty-named symbols in `src`'s item tree, paired with their index in
+/// `ItemTree::symbols`. Derived from `parsed`; memoized separately so
+/// downstream consumers that only need symbols aren't invalidated by changes
+/// to diagnostics or the line index.
+#[salsa::tracked(returns(clone))]
+pub fn file_symbols(db: &dyn Db, src: SourceText) -> Arc<[(String, u32)]> {
+    let tree = crate::db::parsed(db, src).item_tree;
+    tree.symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.name.is_empty())
+        .map(|(idx, s)| (s.name.clone(), idx as u32))
+        .collect()
+}
+
+/// Import/include targets in `src`, before filesystem resolution. The pure
+/// half of `AnalysisHost::index_file`'s dependency-extraction loop: this
+/// filters out `CompactStandardLibrary` and imports satisfied by an in-scope
+/// module, but does not resolve remaining targets to files (that requires
+/// the VFS and search path, which live outside salsa).
+#[salsa::tracked(returns(clone))]
+pub fn raw_imports(db: &dyn Db, src: SourceText) -> Arc<[RawDep]> {
+    let analysis = crate::db::parsed(db, src);
+    let tree = analysis.item_tree.clone();
+    let root = compactp_syntax::SyntaxNode::new_root(analysis.green.clone());
+    let Some(sf) = compactp_ast::SourceFile::cast(root) else {
+        return Arc::from(Vec::new());
+    };
+    let mut out = Vec::new();
+    for import in sf.imports() {
+        let raw = if let Some(n) = import.name() {
+            let nm = n.text().to_string();
+            if nm == "CompactStandardLibrary" {
+                continue;
+            }
+            if tree
+                .top_level()
+                .any(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == nm)
+            {
+                continue;
+            }
+            nm
+        } else if let Some(p) = import.path() {
+            crate::string_lit_text(p.text())
+        } else {
+            continue;
+        };
+        out.push(RawDep { raw, is_include: false });
+    }
+    for inc in sf.includes() {
+        if let Some(tok) = inc.path() {
+            out.push(RawDep {
+                raw: crate::string_lit_text(tok.text()),
+                is_include: true,
+            });
+        }
+    }
+    Arc::from(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +145,17 @@ mod tests {
         // returns(clone) hands back clones of the memoized value; the inner Arcs
         // are the same allocation on a memo hit.
         assert!(Arc::ptr_eq(&a.diagnostics, &b.diagnostics));
+    }
+
+    #[test]
+    fn raw_imports_filters_stdlib_and_local_modules() {
+        let db = CompactDatabase::default();
+        let text = "import CompactStandardLibrary;\nimport Foo;\nmodule Foo {}\nimport \"bar/baz\";\n";
+        let src = SourceText::new(&db, Arc::from(text));
+        let deps = crate::db::raw_imports(&db, src);
+        // CompactStandardLibrary filtered; `Foo` satisfied by local module → filtered;
+        // only the string-path import survives.
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].raw, "bar/baz");
     }
 }

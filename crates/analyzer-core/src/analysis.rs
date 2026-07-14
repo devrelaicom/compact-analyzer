@@ -28,37 +28,13 @@ pub struct FileAnalysis {
 }
 
 pub struct AnalysisHost {
-    // `db`/`sources` are only consumed by `source_for` today, which in turn is
-    // only exercised by its own unit test — `analyze()` isn't re-pointed at
-    // salsa until Task 3 wires in the tracked `parsed` query. Silence
-    // `dead_code` for this transitional state rather than defer adding these
-    // members until they have a non-test caller.
-    #[allow(dead_code)]
     db: crate::db::CompactDatabase,
     /// One stable salsa input per file, plus the raw pointer of the `Arc<str>`
     /// last pushed into it — an unchanged pointer means unchanged content, so
     /// we skip `set_text` and avoid bumping the salsa revision. Same ABA-safe
     /// coupling as before: the `SourceText` input retains the `Arc<str>`.
-    #[allow(dead_code)]
     sources: HashMap<FileId, (usize, crate::db::SourceText)>,
     vfs: Vfs,
-    /// Per-file parse memo, keyed on the raw address of the content `Arc<str>`
-    /// (`Arc::as_ptr`, stored as `usize`). A bare pointer is ABA-safe as a key
-    /// here ONLY because of a retention coupling: each cached [`FileAnalysis`]
-    /// holds `line_index: Arc<LineIndex>`, and `LineIndex` owns a clone of the
-    /// exact `Arc<str>` whose pointer is the key. The cached entry therefore
-    /// pins that allocation alive, so its address cannot be freed and reused by
-    /// a different allocation while the stale key still lives (no ABA).
-    /// Replacing a file's content (`set_overlay`) installs a *new* `Arc<str>`
-    /// at a new address ⇒ key mismatch ⇒ recompute, exactly as intended.
-    ///
-    /// NOTE (Task 2 reconciliation): the v2a brief has this field removed in
-    /// favor of `sources`/salsa, but `analyze()` is not re-pointed to salsa
-    /// until Task 3 (the tracked `parsed` query replaces `parsed_len`). Removing
-    /// this field now would leave `analyze()` non-compiling with no replacement
-    /// query to route through, so it is kept as-is (behavior-preserving; see
-    /// task-2-report.md for the full rationale).
-    cache: HashMap<FileId, (usize, FileAnalysis)>,
     stdlib: Option<FileId>,
     import_search_path: Vec<PathBuf>,
     workspace: crate::workspace::WorkspaceIndex,
@@ -82,7 +58,6 @@ impl AnalysisHost {
             db: crate::db::CompactDatabase::default(),
             sources: HashMap::new(),
             vfs: Vfs::new(),
-            cache: HashMap::new(),
             stdlib: None,
             import_search_path: Vec::new(),
             workspace: crate::workspace::WorkspaceIndex::default(),
@@ -94,11 +69,6 @@ impl AnalysisHost {
 
     /// Lazily provisions (or updates) the salsa `SourceText` input for `file`
     /// from current VFS content. `None` if unreadable.
-    ///
-    /// Not yet called from `analyze()` (that's Task 3, once a tracked `parsed`
-    /// query exists to route through) — exercised directly by its unit test
-    /// for now.
-    #[allow(dead_code)]
     fn source_for(&mut self, file: FileId) -> Option<crate::db::SourceText> {
         use salsa::Setter as _;
         let text = self.vfs.read(file)?;
@@ -210,34 +180,11 @@ impl AnalysisHost {
         self.vfs.generation()
     }
 
-    /// Parses `file`, memoized on the VFS content's `Arc` identity (which
+    /// Parses `file`, memoized by salsa on the `SourceText` input (which
     /// changes exactly when the content is replaced). `None` if unreadable.
-    ///
-    /// The key is the content `Arc<str>`'s raw pointer (`Arc::as_ptr`). This is
-    /// ABA-safe: the cached `FileAnalysis` retains that same `Arc<str>` (via
-    /// `line_index: Arc<LineIndex>`), so the allocation the key names is pinned
-    /// for as long as the entry lives and its address cannot be recycled under
-    /// a stale key — see the `cache` field. A content replacement allocates a
-    /// fresh `Arc<str>` at a distinct address, so the key changes and the parse
-    /// is recomputed.
     pub fn analyze(&mut self, file: FileId) -> Option<FileAnalysis> {
-        let text = self.vfs.read(file)?;
-        let key = Arc::as_ptr(&text) as *const u8 as usize;
-        if let Some((cached_key, analysis)) = self.cache.get(&file)
-            && *cached_key == key
-        {
-            return Some(analysis.clone());
-        }
-        let result = compactp_parser::parse(&text);
-        let root = compactp_syntax::SyntaxNode::new_root(result.green.clone());
-        let analysis = FileAnalysis {
-            green: result.green,
-            diagnostics: Arc::new(result.errors),
-            line_index: Arc::new(LineIndex::new(text)),
-            item_tree: Arc::new(ItemTree::extract(&root)),
-        };
-        self.cache.insert(file, (key, analysis.clone()));
-        Some(analysis)
+        let src = self.source_for(file)?;
+        Some(crate::db::parsed(&self.db, src))
     }
 
     /// (Re)builds the workspace-index entry for one file: its symbol table and
@@ -308,10 +255,12 @@ impl AnalysisHost {
         self.forget_file(file);
     }
 
-    /// Drops the cached parse for `file` (e.g. deleted on disk), forcing a
-    /// recompute on next access.
+    /// Drops the salsa `SourceText` input for `file` (e.g. deleted on disk).
+    /// Parsing is memoized by salsa on the input itself, not by this host, so
+    /// this only forgets the host's `FileId -> SourceText` binding; the next
+    /// `source_for` call re-provisions a fresh input from the VFS.
     pub fn forget_file(&mut self, file: FileId) {
-        self.cache.remove(&file);
+        self.sources.remove(&file);
         // A watched-file DELETE reaches us here (via `remove_workspace_file`)
         // and does NOT bump the VFS generation, so the generation hook in
         // `cached_source_pathname` would miss it: a stale `Some(deleted_path)`
@@ -429,17 +378,22 @@ mod tests {
     }
 
     #[test]
-    fn forget_file_forces_recompute() {
+    fn forget_file_is_transparent_to_parse() {
         let (mut host, file) = host_with("ledger count: Field;");
         let first = host.analyze(file).unwrap();
         host.forget_file(file);
         let second = host.analyze(file).unwrap();
-        // Content is unchanged, but the cache entry was dropped → recomputed →
-        // a fresh diagnostics Arc.
-        assert!(!std::sync::Arc::ptr_eq(
-            &first.diagnostics,
-            &second.diagnostics
-        ));
+        // The host's FileId -> SourceText binding was dropped, but salsa
+        // memoizes parsing on the input's value, not on host-side identity,
+        // so the recompute is transparent: same diagnostics value (an eviction
+        // that actually drops a stale disk file is Task 5's concern).
+        // `compactp_diagnostics::Diagnostic` (external crate) derives `Debug`
+        // but not `PartialEq`, so value equality is asserted via its `Debug`
+        // representation rather than `assert_eq!` directly on the `Vec`.
+        assert_eq!(
+            format!("{:?}", first.diagnostics),
+            format!("{:?}", second.diagnostics)
+        );
     }
 
     #[test]
@@ -462,10 +416,9 @@ mod tests {
 
     #[test]
     fn source_for_updates_input_on_edit_only() {
-        use crate::db::parsed_len;
         let (mut host, file) = host_with("abcd");
         let src1 = host.source_for(file).unwrap();
-        assert_eq!(parsed_len(&host.db, src1), 4);
+        assert_eq!(src1.text(&host.db).len(), 4);
 
         // Same content re-provisioned → same input handle, no revision churn.
         let src2 = host.source_for(file).unwrap();
@@ -475,6 +428,6 @@ mod tests {
         host.vfs_mut().set_overlay(file, "xyz".to_string(), 2);
         let src3 = host.source_for(file).unwrap();
         assert_eq!(src1, src3);
-        assert_eq!(parsed_len(&host.db, src3), 3);
+        assert_eq!(src3.text(&host.db).len(), 3);
     }
 }

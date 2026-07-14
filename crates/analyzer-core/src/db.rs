@@ -5,6 +5,10 @@
 
 use std::sync::Arc;
 
+use crate::FileAnalysis;
+use crate::item_tree::ItemTree;
+use crate::line_index::LineIndex;
+
 /// The database trait tracked functions are written against. A blanket impl
 /// makes every salsa database (i.e. `CompactDatabase`) a `Db`.
 #[salsa::db]
@@ -33,28 +37,42 @@ pub struct SourceText {
     pub text: Arc<str>,
 }
 
-/// Throwaway spike query — replaced by `parsed` in Task 3.
-#[salsa::tracked(returns(clone))]
-pub fn parsed_len(db: &dyn Db, src: SourceText) -> usize {
-    src.text(db).len()
+/// Parse + derive everything M1 knows about one file. Memoized on the
+/// `SourceText` input; recomputed only when that file's text changes.
+///
+/// `no_eq`: `FileAnalysis` is unchanged per the task brief and one of its
+/// fields (`diagnostics: Arc<Vec<compactp_diagnostics::Diagnostic>>`) can't
+/// derive `PartialEq` — `Diagnostic` is defined in an external crate and
+/// doesn't implement it. Without `no_eq`, salsa requires the return type to
+/// be comparable so it can "backdate" unchanged results to downstream
+/// queries; `no_eq` opts this query out of that comparison; there are no
+/// tracked queries downstream of `parsed` yet, so this has no
+/// backdating-skip effect to lose in practice.
+#[salsa::tracked(returns(clone), no_eq)]
+pub fn parsed(db: &dyn Db, src: SourceText) -> FileAnalysis {
+    let text = src.text(db);
+    let result = compactp_parser::parse(&text);
+    let root = compactp_syntax::SyntaxNode::new_root(result.green.clone());
+    FileAnalysis {
+        green: result.green,
+        diagnostics: Arc::new(result.errors),
+        line_index: Arc::new(LineIndex::new(text)),
+        item_tree: Arc::new(ItemTree::extract(&root)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use salsa::Setter as _;
 
     #[test]
-    fn db_boots_memoizes_and_recomputes() {
-        let mut db = CompactDatabase::default();
-        let src = SourceText::new(&db, Arc::from("hello"));
-        assert_eq!(parsed_len(&db, src), 5);
-
-        // Unchanged input → memoized (same revision, no panic, same value).
-        assert_eq!(parsed_len(&db, src), 5);
-
-        // Mutate the input → recompute reflects the new value.
-        src.set_text(&mut db).to(Arc::from("hi"));
-        assert_eq!(parsed_len(&db, src), 2);
+    fn parsed_reuses_memo_across_unchanged_calls() {
+        let db = CompactDatabase::default();
+        let src = SourceText::new(&db, Arc::from("ledger count: Field;"));
+        let a = crate::db::parsed(&db, src);
+        let b = crate::db::parsed(&db, src);
+        // returns(clone) hands back clones of the memoized value; the inner Arcs
+        // are the same allocation on a memo hit.
+        assert!(Arc::ptr_eq(&a.diagnostics, &b.diagnostics));
     }
 }

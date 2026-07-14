@@ -1,8 +1,11 @@
 //! Memoized recompute engine (spec Approach A).
 //!
-//! Parse results are cached per file, memoized on the VFS content's `Arc<str>`
-//! pointer identity (which changes whenever the content is replaced). Any file
-//! edit recomputes that file only. The syntax tree is stored as a `rowan::GreenNode`
+//! Parsing, the line index, and the item tree are produced by the salsa
+//! `parsed` tracked query (`crate::db::parsed`), memoized on the per-file
+//! `SourceText` salsa input. `AnalysisHost` provisions and updates that input
+//! from the VFS (`source_for`), keyed on the content `Arc<str>` pointer
+//! identity so unchanged text is never re-set into salsa, and any file edit
+//! recomputes that file only. The syntax tree is stored as a `rowan::GreenNode`
 //! because `SyntaxNode` is `!Send` — consumers rebuild a cursor with
 //! `SyntaxNode::new_root(green)` (cheap).
 

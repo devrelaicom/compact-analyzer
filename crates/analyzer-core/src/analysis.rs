@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use compactp_ast::AstNode;
 use compactp_diagnostics::Diagnostic;
 use rowan::GreenNode;
 
@@ -196,56 +195,20 @@ impl AnalysisHost {
     /// path (records the target's `FileId`) without reading or parsing it. An
     /// unreadable file is evicted from the index.
     pub fn index_file(&mut self, file: FileId) {
-        let Some(analysis) = self.analyze(file) else {
+        let Some(src) = self.source_for(file) else {
             self.workspace.remove(file);
             return;
         };
-        let tree = analysis.item_tree.clone();
-        let root = crate::SyntaxNode::new_root(analysis.green.clone());
-
-        let symbols: Vec<(String, u32)> = tree
-            .symbols
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| !s.name.is_empty())
-            .map(|(idx, s)| (s.name.clone(), idx as u32))
-            .collect();
+        let symbols: Vec<(String, u32)> = crate::db::file_symbols(&self.db, src).to_vec();
+        let raw_deps = crate::db::raw_imports(&self.db, src);
 
         let from_dir = self.vfs().path(file).parent().map(|d| d.to_path_buf());
         let search = self.import_search_path();
         let mut deps = std::collections::BTreeSet::new();
-        if let (Some(from_dir), Some(sf)) = (from_dir, compactp_ast::SourceFile::cast(root.clone()))
-        {
-            for import in sf.imports() {
-                let raw = if let Some(n) = import.name() {
-                    let nm = n.text().to_string();
-                    // Compiler-internal; not a file dependency.
-                    if nm == "CompactStandardLibrary" {
-                        continue;
-                    }
-                    // An in-scope module satisfies the import → no file edge.
-                    if tree
-                        .top_level()
-                        .any(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == nm)
-                    {
-                        continue;
-                    }
-                    nm
-                } else if let Some(p) = import.path() {
-                    crate::string_lit_text(p.text())
-                } else {
-                    continue;
-                };
-                if let Some(path) = crate::find_source_pathname(&from_dir, &search, &raw) {
+        if let Some(from_dir) = from_dir {
+            for dep in raw_deps.iter() {
+                if let Some(path) = crate::find_source_pathname(&from_dir, &search, &dep.raw) {
                     deps.insert(self.vfs_mut().file_id(&path));
-                }
-            }
-            for inc in sf.includes() {
-                if let Some(tok) = inc.path() {
-                    let raw = crate::string_lit_text(tok.text());
-                    if let Some(path) = crate::find_source_pathname(&from_dir, &search, &raw) {
-                        deps.insert(self.vfs_mut().file_id(&path));
-                    }
                 }
             }
         }
@@ -432,5 +395,21 @@ mod tests {
         let src3 = host.source_for(file).unwrap();
         assert_eq!(src1, src3);
         assert_eq!(src3.text(&host.db).len(), 3);
+    }
+
+    #[test]
+    fn index_file_records_resolved_cross_file_dep() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Foo.compact"), "module Foo {}").unwrap();
+        let main = dir.path().join("main.compact");
+        std::fs::write(&main, "import \"Foo\";").unwrap();
+
+        let mut host = AnalysisHost::new();
+        let foo = host.vfs_mut().file_id(&dir.path().join("Foo.compact"));
+        let main_id = host.vfs_mut().file_id(&main);
+        host.index_file(foo);
+        host.index_file(main_id);
+
+        assert_eq!(host.dependents_of(foo), vec![main_id]);
     }
 }

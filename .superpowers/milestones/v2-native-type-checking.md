@@ -17,6 +17,12 @@
 > later ripped out; **all four** UX features are in-scope; the release bar requires
 > differential agreement with `compactc` over the corpus **and** in-editor integration
 > in the VS Code extension.
+>
+> **Implementation plans** (in `docs/superpowers/plans/`, 2026-07-14): v2a
+> `2026-07-14-v2a-salsa-engine-swap.md` is the **execution-ready** plan; v2b/v2c/v2-M6
+> (`…-v2b-type-system.md`, `…-v2c-type-aware-ux.md`, `…-v2-m6-upstream-automation-tail.md`)
+> are **draft outlines** — an agent must review prior sub-milestones' as-merged state for
+> drift and re-run writing-plans before executing them.
 
 ## Goal
 

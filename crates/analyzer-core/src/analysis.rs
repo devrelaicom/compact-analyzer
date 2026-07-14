@@ -28,6 +28,19 @@ pub struct FileAnalysis {
 }
 
 pub struct AnalysisHost {
+    // `db`/`sources` are only consumed by `source_for` today, which in turn is
+    // only exercised by its own unit test — `analyze()` isn't re-pointed at
+    // salsa until Task 3 wires in the tracked `parsed` query. Silence
+    // `dead_code` for this transitional state rather than defer adding these
+    // members until they have a non-test caller.
+    #[allow(dead_code)]
+    db: crate::db::CompactDatabase,
+    /// One stable salsa input per file, plus the raw pointer of the `Arc<str>`
+    /// last pushed into it — an unchanged pointer means unchanged content, so
+    /// we skip `set_text` and avoid bumping the salsa revision. Same ABA-safe
+    /// coupling as before: the `SourceText` input retains the `Arc<str>`.
+    #[allow(dead_code)]
+    sources: HashMap<FileId, (usize, crate::db::SourceText)>,
     vfs: Vfs,
     /// Per-file parse memo, keyed on the raw address of the content `Arc<str>`
     /// (`Arc::as_ptr`, stored as `usize`). A bare pointer is ABA-safe as a key
@@ -38,6 +51,13 @@ pub struct AnalysisHost {
     /// a different allocation while the stale key still lives (no ABA).
     /// Replacing a file's content (`set_overlay`) installs a *new* `Arc<str>`
     /// at a new address ⇒ key mismatch ⇒ recompute, exactly as intended.
+    ///
+    /// NOTE (Task 2 reconciliation): the v2a brief has this field removed in
+    /// favor of `sources`/salsa, but `analyze()` is not re-pointed to salsa
+    /// until Task 3 (the tracked `parsed` query replaces `parsed_len`). Removing
+    /// this field now would leave `analyze()` non-compiling with no replacement
+    /// query to route through, so it is kept as-is (behavior-preserving; see
+    /// task-2-report.md for the full rationale).
     cache: HashMap<FileId, (usize, FileAnalysis)>,
     stdlib: Option<FileId>,
     import_search_path: Vec<PathBuf>,
@@ -59,6 +79,8 @@ pub struct AnalysisHost {
 impl AnalysisHost {
     pub fn new() -> Self {
         Self {
+            db: crate::db::CompactDatabase::default(),
+            sources: HashMap::new(),
             vfs: Vfs::new(),
             cache: HashMap::new(),
             stdlib: None,
@@ -67,6 +89,32 @@ impl AnalysisHost {
             ledger_adts: crate::ledger_adts::LedgerAdtTable::load(),
             source_path_cache: HashMap::new(),
             source_path_cache_generation: 0,
+        }
+    }
+
+    /// Lazily provisions (or updates) the salsa `SourceText` input for `file`
+    /// from current VFS content. `None` if unreadable.
+    ///
+    /// Not yet called from `analyze()` (that's Task 3, once a tracked `parsed`
+    /// query exists to route through) — exercised directly by its unit test
+    /// for now.
+    #[allow(dead_code)]
+    fn source_for(&mut self, file: FileId) -> Option<crate::db::SourceText> {
+        use salsa::Setter as _;
+        let text = self.vfs.read(file)?;
+        let ptr = Arc::as_ptr(&text) as *const u8 as usize;
+        match self.sources.get(&file).copied() {
+            Some((cached_ptr, src)) if cached_ptr == ptr => Some(src),
+            Some((_, src)) => {
+                src.set_text(&mut self.db).to(text);
+                self.sources.insert(file, (ptr, src));
+                Some(src)
+            }
+            None => {
+                let src = crate::db::SourceText::new(&self.db, text);
+                self.sources.insert(file, (ptr, src));
+                Some(src)
+            }
         }
     }
 
@@ -410,5 +458,23 @@ mod tests {
             .vfs_mut()
             .file_id(Path::new("/nonexistent/nope.compact"));
         assert!(host.analyze(file).is_none());
+    }
+
+    #[test]
+    fn source_for_updates_input_on_edit_only() {
+        use crate::db::parsed_len;
+        let (mut host, file) = host_with("abcd");
+        let src1 = host.source_for(file).unwrap();
+        assert_eq!(parsed_len(&host.db, src1), 4);
+
+        // Same content re-provisioned → same input handle, no revision churn.
+        let src2 = host.source_for(file).unwrap();
+        assert_eq!(src1, src2);
+
+        // Edit → same handle, new text visible to queries.
+        host.vfs_mut().set_overlay(file, "xyz".to_string(), 2);
+        let src3 = host.source_for(file).unwrap();
+        assert_eq!(src1, src3);
+        assert_eq!(parsed_len(&host.db, src3), 3);
     }
 }

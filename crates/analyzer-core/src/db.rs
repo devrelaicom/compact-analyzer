@@ -27,6 +27,7 @@ impl salsa::Database for CompactDatabase {}
 /// File text as a salsa input. Identity is the salsa-assigned id; the host
 /// maps `FileId -> SourceText` so a file keeps one stable input across edits.
 #[salsa::input]
+#[derive(Debug)]
 pub struct SourceText {
     #[returns(clone)]
     pub text: Arc<str>,

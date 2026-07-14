@@ -42,14 +42,21 @@ pub struct SourceText {
 /// Parse + derive everything M1 knows about one file. Memoized on the
 /// `SourceText` input; recomputed only when that file's text changes.
 ///
-/// `no_eq`: `FileAnalysis` is unchanged per the task brief and one of its
-/// fields (`diagnostics: Arc<Vec<compactp_diagnostics::Diagnostic>>`) can't
-/// derive `PartialEq` — `Diagnostic` is defined in an external crate and
-/// doesn't implement it. Without `no_eq`, salsa requires the return type to
-/// be comparable so it can "backdate" unchanged results to downstream
-/// queries; `no_eq` opts this query out of that comparison; there are no
-/// tracked queries downstream of `parsed` yet, so this has no
-/// backdating-skip effect to lose in practice.
+/// `no_eq`: one of `FileAnalysis`'s fields
+/// (`diagnostics: Arc<Vec<compactp_diagnostics::Diagnostic>>`) can't derive
+/// `PartialEq` — `Diagnostic` is defined in an external crate and doesn't
+/// implement it. Without `no_eq`, salsa requires the return type to be
+/// comparable so it can "backdate" unchanged results to downstream queries;
+/// `no_eq` opts this query out of that comparison, so `parsed`'s direct
+/// tracked dependents (`file_symbols`, `raw_imports`, both below) always
+/// re-execute whenever a file's text changes — `parsed`'s result is treated
+/// as changed every time. Those dependents immediately project out
+/// `PartialEq` types (`Arc<[(String, u32)]>`, `Arc<[RawDep]>`), though, so
+/// *their* outputs backdate normally; that projection layer, not `parsed`
+/// itself, is the real backdating firewall insulating further consumers.
+/// `no_eq` costs nothing in principle here regardless: `FileAnalysis`
+/// embeds the full `green` tree, which reflects every source byte including
+/// trivia, so `parsed` could never backdate even if it were `PartialEq`.
 #[salsa::tracked(returns(clone), no_eq)]
 pub fn parsed(db: &dyn Db, src: SourceText) -> FileAnalysis {
     let text = src.text(db);

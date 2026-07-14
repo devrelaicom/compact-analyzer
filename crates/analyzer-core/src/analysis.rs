@@ -224,7 +224,13 @@ impl AnalysisHost {
     /// Drops the salsa `SourceText` input for `file` (e.g. deleted on disk).
     /// Parsing is memoized by salsa on the input itself, not by this host, so
     /// this only forgets the host's `FileId -> SourceText` binding; the next
-    /// `source_for` call re-provisions a fresh input from the VFS.
+    /// `source_for` call re-provisions a fresh input from the VFS. The old
+    /// `SourceText` input and its memoized `parsed`/`file_symbols`/
+    /// `raw_imports` results are NOT reclaimed from the salsa database —
+    /// salsa has no input GC — so they're simply orphaned, unreachable but
+    /// still resident. This is intentional for v2a and weaker reclamation
+    /// than the pre-v2a parse cache; bounding this growth (explicit input
+    /// removal, an LRU, ...) is a v2b concern.
     pub fn forget_file(&mut self, file: FileId) {
         self.sources.remove(&file);
         // A watched-file DELETE reaches us here (via `remove_workspace_file`)

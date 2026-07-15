@@ -757,8 +757,8 @@ fn source_text_for(
 /// against `tsrc`'s item tree for imports (E9002/E9003); includes have no
 /// mismatch check, exactly as the original. The in-scope-module and
 /// `CompactStandardLibrary` skips are preserved verbatim (both make an import
-/// emit no diagnostic at all, matching the original's `continue`s). `fd` is
-/// built host-side via `cached_source_pathname` (no I/O happens here).
+/// emit no diagnostic at all, matching the original's `continue`s). `fd` is the
+/// persisted `FileDeps` input published by `index_file` (no I/O happens here).
 ///
 /// The "searched: {list}" text embeds `from_dir` plus the import search path
 /// — a display detail that depends on host `Path::display()` formatting, an

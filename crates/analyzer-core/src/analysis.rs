@@ -47,17 +47,6 @@ pub struct AnalysisHost {
     import_search_path: Vec<PathBuf>,
     workspace: crate::workspace::WorkspaceIndex,
     ledger_adts: crate::ledger_adts::LedgerAdtTable,
-    /// Memoized `find_source_pathname` probes, keyed on `(from_dir, raw)`. The
-    /// current `import_search_path` is an implicit part of the key, enforced by
-    /// clearing on `set_import_search_path`. See [`cached_source_pathname`] for
-    /// the full invalidation contract.
-    ///
-    /// [`cached_source_pathname`]: AnalysisHost::cached_source_pathname
-    source_path_cache: HashMap<(PathBuf, String), Option<PathBuf>>,
-    /// The `generation()` the `source_path_cache` was last valid for. A change
-    /// means a VFS content mutation (create/change/overlay) has occurred, so the
-    /// memo is stale and must be dropped.
-    source_path_cache_generation: u64,
 }
 
 impl AnalysisHost {
@@ -72,8 +61,6 @@ impl AnalysisHost {
             import_search_path: Vec::new(),
             workspace: crate::workspace::WorkspaceIndex::default(),
             ledger_adts: crate::ledger_adts::LedgerAdtTable::load(),
-            source_path_cache: HashMap::new(),
-            source_path_cache_generation: 0,
         }
     }
 
@@ -227,62 +214,13 @@ impl AnalysisHost {
     /// Directories consulted (after the importing file's own directory) when
     /// resolving non-absolute imports/includes. Mirrors `--compact-path`.
     pub fn set_import_search_path(&mut self, path: Vec<PathBuf>) {
+        // Just store the new path; re-indexing republishes each file's
+        // `FileDeps` under it. There is no separate disk-probe memo to clear.
         self.import_search_path = path;
-        // The search path is an implicit part of every memoized probe key and a
-        // change here does NOT bump the VFS generation, so the generation hook
-        // in `cached_source_pathname` would miss it: drop the memo explicitly so
-        // probes re-run against the new path. (Invalidation hook 3 of 3.)
-        self.source_path_cache.clear();
     }
 
     pub fn import_search_path(&self) -> Vec<PathBuf> {
         self.import_search_path.clone()
-    }
-
-    /// Memoizing wrapper over [`crate::find_source_pathname`]. Within one
-    /// resolution epoch each `(from_dir, raw)` pair is probed (i.e. its
-    /// `Path::exists` syscalls run) at most once. `find_source_pathname` itself
-    /// stays pure and unchanged; this only caches its results.
-    ///
-    /// # Invalidation contract (why a memoized value is always correct)
-    /// The memo MUST return exactly what a fresh `find_source_pathname` against
-    /// the current on-disk state (as known to the host) and the current
-    /// `import_search_path` would return. For a fixed `(from_dir, raw)` key the
-    /// result can only change via one of three host events, and each clears the
-    /// memo:
-    /// 1. any VFS content mutation — a watched-file CREATE/CHANGE
-    ///    (`Vfs::invalidate_disk`) or an overlay op
-    ///    (`Vfs::set_overlay`/`remove_overlay`) — bumps `generation()`, which is
-    ///    detected and cleared at the top of this method;
-    /// 2. a watched-file DELETE, routed through `forget_file`, which does NOT
-    ///    bump the generation and so is cleared inside `forget_file`;
-    /// 3. an `import_search_path` change, cleared inside `set_import_search_path`.
-    ///
-    /// Interning a path (`Vfs::file_id`) is the only other host mutation and it
-    /// cannot change a probe result (it touches neither disk existence,
-    /// `from_dir`, `raw`, nor `import_search_path`), so it needs no hook. These
-    /// three hooks therefore form a complete cover.
-    pub(crate) fn cached_source_pathname(
-        &mut self,
-        from_dir: &std::path::Path,
-        raw: &str,
-    ) -> Option<PathBuf> {
-        // Hook 1 of 3: any content mutation bumps the generation → the whole
-        // memo is stale. Clear and re-key to the current generation.
-        let generation = self.generation();
-        if generation != self.source_path_cache_generation {
-            self.source_path_cache.clear();
-            self.source_path_cache_generation = generation;
-        }
-        let key = (from_dir.to_path_buf(), raw.to_string());
-        if let Some(cached) = self.source_path_cache.get(&key) {
-            return cached.clone();
-        }
-        // Compute BEFORE touching the cache: the immutable borrow of
-        // `import_search_path` must not overlap the mutable borrow in `insert`.
-        let result = crate::find_source_pathname(from_dir, &self.import_search_path, raw);
-        self.source_path_cache.insert(key, result.clone());
-        result
     }
 
     /// Current workspace revision (see `Vfs::generation`).
@@ -316,13 +254,13 @@ impl AnalysisHost {
         let mut resolved: Vec<crate::db::ResolvedDep> = Vec::new();
         if let Some(from_dir) = from_dir {
             for dep in raw_deps.iter() {
+                // A resolved-but-unreadable target becomes `None` (no edge, no
+                // panic): honours the resolver's "unreadable → skip, never die"
+                // ethos.
                 let target =
-                    crate::find_source_pathname(&from_dir, &search, &dep.raw).map(|path| {
+                    crate::find_source_pathname(&from_dir, &search, &dep.raw).and_then(|path| {
                         let fid = self.vfs_mut().file_id(&path);
-                        (
-                            fid,
-                            self.source_for(fid).expect("resolved path is readable"),
-                        )
+                        self.source_for(fid).map(|s| (fid, s))
                     });
                 if let Some((fid, _)) = target {
                     edges.insert(fid);
@@ -388,11 +326,12 @@ impl AnalysisHost {
     /// removal, an LRU, ...) is a v2b concern.
     pub fn forget_file(&mut self, file: FileId) {
         self.sources.remove(&file);
-        // A watched-file DELETE reaches us here (via `remove_workspace_file`)
-        // and does NOT bump the VFS generation, so the generation hook in
-        // `cached_source_pathname` would miss it: a stale `Some(deleted_path)`
-        // must not survive the deletion. (Invalidation hook 2 of 3.)
-        self.source_path_cache.clear();
+        // Also drop the file's `FileDeps` input and republish the workspace-wide
+        // map so the removed file's key disappears from `Workspace.file_deps`
+        // (the keyset shrank — `republish_file_deps_map` recomputes from the
+        // current `dep_inputs` keyset, which is correct for the shrink case).
+        self.dep_inputs.remove(&file);
+        self.republish_file_deps_map();
     }
 
     /// All files currently in the workspace index.

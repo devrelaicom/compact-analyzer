@@ -3,7 +3,6 @@
 //! verified against compactp), then resolved through lexical scopes
 //! (this task) and file scope / imports (Task 4).
 
-use std::path::Path;
 use std::sync::Arc;
 
 use compactp_ast::{AstNode, Pat};
@@ -356,41 +355,24 @@ impl crate::AnalysisHost {
     /// Error diagnostics for imports/includes in `file` that fail resolution.
     /// A cross-file derived fact — recomputed on demand, not cached with the
     /// per-file parse. Thin bridge over the tracked
-    /// `crate::db::resolution_diagnostics_query`: rebuild this file's resolved
-    /// dependency edges via `cached_source_pathname` (preserving that probe's
-    /// memoization contract exactly as the pre-port implementation did — this
-    /// is deliberately NOT `self.file_deps(file)`/`index_file`, which resolve
-    /// through the *uncached* `find_source_pathname` for the unrelated
-    /// cross-file symbol index), precompute the impure "searched:" display
+    /// `crate::db::resolution_diagnostics_query`, mirroring `resolve()`'s
+    /// bridge (Task 7): index this file on demand so its dependency edges are
+    /// materialized, read the persisted `FileDeps` input (memoized — no
+    /// per-call salsa input), precompute the impure "searched:" display
     /// strings, and hand off. All diagnostic logic lives in `db.rs` now.
     pub fn resolution_diagnostics(&mut self, file: FileId) -> Vec<Diagnostic> {
         let Some(src) = self.src_of(file) else {
             return Vec::new();
         };
-        let Some(from_dir) = self.vfs().path(file).parent().map(Path::to_path_buf) else {
-            return Vec::new();
-        };
-        let raw_deps = crate::db::raw_imports(self.db_ref(), src);
-        let mut resolved: Vec<crate::db::ResolvedDep> = Vec::with_capacity(raw_deps.len());
-        for dep in raw_deps.iter() {
-            let target = match self.cached_source_pathname(&from_dir, &dep.raw) {
-                Some(path) => {
-                    let fid = self.vfs_mut().file_id(&path);
-                    let tsrc = self.src_of(fid).expect("resolved path is readable");
-                    Some((fid, tsrc))
-                }
-                None => None,
-            };
-            resolved.push(crate::db::ResolvedDep {
-                raw: dep.raw.clone(),
-                is_include: dep.is_include,
-                target,
-            });
-        }
-        let fd = crate::db::FileDeps::new(self.db_ref(), Arc::from(resolved));
-
-        let from_dir_display = from_dir.display().to_string();
-        let search_display = self
+        self.ensure_indexed(file);
+        let fd = self.file_deps(file);
+        let from_dir = self
+            .vfs()
+            .path(file)
+            .parent()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        let search = self
             .import_search_path()
             .iter()
             .map(|p| p.display().to_string())
@@ -400,8 +382,8 @@ impl crate::AnalysisHost {
             self.db_ref(),
             src,
             fd,
-            Arc::from(from_dir_display.as_str()),
-            Arc::from(search_display.as_str()),
+            Arc::from(from_dir.as_str()),
+            Arc::from(search.as_str()),
         )
         .to_vec()
     }
@@ -1246,169 +1228,5 @@ mod tests {
             extra.display()
         );
         assert_eq!(diags[0].message, expected);
-    }
-
-    // ---- CR-3: cached source-path resolution ----
-    //
-    // These four tests exercise the memo behind `cached_source_pathname`
-    // through the observable `resolution_diagnostics` surface (an import
-    // resolves ⇒ 0 diagnostics; it does not ⇒ 1 "cannot resolve import"). The
-    // first proves the probe is memoized; the other three prove each of the
-    // three invalidation hooks. Every invalidation test is written to go RED if
-    // its specific hook is deleted (see report for the confirmation runs).
-
-    const FOO_MODULE: &str = "module Foo { export circuit f(): Field { return 0; } }";
-
-    /// Memoization: after the target is deleted from disk WITHOUT notifying the
-    /// host (no generation bump, no `forget_file`), resolution still serves the
-    /// cached `Some(...)`, proving the second probe did not re-hit disk. A raw,
-    /// uncached probe (asserted alongside) sees the file is gone. Goes RED with
-    /// no memo at all: the second call would re-probe and report the import
-    /// unresolved.
-    #[test]
-    fn source_path_probe_is_memoized_within_an_epoch() {
-        let (mut host, dir, file) = diag_host(
-            &[
-                ("Foo.compact", FOO_MODULE),
-                (
-                    "main.compact",
-                    "import Foo;\ncircuit m(): Field { return 0; }",
-                ),
-            ],
-            "main.compact",
-        );
-        // First probe resolves and caches Some(Foo.compact).
-        assert!(host.resolution_diagnostics(file).is_empty());
-
-        // Delete the target out-of-band: nothing tells the host, so from the
-        // host's disk model nothing that could change the result has happened.
-        let foo = dir.path().join("Foo.compact");
-        std::fs::remove_file(&foo).unwrap();
-        // A fresh, uncached probe would now say None...
-        assert!(!foo.exists());
-        assert!(crate::find_source_pathname(dir.path(), &[], "Foo").is_none());
-        // ...but the memoized probe still serves the old Some ⇒ still no diag.
-        assert!(
-            host.resolution_diagnostics(file).is_empty(),
-            "memoized probe must not re-hit disk within an epoch"
-        );
-    }
-
-    /// Generation hook: a watched-file CREATE is signalled via `invalidate_disk`
-    /// (which bumps the generation). That must invalidate a cached `None` so the
-    /// now-present import resolves. Goes RED if the generation-change clear is
-    /// removed: the stale `None` survives and the import still reports
-    /// unresolved.
-    #[test]
-    fn create_invalidates_cached_none_via_generation() {
-        let (mut host, dir, file) = diag_host(
-            &[(
-                "main.compact",
-                "import Foo;\ncircuit m(): Field { return 0; }",
-            )],
-            "main.compact",
-        );
-        // Foo.compact does not exist yet ⇒ unresolved, caches None.
-        assert_eq!(host.resolution_diagnostics(file).len(), 1);
-
-        // Create the file and signal it the way the watcher does: CREATE →
-        // invalidate_disk → generation bump.
-        let foo = dir.path().join("Foo.compact");
-        std::fs::write(&foo, FOO_MODULE).unwrap();
-        let foo_id = host.vfs_mut().file_id(&foo);
-        let gen_before = host.generation();
-        host.vfs_mut().invalidate_disk(foo_id);
-        assert!(
-            host.generation() > gen_before,
-            "invalidate_disk must bump the generation"
-        );
-
-        // The generation changed ⇒ cache cleared ⇒ the import now resolves.
-        assert!(
-            host.resolution_diagnostics(file).is_empty(),
-            "a generation bump must invalidate the cached None"
-        );
-    }
-
-    /// `forget_file` hook: a watched-file DELETE routes through
-    /// `remove_workspace_file` → `forget_file` and does NOT bump the
-    /// generation — the exact case that makes a generation-keyed-ALONE cache
-    /// incorrect. The cached `Some` must be dropped so the import goes
-    /// unresolved. Goes RED if the `forget_file` clear is removed: the stale
-    /// `Some` survives the deletion.
-    #[test]
-    fn delete_invalidates_cached_some_via_forget_file() {
-        let (mut host, dir, file) = diag_host(
-            &[
-                ("Foo.compact", FOO_MODULE),
-                (
-                    "main.compact",
-                    "import Foo;\ncircuit m(): Field { return 0; }",
-                ),
-            ],
-            "main.compact",
-        );
-        // Resolves and caches Some(Foo.compact).
-        assert!(host.resolution_diagnostics(file).is_empty());
-
-        // Delete the file and signal it the way the watcher does: DELETE →
-        // remove_workspace_file → forget_file. This does NOT bump generation.
-        let foo = dir.path().join("Foo.compact");
-        let foo_id = host.vfs_mut().file_id(&foo);
-        std::fs::remove_file(&foo).unwrap();
-        let gen_before = host.generation();
-        host.remove_workspace_file(foo_id);
-        assert_eq!(
-            host.generation(),
-            gen_before,
-            "a DELETE must not bump the generation (this is why forget_file must clear)"
-        );
-
-        // The cached Some must have been invalidated ⇒ import now unresolved.
-        let diags = host.resolution_diagnostics(file);
-        assert_eq!(
-            diags.len(),
-            1,
-            "forget_file must invalidate the cached Some"
-        );
-        assert!(diags[0].message.contains("cannot resolve import"));
-    }
-
-    /// `set_import_search_path` hook: the search path is an implicit part of
-    /// every probe key and changing it does NOT bump the generation. The cached
-    /// `None` (computed under the empty search path) must be dropped so the
-    /// now-reachable import resolves. Goes RED if that clear is removed.
-    #[test]
-    fn search_path_change_invalidates_cache() {
-        let (mut host, dir, file) = diag_host(
-            &[
-                (
-                    "libs/Bar.compact",
-                    "module Bar { export circuit g(): Field { return 0; } }",
-                ),
-                (
-                    "main.compact",
-                    "import Bar;\ncircuit m(): Field { return 0; }",
-                ),
-            ],
-            "main.compact",
-        );
-        // Bar lives only under libs/, which is not searched yet ⇒ unresolved,
-        // caches None.
-        assert_eq!(host.resolution_diagnostics(file).len(), 1);
-
-        let gen_before = host.generation();
-        host.set_import_search_path(vec![dir.path().join("libs")]);
-        assert_eq!(
-            host.generation(),
-            gen_before,
-            "changing the search path must not bump the generation"
-        );
-
-        // The memo cleared on the config change ⇒ Bar now resolves.
-        assert!(
-            host.resolution_diagnostics(file).is_empty(),
-            "set_import_search_path must invalidate the cache"
-        );
     }
 }

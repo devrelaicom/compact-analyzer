@@ -23,6 +23,12 @@ pub enum TyKind {
     /// absent annotation). Never the *source* of a type error: an `Unknown`
     /// operand or expectation suppresses a rule rather than firing it.
     Unknown,
+    /// A bounded unsigned integer `Uint<0..upper>` (half-open: values `[0, upper)`).
+    /// The payload is the **exclusive upper bound**, or `None` when it exceeds
+    /// `u128` and is not exactly representable — in which case the lattice
+    /// compares it conservatively (never a false positive). `Uint<k>` and
+    /// `Uint<lo..hi>` both lower to this single canonical form.
+    Uint(Option<u128>),
 }
 
 /// A salsa-interned type id. Under `#[salsa::interned]` this is `Ty<'db>` with
@@ -42,6 +48,17 @@ pub fn ty_display(db: &dyn Db, ty: Ty) -> String {
         TyKind::Boolean => "Boolean".to_string(),
         TyKind::Field => "Field".to_string(),
         TyKind::Unknown => "?".to_string(),
+        TyKind::Uint(Some(hi)) => {
+            // hi == 2^k for 1 <= k <= 248 renders as the bit-width form.
+            if hi.is_power_of_two() {
+                let k = hi.trailing_zeros();
+                if (1..=248).contains(&k) {
+                    return format!("Uint<{k}>");
+                }
+            }
+            format!("Uint<0..{hi}>")
+        }
+        TyKind::Uint(None) => "Uint<0..?>".to_string(),
     }
 }
 
@@ -66,5 +83,47 @@ mod tests {
         assert_eq!(ty_display(&db, Ty::new(&db, TyKind::Boolean)), "Boolean");
         assert_eq!(ty_display(&db, Ty::new(&db, TyKind::Field)), "Field");
         assert_eq!(ty_display(&db, Ty::new(&db, TyKind::Unknown)), "?");
+    }
+
+    #[test]
+    fn uint_display_normalizes_power_of_two() {
+        let db = CompactDatabase::default();
+        // hi == 2^k -> Uint<k>
+        assert_eq!(
+            ty_display(&db, Ty::new(&db, TyKind::Uint(Some(256)))),
+            "Uint<8>"
+        );
+        assert_eq!(
+            ty_display(&db, Ty::new(&db, TyKind::Uint(Some(2)))),
+            "Uint<1>"
+        );
+        // non power of two -> Uint<0..hi>
+        assert_eq!(
+            ty_display(&db, Ty::new(&db, TyKind::Uint(Some(10)))),
+            "Uint<0..10>"
+        );
+        assert_eq!(
+            ty_display(&db, Ty::new(&db, TyKind::Uint(Some(1)))),
+            "Uint<0..1>"
+        );
+        assert_eq!(
+            ty_display(&db, Ty::new(&db, TyKind::Uint(Some(257)))),
+            "Uint<0..257>"
+        );
+        // not exactly representable
+        assert_eq!(
+            ty_display(&db, Ty::new(&db, TyKind::Uint(None))),
+            "Uint<0..?>"
+        );
+    }
+
+    #[test]
+    fn uint_interns_by_bound() {
+        let db = CompactDatabase::default();
+        let a = Ty::new(&db, TyKind::Uint(Some(256)));
+        let b = Ty::new(&db, TyKind::Uint(Some(256)));
+        let c = Ty::new(&db, TyKind::Uint(Some(255)));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

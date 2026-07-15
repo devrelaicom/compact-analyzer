@@ -27,6 +27,51 @@ pub(crate) fn type_node_kind(ty: &compactp_ast::Type) -> TyKind {
     match ty {
         Type::Boolean(_) => TyKind::Boolean,
         Type::Field(_) => TyKind::Field,
+        Type::Uint(u) => uint_bound(u),
+        _ => TyKind::Unknown,
+    }
+}
+
+/// Parse a `Uint` size or an integer-literal token's text to a `u128`.
+/// Accepts decimal and `0x`/`0X` hex. `None` if the text is not a plain integer
+/// literal (e.g. a generic numeric parameter identifier) or overflows `u128`.
+fn parse_int_literal(text: &str) -> Option<u128> {
+    let t = text.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u128::from_str_radix(hex, 16).ok()
+    } else {
+        t.parse::<u128>().ok()
+    }
+}
+
+/// Lower a `Uint<...>` annotation to its canonical `TyKind::Uint(exclusive
+/// upper bound)`, per the extracted rule. A malformed or non-literal annotation
+/// lowers to `Unknown` (conservatively suppresses the lattice — corpus-safe,
+/// since accepted files have no malformed Uints). `Uint<k>` denotes `[0, 2^k)`
+/// for `1 <= k <= 248`; `Uint<lo..hi>` denotes `[lo, hi)` with `lo == 0`,
+/// `hi >= 1`.
+fn uint_bound(u: &compactp_ast::UintType) -> TyKind {
+    let sizes: Vec<compactp_ast::TypeSize> = u.sizes().collect();
+    match sizes.as_slice() {
+        // Bit-width form: Uint<k>.
+        [k] => match parse_int_literal(&k.syntax().text().to_string()) {
+            Some(k) if (1..=248).contains(&k) => {
+                let bound = if k < 128 { Some(1u128 << k) } else { None };
+                TyKind::Uint(bound)
+            }
+            _ => TyKind::Unknown, // out of range or non-literal
+        },
+        // Range form: Uint<lo..hi>.
+        [lo, hi] => {
+            if parse_int_literal(&lo.syntax().text().to_string()) != Some(0) {
+                return TyKind::Unknown; // range start must be 0 (else malformed)
+            }
+            match parse_int_literal(&hi.syntax().text().to_string()) {
+                Some(0) => TyKind::Unknown, // range end must be >= 1
+                Some(hi) => TyKind::Uint(Some(hi)),
+                None => TyKind::Uint(None), // hi is huge (>= 2^128) or non-literal-huge
+            }
+        }
         _ => TyKind::Unknown,
     }
 }
@@ -285,18 +330,53 @@ mod tests {
     }
 
     #[test]
+    fn uint_annotation_lowers_to_bound() {
+        let db = CompactDatabase::default();
+        // Uint<8> -> exclusive upper 2^8 = 256
+        let a = SourceText::new(&db, Arc::from("export circuit f(): Uint<8> { }"));
+        let ia = circuit_index(&db, a, "f");
+        let ca = circuit_node_by_index(&db, a, ia).unwrap();
+        assert_eq!(
+            type_node_kind(&ca.return_type().unwrap()),
+            TyKind::Uint(Some(256))
+        );
+        // Uint<0..10> -> exclusive upper 10
+        let b = SourceText::new(&db, Arc::from("export circuit f(): Uint<0..10> { }"));
+        let ib = circuit_index(&db, b, "f");
+        let cb = circuit_node_by_index(&db, b, ib).unwrap();
+        assert_eq!(
+            type_node_kind(&cb.return_type().unwrap()),
+            TyKind::Uint(Some(10))
+        );
+        // Malformed (non-zero start) -> Unknown (suppresses; not our diagnostic)
+        let c = SourceText::new(&db, Arc::from("export circuit f(): Uint<3..10> { }"));
+        let ic = circuit_index(&db, c, "f");
+        let cc = circuit_node_by_index(&db, c, ic).unwrap();
+        assert_eq!(type_node_kind(&cc.return_type().unwrap()), TyKind::Unknown);
+        // Width beyond 127 -> not exactly representable
+        let d = SourceText::new(&db, Arc::from("export circuit f(): Uint<200> { }"));
+        let id = circuit_index(&db, d, "f");
+        let cd = circuit_node_by_index(&db, d, id).unwrap();
+        assert_eq!(
+            type_node_kind(&cd.return_type().unwrap()),
+            TyKind::Uint(None)
+        );
+    }
+
+    #[test]
     fn unknown_operand_or_expectation_suppresses() {
         let db = CompactDatabase::default();
-        // Unknown declared type (a Uint): no rule fires yet.
+        // Boolean literal into a Uint return: Boolean </: Uint -> rejects
+        // (matches compactc: `Uint<8> return true` is a type error).
         let a = SourceText::new(
             &db,
             Arc::from("export circuit foo(): Uint<0..7> { return true; }"),
         );
-        assert!(type_diagnostics_query(&db, a).is_empty());
-        // Unknown operand (numeric literal) into a modeled type: suppressed.
+        assert_eq!(type_diagnostics_query(&db, a).len(), 1);
+        // A return type the checker does not model (Bytes) still suppresses.
         let b = SourceText::new(
             &db,
-            Arc::from("export circuit foo(): Boolean { return 1; }"),
+            Arc::from("export circuit foo(): Bytes<32> { return true; }"),
         );
         assert!(type_diagnostics_query(&db, b).is_empty());
     }

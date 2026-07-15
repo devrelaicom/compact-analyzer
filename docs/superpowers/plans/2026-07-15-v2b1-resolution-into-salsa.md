@@ -181,25 +181,38 @@ Make `item_tree` a real backdating firewall: derive `PartialEq, Eq` on `Symbol`/
 
 Add to `db.rs` tests (a trivia-only edit must reuse the `item_tree` memo):
 
+> **Salsa-mechanics correction (verified during execution).** `item_tree` is a *direct*
+> dependent of the `no_eq` `parsed` query, so it re-executes on *every* edit and returns a
+> freshly-allocated `Arc` — `Arc::ptr_eq` on `item_tree` itself is therefore never
+> satisfiable. Backdating rewrites `item_tree`'s *revision stamp* (using the new
+> `PartialEq`), not its stored `Arc`; the firewall is observable one hop **downstream**,
+> where `file_symbols` skips re-execution. The test asserts `item_tree` *value*-equality
+> (proves the derive salsa compares on) **and** `Arc::ptr_eq` on `file_symbols` (proves the
+> firewall).
+
 ```rust
 #[test]
-fn trivia_only_edit_backdates_item_tree() {
+fn trivia_only_edit_backdates_downstream_of_item_tree() {
     use salsa::Setter as _;
     let mut db = CompactDatabase::default();
     let src = SourceText::new(&db, Arc::from("export circuit c(): [] {}"));
     let t1 = crate::db::item_tree(&db, src);
+    let s1 = crate::db::file_symbols(&db, src);
     // Add only a trailing comment: items are byte-identical.
     src.set_text(&mut db).to(Arc::from("export circuit c(): [] {} // note"));
     let t2 = crate::db::item_tree(&db, src);
-    // Backdated: salsa returns the SAME Arc allocation because the value is Eq.
-    assert!(Arc::ptr_eq(&t1, &t2));
+    let s2 = crate::db::file_symbols(&db, src);
+    // item_tree re-runs (fresh Arc) but its VALUE is Eq → salsa backdates its revision.
+    assert_eq!(*t1, *t2);
+    // Downstream firewall: file_symbols skips re-execution → SAME Arc allocation.
+    assert!(Arc::ptr_eq(&s1, &s2));
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p analyzer-core trivia_only_edit_backdates_item_tree`
-Expected: FAIL — `Arc`s differ, because without `PartialEq` on the value salsa cannot backdate `item_tree` (it re-runs and allocates a fresh `Arc`).
+Run: `cargo test -p analyzer-core trivia_only_edit_backdates_downstream_of_item_tree`
+Expected: FAIL — with `item_tree` still `no_eq` (or `ItemTree` lacking `PartialEq`), salsa cannot backdate `item_tree`'s revision, so `file_symbols` re-executes and the `Arc::ptr_eq(&s1, &s2)` assertion fails.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -855,7 +868,12 @@ fn editing_importer_body_does_not_reresolve_imported_file() {
 
 - [ ] **Step 2: Trivia-only edit does not re-resolve**
 
-Assert that after a comment-only edit to a file, `resolve_query` returns an equal `Definition` and the `item_tree` memo backdated (ptr-eq), i.e. resolution rode the Task 2 firewall.
+Assert that after a comment-only edit to a file, `resolve_query` returns an equal
+`Definition`, and prove the firewall **downstream** (not on `item_tree` itself, which always
+re-executes — see Task 2's salsa-mechanics correction): assert `Arc::ptr_eq` on a
+`PartialEq`-returning derived query that rode the backdate — `file_symbols(&db, src)` before
+and after the trivia edit must be the same `Arc` allocation (unchanged item_tree revision →
+downstream skipped). Do **not** assert `Arc::ptr_eq` on `item_tree` itself.
 
 - [ ] **Step 3: Whole-suite + corpus + lints**
 

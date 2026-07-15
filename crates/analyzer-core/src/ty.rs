@@ -83,7 +83,8 @@ pub(crate) fn is_subtype(sub: TyKind, sup: TyKind) -> bool {
         (TyKind::Uint(a), TyKind::Uint(b)) => uint_upper_le(a, b),
         // Bytes<n> <: Bytes<m> iff n == m; Bytes is unrelated to all else.
         (TyKind::Bytes(a), TyKind::Bytes(b)) => a == b,
-        // Everything else (Boolean/Field/Uint cross, Field->Uint) is unrelated.
+        // Everything else (Boolean/Field/Uint cross, Field->Uint, Bytes
+        // cross-kind) is unrelated.
         _ => false,
     }
 }

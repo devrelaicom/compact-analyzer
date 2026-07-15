@@ -148,8 +148,9 @@ fn expr_ty_kind(expr: &compactp_ast::expr::Expr) -> TyKind {
 
 /// If `cast` is an `src as tgt` the checker can attribute as **illegal**,
 /// returns `(src, tgt)` for the diagnostic. The operand's source type must be
-/// known — only a primitive-literal operand is typed here (a parameter / local
-/// / arbitrary expression types to `Unknown`, and `can_cast(Unknown, _)` is
+/// known — a primitive-literal or (nested) cast operand is typed here (a
+/// parameter / local / arbitrary expression types to `Unknown`, and
+/// `can_cast(Unknown, _)` is
 /// `true`, so it suppresses). The operand is the `CAST_EXPR`'s `Expr` child
 /// (the target `Type` child does not cast to `Expr`).
 fn cast_error(cast: &compactp_ast::expr::CastExpr) -> Option<(TyKind, TyKind)> {

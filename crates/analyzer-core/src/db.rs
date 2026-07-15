@@ -270,17 +270,149 @@ pub(crate) fn resolve_includes(
     None
 }
 
-/// Resolves `name` through the file's imports, in declaration order.
-// Task 6 implements this.
-fn resolve_imports(
-    _db: &dyn Db,
-    _file: crate::FileId,
-    _src: SourceText,
-    _fd: FileDeps,
-    _ws: Workspace,
-    _name: &str,
+/// Resolves `name` through the file's imports, in declaration order. Port of
+/// `Resolver::resolve_through_import`'s driver loop: rebuild the AST from the
+/// memoized `parsed` green tree and try each `import` in turn. Pure — every
+/// cross-file target arrives via `fd`/`ws`.
+pub(crate) fn resolve_imports(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    name: &str,
 ) -> Option<crate::Definition> {
+    let tree = crate::db::item_tree(db, src);
+    let green = crate::db::parsed(db, src).green;
+    let root = compactp_syntax::SyntaxNode::new_root(green);
+    let sf = compactp_ast::SourceFile::cast(root)?;
+    for import in sf.imports() {
+        if let Some(d) = resolve_one_import(db, file, &tree, fd, ws, &import, name) {
+            return Some(d);
+        }
+    }
     None
+}
+
+/// One import's contribution to the namespace, honoring prefix and selective
+/// specifier lists (with aliases). Faithful transcription of
+/// `Resolver::resolve_through_import`: the two filesystem-probe call sites
+/// become reads of the matching `ResolvedDep` in `fd` (via
+/// `resolve_external_module_member`), and the `CompactStandardLibrary` arm
+/// reads `ws.stdlib`.
+fn resolve_one_import(
+    db: &dyn Db,
+    file: crate::FileId,
+    tree: &crate::ItemTree,
+    fd: FileDeps,
+    ws: Workspace,
+    import: &compactp_ast::Import,
+    name: &str,
+) -> Option<crate::Definition> {
+    // Determine the effective name to look up in the import's exports.
+    let mut lookup: &str = name;
+    let stripped;
+    if let Some(prefix) = import.prefix().and_then(|p| p.name()) {
+        // Prefix applies to every name from this import: unprefixed names never
+        // resolve through it.
+        stripped = name.strip_prefix(prefix.text())?.to_string();
+        lookup = &stripped;
+    }
+
+    // Selective list: only listed names are visible; `as` aliases rename them.
+    let specifiers: Vec<(String, String)> = import
+        .syntax()
+        .descendants()
+        .filter_map(compactp_ast::ImportSpecifier::cast)
+        .filter_map(|spec| {
+            let original = spec.name()?.text().to_string();
+            let alias =
+                crate::resolve::import_specifier_alias(&spec).unwrap_or_else(|| original.clone());
+            Some((alias, original))
+        })
+        .collect();
+    let target_name: String = if specifiers.is_empty() {
+        lookup.to_string()
+    } else {
+        specifiers
+            .iter()
+            .find(|(alias, _)| alias == lookup)?
+            .1
+            .clone()
+    };
+
+    // Where do this import's exports live?
+    match import.name() {
+        Some(module_token) if module_token.text() == "CompactStandardLibrary" => {
+            let (std_file, std_src) = ws.stdlib(db)?;
+            let std_tree = crate::db::item_tree(db, std_src);
+            let (idx, _) = std_tree
+                .top_level()
+                .find(|(_, s)| s.exported && s.name == target_name)?;
+            Some(crate::Definition::Item {
+                file: std_file,
+                index: idx,
+            })
+        }
+        Some(module_token) => {
+            let module_name = module_token.text().to_string();
+            // In-scope module first (in-scope FIRST, filesystem second). An
+            // in-scope module wins even if the member is absent.
+            if let Some((module_idx, _)) = tree
+                .top_level()
+                .find(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == module_name)
+            {
+                return tree
+                    .children_of(module_idx)
+                    .find(|(_, s)| s.exported && s.name == target_name)
+                    .map(|(idx, _)| crate::Definition::Item { file, index: idx });
+            }
+            // No in-scope module → external module member via the file's
+            // resolved deps: `<module_name>` containing exactly `module
+            // <module_name>`.
+            resolve_external_module_member(db, fd, &module_name, &module_name, &target_name)
+        }
+        // String-path import: never consults in-scope modules; expected module
+        // name is the last path component.
+        None => {
+            let raw = crate::string_lit_text(import.path()?.text());
+            let expected = crate::path_module_name(&raw)?;
+            resolve_external_module_member(db, fd, &raw, &expected, &target_name)
+        }
+    }
+}
+
+/// Resolves `target_name` as an exported member of the single module in the
+/// file that `raw` resolves to, requiring that module's name to equal
+/// `expected_module` (compiler rule). Used by both the identifier and
+/// string-path import arms. The host's disk probe + `analyze` becomes: find the
+/// matching non-include `ResolvedDep` in `fd` and read the target's
+/// `item_tree`.
+pub(crate) fn resolve_external_module_member(
+    db: &dyn Db,
+    fd: FileDeps,
+    raw: &str,
+    expected_module: &str,
+    target_name: &str,
+) -> Option<crate::Definition> {
+    let dep = fd
+        .deps(db)
+        .iter()
+        .find(|d| d.raw == raw && !d.is_include)?
+        .clone();
+    let (tfile, tsrc) = dep.target?;
+    let ttree = crate::db::item_tree(db, tsrc);
+    let (module_idx, module_sym) = crate::resolve::single_top_level_module(&ttree)?;
+    if module_sym.name != expected_module {
+        return None;
+    }
+    let (idx, _) = ttree
+        .children_of(module_idx)
+        .find(|(_, s)| s.exported && s.name == target_name)?;
+    Some(crate::Definition::Item {
+        file: tfile,
+        index: idx,
+    })
 }
 
 #[cfg(test)]
@@ -385,6 +517,21 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn resolve_imports_in_scope_module_member() {
+        let db = CompactDatabase::default();
+        let src = SourceText::new(
+            &db,
+            Arc::from("module M { export circuit ex(): [] {} }\nimport M;"),
+        );
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        // No file_deps map entries needed here: the import resolves through the
+        // in-scope module `M`, never touching the filesystem/deps arm.
+        let ws = Workspace::new(&db, None, Arc::new(std::collections::BTreeMap::new()));
+        let d = resolve_imports(&db, crate::FileId::from_raw_for_test(0), src, fd, ws, "ex");
+        assert!(matches!(d, Some(crate::Definition::Item { index, .. }) if index != 0));
     }
 
     #[test]

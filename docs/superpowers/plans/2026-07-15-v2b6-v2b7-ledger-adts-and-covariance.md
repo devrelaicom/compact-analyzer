@@ -248,7 +248,9 @@ In `ty.rs`, the existing tests `subtype_lattice_matches_compiler`, `bytes_subtyp
 In `crates/analyzer-core/src/infer.rs`, `TyKind` is used by value in several places relying on `Copy`. Make these compile under `Clone`:
 - `is_subtype(ret.kind, declared)` → `is_subtype(&ret.kind, &declared)` (in `type_diagnostics_query`).
 - `can_cast(src, tgt)` inside `cast_error` → `can_cast(&src, &tgt)`.
-- `return_mismatch_diag`/`cast_error_diag` take `TyKind` by value and call `Ty::new(db, actual)`; `Ty::new` now needs an owned `TyKind` (fine — they own it). Where a caller passes a value it still holds afterward, clone it (e.g. `ret.cast_error` is `Option<(TyKind, TyKind)>` — destructure by value with `if let Some((s, t)) = ret.cast_error` still works because `ReturnTy` is consumed per-iteration; if the borrow checker complains, clone: `if let Some((s, t)) = ret.cast_error.clone()`).
+- **The real move site in `type_diagnostics_query`:** `declared` is computed once per circuit but the loop below calls `return_mismatch_diag(db, ret.kind, declared, name, ret.span)`, which takes `declared: TyKind` **by value** and thus moves it — so the next loop iteration's `declared != TyKind::Unknown` / `is_subtype(&ret.kind, &declared)` would be a use-after-move once `TyKind` is no longer `Copy`. Fix by cloning at the call: `return_mismatch_diag(db, ret.kind, declared.clone(), name, ret.span)`. (`ret.kind` is a disjoint per-iteration owned field and may be moved as-is.)
+- `return_mismatch_diag`/`cast_error_diag` keep taking `TyKind` by value and call `Ty::new(db, actual)` (`Ty::new` needs an owned `TyKind` — fine, they own it).
+- `if let Some((s, t)) = ret.cast_error` is a partial move of a disjoint owned field per iteration — it needs **no** clone.
 - `ReturnTy.kind` and the `(span, kind)` mapping in `infer_circuit_returns`: `.map(|r| (r.span, r.kind))` moves `r.kind` — fine.
 
 Do **not** change behavior; this step is purely making the existing logic borrow-correct.
@@ -910,17 +912,29 @@ fn ledger_adt_at(
         compactp_ast::Type::Ref(r) => r.name()?,
         _ => return None, // scalar-typed -> implicit Cell (no builtin ADT methods checked)
     };
-    // If the head resolves to a user-defined named type, it is not a builtin ADT.
-    let head_off = head_tok.text_range().start();
-    if let Some(crate::Definition::Item { file: hf, index: hi }) =
-        resolve_query(db, df, dsrc, fd, ws, head_off)
-    {
-        if let Some(hs) = item_symbol(db, df, dsrc, fd, hf, hi) {
-            if matches!(
-                hs.kind,
-                crate::SymbolKind::Struct | crate::SymbolKind::Enum | crate::SymbolKind::TypeAlias
-            ) {
-                return None;
+    // If the head resolves to a user-defined named type, it is not a builtin
+    // ADT. Only run this check when the ledger field is in the SAME file as the
+    // call (`df == file`), where `src`/`fd` are the correct resolution inputs
+    // for `df`; a cross-file field's head would need `df`'s own `FileDeps`, and
+    // using the caller's `fd` could mis-resolve. Skipping the check cross-file
+    // is safe: emitting `E3004` requires a *builtin* ADT, which requires
+    // `import CompactStandardLibrary;`, and with that import a user type named
+    // like a builtin is a duplicate-binding compile error — so on any
+    // `compactc`-accepted file a builtin head is genuinely the builtin.
+    if df == file {
+        let head_off = head_tok.text_range().start();
+        if let Some(crate::Definition::Item { file: hf, index: hi }) =
+            resolve_query(db, file, src, fd, ws, head_off)
+        {
+            if let Some(hs) = item_symbol(db, file, src, fd, hf, hi) {
+                if matches!(
+                    hs.kind,
+                    crate::SymbolKind::Struct
+                        | crate::SymbolKind::Enum
+                        | crate::SymbolKind::TypeAlias
+                ) {
+                    return None;
+                }
             }
         }
     }
@@ -975,7 +989,20 @@ pub fn ledger_call_diagnostics_query(
         if recv.syntax().kind() != compactp_syntax::SyntaxKind::NAME_EXPR {
             continue;
         }
-        let recv_off = recv.syntax().text_range().start();
+        // Resolve at the receiver's IDENT token, NOT the node start: the parser
+        // attaches the statement's leading whitespace inside the NAME_EXPR, so
+        // the node start points at whitespace and `resolve_query`
+        // (`token_at_offset`) would fail. Mirrors `generic_diagnostics_query`,
+        // which resolves at `name_tok.text_range().start()`.
+        let Some(recv_off) = recv
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| t.kind() == compactp_syntax::SyntaxKind::IDENT)
+            .map(|t| t.text_range().start())
+        else {
+            continue;
+        };
         let Some(method_tok) = call.name() else { continue };
         let method = method_tok.text().to_string();
 

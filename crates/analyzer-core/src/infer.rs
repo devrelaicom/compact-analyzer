@@ -30,6 +30,25 @@ pub(crate) fn type_node_kind(ty: &compactp_ast::Type) -> TyKind {
         Type::Field(_) => TyKind::Field,
         Type::Uint(u) => uint_bound(u),
         Type::Bytes(b) => bytes_size(b),
+        Type::Tuple(t) => {
+            let elems: Vec<TyKind> = t.element_types().map(|e| type_node_kind(&e)).collect();
+            TyKind::Tuple(std::sync::Arc::from(elems))
+        }
+        Type::Vector(v) => {
+            let elem = v
+                .element_type()
+                .map(|e| type_node_kind(&e))
+                .unwrap_or(TyKind::Unknown);
+            match v
+                .size()
+                .and_then(|s| parse_int_literal(&s.syntax().text().to_string()))
+            {
+                Some(n) if n <= u32::MAX as u128 => {
+                    TyKind::Vector(n as u32, std::sync::Arc::new(elem))
+                }
+                _ => TyKind::Unknown, // non-literal / overflowing size -> suppress
+            }
+        }
         _ => TyKind::Unknown,
     }
 }
@@ -142,6 +161,23 @@ fn expr_ty_kind(expr: &compactp_ast::expr::Expr) -> TyKind {
             .ty()
             .map(|t| type_node_kind(&t))
             .unwrap_or(TyKind::Unknown),
+        Expr::Array(arr) => {
+            // A spread element makes arity/types indeterminate -> Unknown.
+            if arr
+                .syntax()
+                .children()
+                .any(|c| c.kind() == compactp_syntax::SyntaxKind::SPREAD_EXPR)
+            {
+                return TyKind::Unknown;
+            }
+            let elems: Vec<TyKind> = arr
+                .syntax()
+                .children()
+                .filter_map(compactp_ast::expr::Expr::cast)
+                .map(|e| expr_ty_kind(&e))
+                .collect();
+            TyKind::Tuple(std::sync::Arc::from(elems))
+        }
         _ => TyKind::Unknown,
     }
 }
@@ -262,7 +298,9 @@ fn circuit_returns(circuit: &compactp_ast::CircuitDef) -> Vec<ReturnTy> {
         // Only model literals and casts; skip operands the checker can't type.
         if matches!(
             value,
-            compactp_ast::expr::Expr::Literal(_) | compactp_ast::expr::Expr::Cast(_)
+            compactp_ast::expr::Expr::Literal(_)
+                | compactp_ast::expr::Expr::Cast(_)
+                | compactp_ast::expr::Expr::Array(_)
         ) {
             out.push(ReturnTy {
                 span: ret.syntax().text_range(),
@@ -459,6 +497,65 @@ mod tests {
     }
 
     #[test]
+    fn tuple_and_vector_annotations_lower() {
+        use std::sync::Arc;
+        let db = CompactDatabase::default();
+        // [Uint<8>, Boolean] -> Tuple([Uint(256), Boolean])
+        let a = SourceText::new(&db, Arc::from("export circuit f(): [Uint<8>, Boolean] { }"));
+        let ia = circuit_index(&db, a, "f");
+        let ca = circuit_node_by_index(&db, a, ia).unwrap();
+        assert_eq!(
+            type_node_kind(&ca.return_type().unwrap()),
+            TyKind::Tuple(Arc::from(vec![TyKind::Uint(Some(256)), TyKind::Boolean]))
+        );
+        // Vector<3, Uint<8>> -> Vector(3, Uint(256))
+        let b = SourceText::new(&db, Arc::from("export circuit f(): Vector<3, Uint<8>> { }"));
+        let ib = circuit_index(&db, b, "f");
+        let cb = circuit_node_by_index(&db, b, ib).unwrap();
+        assert_eq!(
+            type_node_kind(&cb.return_type().unwrap()),
+            TyKind::Vector(3, Arc::new(TyKind::Uint(Some(256))))
+        );
+        // Empty tuple -> unit.
+        let c = SourceText::new(&db, Arc::from("export circuit f(): [] { }"));
+        let ic = circuit_index(&db, c, "f");
+        let cc = circuit_node_by_index(&db, c, ic).unwrap();
+        assert_eq!(type_node_kind(&cc.return_type().unwrap()), TyKind::Tuple(Arc::from(vec![])));
+        // Non-literal vector size -> Unknown (suppresses).
+        let d = SourceText::new(&db, Arc::from("export circuit f(): Vector<N, Uint<8>> { }"));
+        let id = circuit_index(&db, d, "f");
+        let cd = circuit_node_by_index(&db, d, id).unwrap();
+        assert_eq!(type_node_kind(&cd.return_type().unwrap()), TyKind::Unknown);
+    }
+
+    #[test]
+    fn tuple_literal_return_typed_and_checked() {
+        use std::sync::Arc;
+        let db = CompactDatabase::default();
+        // return [1, true] types to Tuple([Uint(2), Boolean]).
+        let a = SourceText::new(&db, Arc::from("export circuit f(): [Uint<8>, Boolean] { return [1, true]; }"));
+        let ia = circuit_index(&db, a, "f");
+        assert_eq!(
+            infer_circuit_returns(&db, a, ia)[0].1,
+            TyKind::Tuple(Arc::from(vec![TyKind::Uint(Some(2)), TyKind::Boolean]))
+        );
+        // In-range literal tuple into declared tuple -> accept.
+        assert!(type_diagnostics_query(&db, a).is_empty());
+        // Tuple literal into a Vector of equal length -> accept (the equivalence).
+        let b = SourceText::new(&db, Arc::from("export circuit f(): Vector<3, Uint<8>> { return [1, 2, 3]; }"));
+        assert!(type_diagnostics_query(&db, b).is_empty());
+        // Element out of range -> reject (300 not <: Uint<8>).
+        let c = SourceText::new(&db, Arc::from("export circuit f(): Vector<3, Uint<8>> { return [1, 2, 300]; }"));
+        assert_eq!(type_diagnostics_query(&db, c).len(), 1);
+        // Arity mismatch -> reject.
+        let d = SourceText::new(&db, Arc::from("export circuit f(): [Uint<8>] { return [1, true]; }"));
+        assert_eq!(type_diagnostics_query(&db, d).len(), 1);
+        // A spread element makes the literal indeterminate -> Unknown -> suppress.
+        let e = SourceText::new(&db, Arc::from("export circuit f(x: [Uint<8>, Uint<8>]): [Uint<8>, Uint<8>] { return [...x]; }"));
+        assert!(type_diagnostics_query(&db, e).is_empty());
+    }
+
+    #[test]
     fn literal_into_uint_range_accept_and_reject() {
         let db = CompactDatabase::default();
         // In range: 5 (Uint<0..6>) <: Uint<0..10> -> no diagnostic
@@ -619,10 +716,12 @@ mod tests {
             Arc::from("export circuit foo(): Boolean { return 1; }"),
         );
         assert_eq!(type_diagnostics_query(&db, b).len(), 1);
-        // A return type the checker does not model (Vector) still suppresses.
+        // A return type the checker does not model (a named type reference)
+        // still suppresses. (Vector/Tuple are now modeled — see
+        // `tuple_and_vector_annotations_lower` / `tuple_literal_return_typed_and_checked`.)
         let c = SourceText::new(
             &db,
-            Arc::from("export circuit foo(): Vector<3, Field> { return true; }"),
+            Arc::from("export circuit foo(): MyType { return true; }"),
         );
         assert!(type_diagnostics_query(&db, c).is_empty());
     }

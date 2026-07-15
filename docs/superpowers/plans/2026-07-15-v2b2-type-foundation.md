@@ -56,6 +56,20 @@ against `compactc`'s type-checking-phase verdict: a **binary accept/reject corpu
 5. **Trivial vertical slice — primitive-literal typing.** The one rule proving the whole
    path: a fixture captured from `compactc`, a native rule, agreement asserted both ways.
 
+## Carry-forwards from v2b.1 (final whole-branch review, 2026-07-15)
+
+- **Add a `FileId → SourceText` map to the `Workspace` salsa input (highest-value cheap
+  win).** v2b.1's `source_text_for` (in `db.rs`) recovers a cross-file `SourceText` for a
+  resolved `Definition` by scanning `ws.file_deps(db).values()` and reading each file's
+  `deps` — which is both **O(files × deps)** and, worse, takes a salsa dependency on
+  *every* file's `FileDeps`, so any resolution reaching that arm (transitive cross-file
+  member access) re-executes whenever *any* file's `FileDeps` is republished. v2b's type
+  layer will drive `resolve()`/`item_tree` cross-file reads far harder, so add a
+  `file_srcs: Arc<BTreeMap<FileId, SourceText>>` field to `Workspace` (published alongside
+  the existing `file_deps` map, on the same keyset-grow/shrink events) and make
+  `source_text_for` an O(1), dependency-narrow map lookup. Behavior-preserving; do it early
+  in v2b.2 before the type queries inherit the over-broad dependency.
+
 ## Key open questions to resolve at plan time
 
 - **`Ty` constructor set for the slice** — kept minimal; the real universe grows per rule.

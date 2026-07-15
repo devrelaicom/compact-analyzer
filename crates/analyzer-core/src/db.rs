@@ -191,8 +191,8 @@ pub fn item_tree(db: &dyn Db, src: SourceText) -> Arc<ItemTree> {
 
 /// File-scope name resolution as a tracked query: enclosing-module siblings,
 /// then top-level items, then included files' top-level decls, then imports.
-/// The port of `Resolver::resolve_in_file_scope`; all cross-file targets come
-/// from `fd`/`ws` (no I/O).
+/// This is the salsa port of the former imperative file-scope resolver; all
+/// cross-file targets come from `fd`/`ws` (no I/O).
 #[salsa::tracked(returns(clone))]
 pub fn resolve_in_file(
     db: &dyn Db,
@@ -236,6 +236,8 @@ pub fn resolve_in_file(
 /// skip, never die" ethos.
 pub(crate) fn resolve_includes(
     db: &dyn Db,
+    // Unused here: retained for call-site symmetry with the sibling
+    // resolution helpers (e.g. `resolve_imports`), which do need `file`.
     _file: crate::FileId,
     fd: FileDeps,
     ws: Workspace,
@@ -271,10 +273,10 @@ pub(crate) fn resolve_includes(
     None
 }
 
-/// Resolves `name` through the file's imports, in declaration order. Port of
-/// `Resolver::resolve_through_import`'s driver loop: rebuild the AST from the
-/// memoized `parsed` green tree and try each `import` in turn. Pure — every
-/// cross-file target arrives via `fd`/`ws`.
+/// Resolves `name` through the file's imports, in declaration order. Salsa
+/// port of the former imperative import-resolution driver loop: rebuild the
+/// AST from the memoized `parsed` green tree and try each `import` in turn.
+/// Pure — every cross-file target arrives via `fd`/`ws`.
 pub(crate) fn resolve_imports(
     db: &dyn Db,
     file: crate::FileId,
@@ -296,8 +298,8 @@ pub(crate) fn resolve_imports(
 }
 
 /// One import's contribution to the namespace, honoring prefix and selective
-/// specifier lists (with aliases). Faithful transcription of
-/// `Resolver::resolve_through_import`: the two filesystem-probe call sites
+/// specifier lists (with aliases). Faithful transcription of the former
+/// imperative import-resolution logic: the two filesystem-probe call sites
 /// become reads of the matching `ResolvedDep` in `fd` (via
 /// `resolve_external_module_member`), and the `CompactStandardLibrary` arm
 /// reads `ws.stdlib`.
@@ -484,7 +486,7 @@ pub fn resolve_query(
 /// bridge); the top-level dispatcher calls the inner `resolve_name_at` helper
 /// directly.
 #[salsa::tracked(returns(clone))]
-pub fn resolve_name_query(
+pub(crate) fn resolve_name_query(
     db: &dyn Db,
     file: crate::FileId,
     src: SourceText,
@@ -749,9 +751,9 @@ fn source_text_for(
 }
 
 /// Error diagnostics for imports/includes in `src`, given `fd`'s resolved
-/// targets. Tracked port of `AnalysisHost::resolution_diagnostics` (+ its
-/// `module_mismatch_diag` helper): for each import/include recovered from
-/// `parsed(db, src)`'s green tree, look up the matching `ResolvedDep` in `fd`
+/// targets. Tracked port of `AnalysisHost::resolution_diagnostics` (+ the
+/// module-mismatch check it used to run inline): for each import/include
+/// recovered from `parsed(db, src)`'s green tree, look up the matching `ResolvedDep` in `fd`
 /// — `target: None` reports the unresolved-import/include diagnostic
 /// (E9001/E9004); `target: Some((_, tsrc))` runs the module-mismatch check
 /// against `tsrc`'s item tree for imports (E9002/E9003); includes have no
@@ -765,8 +767,9 @@ fn source_text_for(
 /// impure concern the query itself must not touch. The host precomputes
 /// `from_dir_display` (`from_dir.display().to_string()`) and `search_display`
 /// (the search path list joined with `", "`, the same way the original
-/// `resolve::searched_list` joined it) and hands them in as `Arc<str>`;
-/// [`searched_list_display`] recombines them into the exact original string.
+/// imperative "searched:" formatting joined it) and hands them in as
+/// `Arc<str>`; [`searched_list_display`] recombines them into the exact
+/// original string.
 ///
 /// `no_eq`: `Diagnostic` (external crate `compactp_diagnostics`) has no
 /// `PartialEq`, so `Arc<[Diagnostic]>` can't be compared for backdating —
@@ -885,10 +888,10 @@ fn push_import_diag(
 }
 
 /// Error iff `tsrc`'s single top-level module does not match `expected`. Port
-/// of `AnalysisHost::module_mismatch_diag`; the host's `analyze(target)` disk
-/// read becomes a plain `item_tree(db, tsrc)` — `tsrc` already arrived via a
-/// resolved `ResolvedDep`, materialized once, host-side, so no I/O happens
-/// here.
+/// of the former imperative module-mismatch check; the host's
+/// `analyze(target)` disk read becomes a plain `item_tree(db, tsrc)` —
+/// `tsrc` already arrived via a resolved `ResolvedDep`, materialized once,
+/// host-side, so no I/O happens here.
 fn module_mismatch_diag_query(
     db: &dyn Db,
     tsrc: SourceText,
@@ -915,11 +918,10 @@ fn module_mismatch_diag_query(
 }
 
 /// Recombines the host-precomputed `from_dir_display`/`search_display`
-/// strings into the exact "searched: ..." list the original
-/// `resolve::searched_list(from_dir, search)` produced: `from_dir` alone when
-/// the search path is empty, else `from_dir, <search paths joined by ", ">` —
-/// `search_display` is already that same join, computed host-side the same
-/// way `searched_list` did it.
+/// strings into the exact "searched: ..." list the original imperative
+/// formatting produced: `from_dir` alone when the search path is empty, else
+/// `from_dir, <search paths joined by ", ">` — `search_display` is already
+/// that same join, computed host-side the same way the original did it.
 fn searched_list_display(from_dir_display: &str, search_display: &str) -> String {
     if search_display.is_empty() {
         from_dir_display.to_string()

@@ -1202,9 +1202,9 @@ mod tests {
         assert_eq!(diags[0].code.number, 9001);
     }
 
-    /// Byte-identical "searched: {list}" wording: the original
-    /// `resolve::searched_list(from_dir, search)` rendered `from_dir` followed
-    /// by every extra search-path entry, joined with `", "`. The tracked query
+    /// Byte-identical "searched: {list}" wording: the original imperative
+    /// formatting rendered `from_dir` followed by every extra search-path
+    /// entry, joined with `", "`. The tracked query
     /// only ever sees the host-precomputed `from_dir_display`/`search_display`
     /// strings, so this locks in that the two combine back into exactly that
     /// format (not, say, a trailing separator when the search path is

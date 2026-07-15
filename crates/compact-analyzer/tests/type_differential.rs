@@ -164,6 +164,12 @@ fn corpus_no_false_positives() {
         false_positives.len()
     );
     assert!(
+        accepted > 0,
+        "corpus gate exercised no compactc-accepted files (accepted={accepted}, \
+         compiler_rejected={compiler_rejected}, indeterminate={indeterminate}); \
+         the toolchain or invocation may be misconfigured"
+    );
+    assert!(
         false_positives.is_empty(),
         "native emitted type diagnostics on {} file(s) compactc accepts (false positives): {:?}",
         false_positives.len(),

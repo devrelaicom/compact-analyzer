@@ -167,7 +167,10 @@ pub struct FileDeps {
 /// reach a *target* file's own cross-file edges (needed for the transitive
 /// include walk). The host republishes `file_deps` only when its keyset
 /// changes (a file added/removed); per-file dep *content* changes flow
-/// through the individual `FileDeps` inputs.
+/// through the individual `FileDeps` inputs. It also holds `file_srcs`, a
+/// `FileId -> SourceText` map for every file reachable from the workspace,
+/// republished on that same structural (keyset-change) schedule; see its own
+/// doc comment below for detail.
 #[salsa::input]
 pub struct Workspace {
     #[returns(clone)]
@@ -556,7 +559,6 @@ fn resolve_struct_literal_field(
         name,
         file,
         src,
-        fd,
         ws,
     )
 }
@@ -598,7 +600,6 @@ fn resolve_member(
         name,
         file,
         src,
-        fd,
         ws,
     )
 }
@@ -690,7 +691,6 @@ fn item_declaration_at(
 /// Child symbol of `parent_def` with the given kind and name. Port of
 /// `AnalysisHost::field_of`; the target file's `item_tree` is read via
 /// [`source_text_for`] rather than the host's `analyze`.
-#[allow(clippy::too_many_arguments)]
 fn field_of(
     db: &dyn Db,
     parent_def: &crate::Definition,
@@ -698,11 +698,6 @@ fn field_of(
     name: &str,
     this_file: crate::FileId,
     this_src: SourceText,
-    // No longer read directly: `source_text_for` (below) dropped its `fd`
-    // parameter in favor of `Workspace.file_srcs`. Kept in the signature
-    // (rather than removed) so both call sites' argument lists stay
-    // unchanged — a call-site-stable, behavior-preserving no-op.
-    _fd: FileDeps,
     ws: Workspace,
 ) -> Option<crate::Definition> {
     let crate::Definition::Item { file, index } = parent_def else {

@@ -366,7 +366,13 @@ pub fn type_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnostic]>
             }
             // Return-mismatch only fires on a return type the checker models.
             if declared != TyKind::Unknown && !is_subtype(&ret.kind, &declared) {
-                diags.push(return_mismatch_diag(db, ret.kind, declared.clone(), name, ret.span));
+                diags.push(return_mismatch_diag(
+                    db,
+                    ret.kind,
+                    declared.clone(),
+                    name,
+                    ret.span,
+                ));
             }
         }
     }
@@ -520,7 +526,10 @@ mod tests {
         let c = SourceText::new(&db, Arc::from("export circuit f(): [] { }"));
         let ic = circuit_index(&db, c, "f");
         let cc = circuit_node_by_index(&db, c, ic).unwrap();
-        assert_eq!(type_node_kind(&cc.return_type().unwrap()), TyKind::Tuple(Arc::from(vec![])));
+        assert_eq!(
+            type_node_kind(&cc.return_type().unwrap()),
+            TyKind::Tuple(Arc::from(vec![]))
+        );
         // Non-literal vector size -> Unknown (suppresses).
         let d = SourceText::new(&db, Arc::from("export circuit f(): Vector<N, Uint<8>> { }"));
         let id = circuit_index(&db, d, "f");
@@ -533,7 +542,10 @@ mod tests {
         use std::sync::Arc;
         let db = CompactDatabase::default();
         // return [1, true] types to Tuple([Uint(2), Boolean]).
-        let a = SourceText::new(&db, Arc::from("export circuit f(): [Uint<8>, Boolean] { return [1, true]; }"));
+        let a = SourceText::new(
+            &db,
+            Arc::from("export circuit f(): [Uint<8>, Boolean] { return [1, true]; }"),
+        );
         let ia = circuit_index(&db, a, "f");
         assert_eq!(
             infer_circuit_returns(&db, a, ia)[0].1,
@@ -542,16 +554,30 @@ mod tests {
         // In-range literal tuple into declared tuple -> accept.
         assert!(type_diagnostics_query(&db, a).is_empty());
         // Tuple literal into a Vector of equal length -> accept (the equivalence).
-        let b = SourceText::new(&db, Arc::from("export circuit f(): Vector<3, Uint<8>> { return [1, 2, 3]; }"));
+        let b = SourceText::new(
+            &db,
+            Arc::from("export circuit f(): Vector<3, Uint<8>> { return [1, 2, 3]; }"),
+        );
         assert!(type_diagnostics_query(&db, b).is_empty());
         // Element out of range -> reject (300 not <: Uint<8>).
-        let c = SourceText::new(&db, Arc::from("export circuit f(): Vector<3, Uint<8>> { return [1, 2, 300]; }"));
+        let c = SourceText::new(
+            &db,
+            Arc::from("export circuit f(): Vector<3, Uint<8>> { return [1, 2, 300]; }"),
+        );
         assert_eq!(type_diagnostics_query(&db, c).len(), 1);
         // Arity mismatch -> reject.
-        let d = SourceText::new(&db, Arc::from("export circuit f(): [Uint<8>] { return [1, true]; }"));
+        let d = SourceText::new(
+            &db,
+            Arc::from("export circuit f(): [Uint<8>] { return [1, true]; }"),
+        );
         assert_eq!(type_diagnostics_query(&db, d).len(), 1);
         // A spread element makes the literal indeterminate -> Unknown -> suppress.
-        let e = SourceText::new(&db, Arc::from("export circuit f(x: [Uint<8>, Uint<8>]): [Uint<8>, Uint<8>] { return [...x]; }"));
+        let e = SourceText::new(
+            &db,
+            Arc::from(
+                "export circuit f(x: [Uint<8>, Uint<8>]): [Uint<8>, Uint<8>] { return [...x]; }",
+            ),
+        );
         assert!(type_diagnostics_query(&db, e).is_empty());
     }
 

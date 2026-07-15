@@ -80,7 +80,11 @@ pub(crate) fn display_kind(kind: &TyKind) -> String {
         TyKind::Uint(None) => "Uint<0..?>".to_string(),
         TyKind::Bytes(n) => format!("Bytes<{n}>"),
         TyKind::Tuple(elems) => {
-            let inner = elems.iter().map(display_kind).collect::<Vec<_>>().join(", ");
+            let inner = elems
+                .iter()
+                .map(display_kind)
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("[{inner}]")
         }
         TyKind::Vector(n, elem) => format!("Vector<{n}, {}>", display_kind(elem)),
@@ -103,10 +107,9 @@ pub(crate) fn is_subtype(sub: &TyKind, sup: &TyKind) -> bool {
         // Bytes<n> <: Bytes<m> iff n == m; Bytes is unrelated to all else.
         (TyKind::Bytes(a), TyKind::Bytes(b)) => a == b,
         // Tuple & Vector are one sequence relation (all four combinations).
-        (
-            TyKind::Tuple(_) | TyKind::Vector(_, _),
-            TyKind::Tuple(_) | TyKind::Vector(_, _),
-        ) => seq_subtype(sub, sup),
+        (TyKind::Tuple(_) | TyKind::Vector(_, _), TyKind::Tuple(_) | TyKind::Vector(_, _)) => {
+            seq_subtype(sub, sup)
+        }
         // Everything else (Boolean/Field/Uint cross, Field->Uint, Bytes
         // cross-kind) is unrelated.
         _ => false,
@@ -347,24 +350,36 @@ mod tests {
         let vec = TyKind::Vector(3, Arc::new(TyKind::Uint(Some(256))));
         assert_eq!(ty_display(&db, Ty::new(&db, vec)), "Vector<3, Uint<8>>");
         // Empty tuple is the unit type.
-        assert_eq!(ty_display(&db, Ty::new(&db, TyKind::Tuple(Arc::from(vec![])))), "[]");
+        assert_eq!(
+            ty_display(&db, Ty::new(&db, TyKind::Tuple(Arc::from(vec![])))),
+            "[]"
+        );
     }
 
     #[test]
     fn sequence_subtyping_matches_compiler() {
-        use std::sync::Arc;
         use TyKind::*;
+        use std::sync::Arc;
         let u8k = || Uint(Some(256));
         let u16k = || Uint(Some(65536));
         let tup = |v: Vec<TyKind>| Tuple(Arc::from(v));
         let vec = |n, t| Vector(n, Arc::new(t));
 
         // Element-wise covariance: [Uint8, Uint8] <: [Uint16, Field]
-        assert!(is_subtype(&tup(vec![u8k(), u8k()]), &tup(vec![u16k(), Field])));
+        assert!(is_subtype(
+            &tup(vec![u8k(), u8k()]),
+            &tup(vec![u16k(), Field])
+        ));
         // Narrowing an element rejects: [Uint16, Uint16] </: [Uint8, Uint8]
-        assert!(!is_subtype(&tup(vec![u16k(), u16k()]), &tup(vec![u8k(), u8k()])));
+        assert!(!is_subtype(
+            &tup(vec![u16k(), u16k()]),
+            &tup(vec![u8k(), u8k()])
+        ));
         // Non-covariant element rejects: [Uint8, Boolean] </: [Uint16, Field]
-        assert!(!is_subtype(&tup(vec![u8k(), Boolean]), &tup(vec![u16k(), Field])));
+        assert!(!is_subtype(
+            &tup(vec![u8k(), Boolean]),
+            &tup(vec![u16k(), Field])
+        ));
         // Arity mismatch rejects.
         assert!(!is_subtype(&tup(vec![u8k(), u8k()]), &tup(vec![u8k()])));
         // Vector covariance + length: Vector<3,Uint8> <: Vector<3,Uint16>, not Vector<2,_>.
@@ -380,9 +395,15 @@ mod tests {
         // Heterogeneous tuple into a vector rejects when an element is non-covariant.
         assert!(!is_subtype(&tup(vec![u8k(), Boolean]), &vec(2, Field)));
         // Nested sequences recurse.
-        assert!(is_subtype(&vec(2, tup(vec![u8k(), u8k()])), &vec(2, tup(vec![u16k(), Field]))));
+        assert!(is_subtype(
+            &vec(2, tup(vec![u8k(), u8k()])),
+            &vec(2, tup(vec![u16k(), Field]))
+        ));
         // Unknown element suppresses that position (never a false positive).
-        assert!(is_subtype(&tup(vec![Unknown, Boolean]), &tup(vec![u8k(), Boolean])));
+        assert!(is_subtype(
+            &tup(vec![Unknown, Boolean]),
+            &tup(vec![u8k(), Boolean])
+        ));
         // A sequence is unrelated to a scalar.
         assert!(!is_subtype(&tup(vec![u8k()]), &u8k()));
         assert!(!is_subtype(&u8k(), &vec(1, u8k())));

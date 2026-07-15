@@ -81,6 +81,8 @@ pub(crate) fn is_subtype(sub: TyKind, sup: TyKind) -> bool {
         (TyKind::Uint(_), TyKind::Field) => true,
         // Uint<0..a> <: Uint<0..b> iff a <= b (range containment).
         (TyKind::Uint(a), TyKind::Uint(b)) => uint_upper_le(a, b),
+        // Bytes<n> <: Bytes<m> iff n == m; Bytes is unrelated to all else.
+        (TyKind::Bytes(a), TyKind::Bytes(b)) => a == b,
         // Everything else (Boolean/Field/Uint cross, Field->Uint) is unrelated.
         _ => false,
     }
@@ -209,5 +211,26 @@ mod tests {
         // Unknown suppresses in both directions
         assert!(is_subtype(Unknown, Field));
         assert!(is_subtype(Boolean, Unknown));
+    }
+
+    #[test]
+    fn bytes_subtype_is_same_size_only() {
+        use TyKind::*;
+        // reflexive by size
+        assert!(is_subtype(Bytes(32), Bytes(32)));
+        assert!(is_subtype(Bytes(1), Bytes(1)));
+        // different size is unrelated (both directions)
+        assert!(!is_subtype(Bytes(4), Bytes(32)));
+        assert!(!is_subtype(Bytes(32), Bytes(4)));
+        // Bytes is unrelated to every other kind
+        assert!(!is_subtype(Bytes(32), Field));
+        assert!(!is_subtype(Field, Bytes(32)));
+        assert!(!is_subtype(Bytes(32), Uint(Some(256))));
+        assert!(!is_subtype(Uint(Some(256)), Bytes(32)));
+        assert!(!is_subtype(Bytes(32), Boolean));
+        assert!(!is_subtype(Boolean, Bytes(32)));
+        // Unknown still suppresses in both directions
+        assert!(is_subtype(Unknown, Bytes(32)));
+        assert!(is_subtype(Bytes(32), Unknown));
     }
 }

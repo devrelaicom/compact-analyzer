@@ -139,6 +139,51 @@ pub fn raw_imports(db: &dyn Db, src: SourceText) -> Arc<[RawDep]> {
     Arc::from(out)
 }
 
+/// A cross-file resolved edge: one import/include target after host-side
+/// disk resolution. `target: None` means the raw string did not resolve to a
+/// file.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ResolvedDep {
+    pub raw: String,
+    pub is_include: bool,
+    pub target: Option<(crate::FileId, SourceText)>,
+}
+
+/// Per-file cross-file environment, set by the host from `index_file`'s
+/// resolution pass. One handle per `FileId`, stored host-side like `sources`.
+#[salsa::input]
+pub struct FileDeps {
+    #[returns(clone)]
+    pub deps: Arc<[ResolvedDep]>,
+}
+
+/// Workspace singleton: the stdlib file's `(FileId, SourceText)`, or `None`.
+#[salsa::input]
+pub struct Workspace {
+    #[returns(clone)]
+    pub stdlib: Option<(crate::FileId, SourceText)>,
+}
+
+/// Item tree for `src`, memoized on the `SourceText` input. Spike-minimal:
+/// just projects `parsed`'s item tree out. `ItemTree` doesn't derive
+/// `PartialEq` (Task 2 gives this query its own backdating story), so `no_eq`
+/// opts out of salsa's default backdating comparison, same as `parsed` above.
+#[salsa::tracked(returns(clone), no_eq)]
+pub fn item_tree(db: &dyn Db, src: SourceText) -> Arc<ItemTree> {
+    crate::db::parsed(db, src).item_tree
+}
+
+/// Throwaway spike: proves a tracked query can read a *second* file's
+/// `item_tree` (reached via a `FileDeps` entry) purely, with no I/O. Deleted
+/// in Task 5 once the real cross-file resolution queries land.
+#[salsa::tracked(returns(clone))]
+pub fn spike_cross_file(db: &dyn Db, fd: FileDeps, raw: String) -> Option<String> {
+    let dep = fd.deps(db).iter().find(|d| d.raw == raw)?.clone();
+    let (_, target_src) = dep.target?;
+    let tree = crate::db::item_tree(db, target_src);
+    tree.top_level().next().map(|(_, s)| s.name.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +215,21 @@ mod tests {
         b.set_text(&mut db).to(Arc::from("ledger b2: Field;"));
         let a_diag_again = crate::db::parsed(&db, a).diagnostics;
         assert!(Arc::ptr_eq(&a_diag, &a_diag_again));
+    }
+
+    #[test]
+    fn spike_reads_another_files_item_tree_purely() {
+        let db = CompactDatabase::default();
+        let target_src = SourceText::new(&db, Arc::from("export circuit tgt(): [] {}"));
+        let deps: Arc<[ResolvedDep]> = Arc::from(vec![ResolvedDep {
+            raw: "T".to_string(),
+            is_include: false,
+            target: Some((crate::FileId::from_raw_for_test(1), target_src)),
+        }]);
+        let fd = FileDeps::new(&db, deps);
+        // The spike resolves raw "T" to its target's first top-level symbol name.
+        assert_eq!(spike_cross_file(&db, fd, "T".to_string()).as_deref(), Some("tgt"));
+        assert_eq!(spike_cross_file(&db, fd, "Nope".to_string()), None);
     }
 
     #[test]

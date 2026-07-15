@@ -7,6 +7,7 @@
 mod analysis;
 mod db;
 pub mod fixture;
+mod infer;
 mod item_tree;
 mod ledger_adts;
 mod line_index;

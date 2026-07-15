@@ -80,12 +80,13 @@ pub struct RawDep {
 }
 
 /// Non-empty-named symbols in `src`'s item tree, paired with their index in
-/// `ItemTree::symbols`. Derived from `parsed`; memoized separately so
-/// downstream consumers that only need symbols aren't invalidated by changes
-/// to diagnostics or the line index.
+/// `ItemTree::symbols`. Derived from `item_tree` (not `parsed` directly) so
+/// this query — and everything built on it — benefits from `item_tree`'s
+/// backdating firewall: a trivia-only edit leaves `item_tree`'s `Arc`
+/// unchanged, so `file_symbols` skips re-execution too.
 #[salsa::tracked(returns(clone))]
 pub fn file_symbols(db: &dyn Db, src: SourceText) -> Arc<[(String, u32)]> {
-    let tree = crate::db::parsed(db, src).item_tree;
+    let tree = crate::db::item_tree(db, src);
     tree.symbols
         .iter()
         .enumerate()
@@ -164,11 +165,15 @@ pub struct Workspace {
     pub stdlib: Option<(crate::FileId, SourceText)>,
 }
 
-/// Item tree for `src`, memoized on the `SourceText` input. Spike-minimal:
-/// just projects `parsed`'s item tree out. `ItemTree` doesn't derive
-/// `PartialEq` (Task 2 gives this query its own backdating story), so `no_eq`
-/// opts out of salsa's default backdating comparison, same as `parsed` above.
-#[salsa::tracked(returns(clone), no_eq)]
+/// Item tree for `src`, memoized on the `SourceText` input. Projects
+/// `parsed`'s item tree out. `ItemTree` (and `Symbol`) derive `PartialEq,
+/// Eq`, so this query backdates normally: a trivia-only edit re-runs
+/// `parsed` (which can never backdate — see above) but produces an
+/// unchanged `ItemTree`, so `item_tree` returns the *same* `Arc` allocation
+/// and every tracked query downstream of `item_tree` skips re-execution.
+/// This is the backdating firewall the rest of v2b.1's resolution queries
+/// build on.
+#[salsa::tracked(returns(clone))]
 pub fn item_tree(db: &dyn Db, src: SourceText) -> Arc<ItemTree> {
     crate::db::parsed(db, src).item_tree
 }
@@ -230,6 +235,38 @@ mod tests {
         // The spike resolves raw "T" to its target's first top-level symbol name.
         assert_eq!(spike_cross_file(&db, fd, "T".to_string()).as_deref(), Some("tgt"));
         assert_eq!(spike_cross_file(&db, fd, "Nope".to_string()), None);
+    }
+
+    #[test]
+    fn trivia_only_edit_backdates_item_tree() {
+        use salsa::Setter as _;
+        let mut db = CompactDatabase::default();
+        let src = SourceText::new(&db, Arc::from("export circuit c(): [] {}"));
+        let t1 = crate::db::item_tree(&db, src);
+        let s1 = crate::db::file_symbols(&db, src);
+        // Add only a trailing comment: items are byte-identical.
+        src.set_text(&mut db).to(Arc::from("export circuit c(): [] {} // note"));
+        let t2 = crate::db::item_tree(&db, src);
+        let s2 = crate::db::file_symbols(&db, src);
+        // `item_tree` is a *direct* dependent of `parsed`, which is `no_eq`
+        // and therefore always reports "changed" once its input changed;
+        // `item_tree` must always re-execute and reallocate its `Arc` in
+        // that case (salsa backdates a memo's `changed_at`, but "[r]e-
+        // execution may update or replace the value" -- salsa never hands
+        // back the old allocation from the query that itself re-executed).
+        // So the trivia-only edit still produces a *different* Arc here --
+        // but an equal one, confirming `ItemTree`'s new `PartialEq` derive
+        // makes the values compare equal despite the byte-different source.
+        assert_eq!(*t1, *t2, "trivia-only edit must leave the ItemTree value unchanged");
+        // The backdating firewall payoff appears one hop further downstream:
+        // `file_symbols` depends on `item_tree` (not `parsed`), so when
+        // `item_tree`'s `changed_at` backdates, `file_symbols` sees no
+        // change in its dependency and skips re-execution entirely --
+        // returning the exact same `Arc` allocation as before the edit.
+        assert!(
+            Arc::ptr_eq(&s1, &s2),
+            "file_symbols must backdate (same Arc) across a trivia-only edit"
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub enum SymbolKind {
     Constructor,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
@@ -40,7 +40,7 @@ pub struct Symbol {
     pub parent: Option<u32>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ItemTree {
     pub symbols: Vec<Symbol>,
 }

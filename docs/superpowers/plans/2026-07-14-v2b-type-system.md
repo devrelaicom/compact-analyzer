@@ -1,5 +1,14 @@
 # v2b — Type System — DRAFT / OUTLINE (not execution-ready)
 
+> 🛑 **SUPERSEDED (2026-07-15).** A drift review against as-merged v2a found this draft's
+> central premise — "type queries as salsa functions over the M2 resolver" — false: the
+> resolver is imperative host code, not salsa. v2b was re-brainstormed and decomposed. Use
+> instead: the foundation design `docs/superpowers/specs/2026-07-15-v2b-foundation-design.md`
+> and the sub-plans `2026-07-15-v2b1-resolution-into-salsa.md` (execution-ready),
+> `2026-07-15-v2b2-type-foundation.md`, `2026-07-15-v2b-rules-index.md`,
+> `2026-07-15-v2b-final-vscode-integration.md`. This file is kept only for historical
+> context; the carry-forwards below were folded into the foundation design.
+
 > ⚠️ **DRAFT OUTLINE — DO NOT EXECUTE AS-IS.** This is a forward-context sketch captured
 > alongside the v2 program spec so we don't lose sight of what comes after v2a. It is
 > **not** a bite-sized, execution-ready plan.

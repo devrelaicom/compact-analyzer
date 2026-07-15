@@ -55,6 +55,36 @@ const FIXTURES: &[Fixture] = &[
         native_rejects: true,
         rule: "primitive-literal-return",
     },
+    Fixture {
+        name: "uint_in_range_ok.compact",
+        native_rejects: false,
+        rule: "uint-lattice",
+    },
+    Fixture {
+        name: "uint_over_range.compact",
+        native_rejects: true,
+        rule: "uint-lattice",
+    },
+    Fixture {
+        name: "uint_bitwidth_max_ok.compact",
+        native_rejects: false,
+        rule: "uint-lattice",
+    },
+    Fixture {
+        name: "uint_bitwidth_over.compact",
+        native_rejects: true,
+        rule: "uint-lattice",
+    },
+    Fixture {
+        name: "uint_literal_into_field_ok.compact",
+        native_rejects: false,
+        rule: "uint-lattice",
+    },
+    Fixture {
+        name: "boolean_into_uint.compact",
+        native_rejects: true,
+        rule: "uint-lattice",
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

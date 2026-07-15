@@ -3,10 +3,11 @@
 //! verified against compactp), then resolved through lexical scopes
 //! (this task) and file scope / imports (Task 4).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 
 use compactp_ast::{AstNode, Pat};
-use compactp_diagnostics::{Diagnostic, DiagnosticCode};
+use compactp_diagnostics::Diagnostic;
 use compactp_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::TokenAtOffset;
 use text_size::{TextRange, TextSize};
@@ -354,104 +355,55 @@ impl crate::AnalysisHost {
 
     /// Error diagnostics for imports/includes in `file` that fail resolution.
     /// A cross-file derived fact — recomputed on demand, not cached with the
-    /// per-file parse.
+    /// per-file parse. Thin bridge over the tracked
+    /// `crate::db::resolution_diagnostics_query`: rebuild this file's resolved
+    /// dependency edges via `cached_source_pathname` (preserving that probe's
+    /// memoization contract exactly as the pre-port implementation did — this
+    /// is deliberately NOT `self.file_deps(file)`/`index_file`, which resolve
+    /// through the *uncached* `find_source_pathname` for the unrelated
+    /// cross-file symbol index), precompute the impure "searched:" display
+    /// strings, and hand off. All diagnostic logic lives in `db.rs` now.
     pub fn resolution_diagnostics(&mut self, file: FileId) -> Vec<Diagnostic> {
-        let Some(analysis) = self.analyze(file) else {
-            return Vec::new();
-        };
-        let tree = analysis.item_tree.clone();
-        let root = SyntaxNode::new_root(analysis.green.clone());
-        let Some(sf) = compactp_ast::SourceFile::cast(root) else {
+        let Some(src) = self.src_of(file) else {
             return Vec::new();
         };
         let Some(from_dir) = self.vfs().path(file).parent().map(Path::to_path_buf) else {
             return Vec::new();
         };
-        let search = self.import_search_path();
-        let mut diags = Vec::new();
-        for import in sf.imports() {
-            if let Some(name) = import.name() {
-                let nm = name.text().to_string();
-                if nm == "CompactStandardLibrary" {
-                    continue;
+        let raw_deps = crate::db::raw_imports(self.db_ref(), src);
+        let mut resolved: Vec<crate::db::ResolvedDep> = Vec::with_capacity(raw_deps.len());
+        for dep in raw_deps.iter() {
+            let target = match self.cached_source_pathname(&from_dir, &dep.raw) {
+                Some(path) => {
+                    let fid = self.vfs_mut().file_id(&path);
+                    let tsrc = self.src_of(fid).expect("resolved path is readable");
+                    Some((fid, tsrc))
                 }
-                if tree
-                    .top_level()
-                    .any(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == nm)
-                {
-                    continue; // satisfied by an in-scope module
-                }
-                match self.cached_source_pathname(&from_dir, &nm) {
-                    None => diags.push(unresolved_import_diag(
-                        &nm,
-                        &from_dir,
-                        &search,
-                        name.text_range(),
-                    )),
-                    Some(path) => {
-                        let target = self.vfs_mut().file_id(&path);
-                        if let Some(d) = self.module_mismatch_diag(target, &nm, name.text_range()) {
-                            diags.push(d);
-                        }
-                    }
-                }
-            } else if let Some(ptok) = import.path() {
-                let raw = crate::string_lit_text(ptok.text());
-                let span = ptok.text_range();
-                let Some(expected) = crate::path_module_name(&raw) else {
-                    continue;
-                };
-                match self.cached_source_pathname(&from_dir, &raw) {
-                    None => diags.push(unresolved_import_diag(&raw, &from_dir, &search, span)),
-                    Some(path) => {
-                        let target = self.vfs_mut().file_id(&path);
-                        if let Some(d) = self.module_mismatch_diag(target, &expected, span) {
-                            diags.push(d);
-                        }
-                    }
-                }
-            }
+                None => None,
+            };
+            resolved.push(crate::db::ResolvedDep {
+                raw: dep.raw.clone(),
+                is_include: dep.is_include,
+                target,
+            });
         }
-        for inc in sf.includes() {
-            if let Some(tok) = inc.path() {
-                let raw = crate::string_lit_text(tok.text());
-                if self.cached_source_pathname(&from_dir, &raw).is_none() {
-                    diags.push(unresolved_include_diag(
-                        &raw,
-                        &from_dir,
-                        &search,
-                        tok.text_range(),
-                    ));
-                }
-            }
-        }
-        diags
-    }
+        let fd = crate::db::FileDeps::new(self.db_ref(), Arc::from(resolved));
 
-    /// Error iff `target`'s single module does not match `expected`.
-    fn module_mismatch_diag(
-        &mut self,
-        target: FileId,
-        expected: &str,
-        span: TextRange,
-    ) -> Option<Diagnostic> {
-        let tree = self.analyze(target)?.item_tree.clone();
-        match single_top_level_module(&tree) {
-            None => Some(Diagnostic::error(
-                DiagnosticCode::new("E", 9003),
-                format!("imported file does not contain a single `module {expected}`"),
-                span,
-            )),
-            Some((_, sym)) if sym.name != expected => Some(Diagnostic::error(
-                DiagnosticCode::new("E", 9002),
-                format!(
-                    "imported file defines module `{}` rather than expected `{expected}`",
-                    sym.name
-                ),
-                span,
-            )),
-            Some(_) => None,
-        }
+        let from_dir_display = from_dir.display().to_string();
+        let search_display = self
+            .import_search_path()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        crate::db::resolution_diagnostics_query(
+            self.db_ref(),
+            src,
+            fd,
+            Arc::from(from_dir_display.as_str()),
+            Arc::from(search_display.as_str()),
+        )
+        .to_vec()
     }
 }
 
@@ -464,44 +416,6 @@ pub(crate) fn single_top_level_module(tree: &crate::ItemTree) -> Option<(u32, &c
         return None; // more than one top-level declaration
     }
     (first.1.kind == crate::SymbolKind::Module).then_some(first)
-}
-
-pub(crate) fn searched_list(from_dir: &Path, search: &[PathBuf]) -> String {
-    let mut parts = vec![from_dir.display().to_string()];
-    parts.extend(search.iter().map(|p| p.display().to_string()));
-    parts.join(", ")
-}
-
-pub(crate) fn unresolved_import_diag(
-    raw: &str,
-    from_dir: &Path,
-    search: &[PathBuf],
-    span: TextRange,
-) -> Diagnostic {
-    Diagnostic::error(
-        DiagnosticCode::new("E", 9001),
-        format!(
-            "cannot resolve import `{raw}` (searched: {})",
-            searched_list(from_dir, search)
-        ),
-        span,
-    )
-}
-
-pub(crate) fn unresolved_include_diag(
-    raw: &str,
-    from_dir: &Path,
-    search: &[PathBuf],
-    span: TextRange,
-) -> Diagnostic {
-    Diagnostic::error(
-        DiagnosticCode::new("E", 9004),
-        format!(
-            "cannot resolve include `{raw}` (searched: {})",
-            searched_list(from_dir, search)
-        ),
-        span,
-    )
 }
 
 /// Index of the module symbol whose range contains `offset`, if any.
@@ -1288,6 +1202,50 @@ mod tests {
         let diags = host.resolution_diagnostics(file);
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("cannot resolve include"));
+    }
+
+    // ---- Task 9: tracked resolution_diagnostics ----
+
+    #[test]
+    fn resolution_diagnostics_report_unresolved_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.compact");
+        std::fs::write(&main, "import \"DoesNotExist\";").unwrap();
+        let mut host = crate::AnalysisHost::new();
+        let id = host.vfs_mut().file_id(&main);
+        host.index_file(id);
+        let diags = host.resolution_diagnostics(id);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code.prefix, "E");
+        assert_eq!(diags[0].code.number, 9001);
+    }
+
+    /// Byte-identical "searched: {list}" wording: the original
+    /// `resolve::searched_list(from_dir, search)` rendered `from_dir` followed
+    /// by every extra search-path entry, joined with `", "`. The tracked query
+    /// only ever sees the host-precomputed `from_dir_display`/`search_display`
+    /// strings, so this locks in that the two combine back into exactly that
+    /// format (not, say, a trailing separator when the search path is
+    /// non-empty, or a stray one when it's empty).
+    #[test]
+    fn unresolved_import_searched_list_matches_original_format() {
+        let (mut host, dir, file) = diag_host(
+            &[(
+                "main.compact",
+                "import Missing;\ncircuit m(): Field { return 0; }",
+            )],
+            "main.compact",
+        );
+        let extra = dir.path().join("libs");
+        host.set_import_search_path(vec![extra.clone()]);
+        let diags = host.resolution_diagnostics(file);
+        assert_eq!(diags.len(), 1);
+        let expected = format!(
+            "cannot resolve import `Missing` (searched: {}, {})",
+            dir.path().display(),
+            extra.display()
+        );
+        assert_eq!(diags[0].message, expected);
     }
 
     // ---- CR-3: cached source-path resolution ----

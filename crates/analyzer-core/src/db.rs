@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use compactp_ast::AstNode;
+use compactp_diagnostics::{Diagnostic, DiagnosticCode};
 
 use crate::FileAnalysis;
 use crate::item_tree::ItemTree;
@@ -745,6 +746,218 @@ fn source_text_for(
         }
     }
     None
+}
+
+/// Error diagnostics for imports/includes in `src`, given `fd`'s resolved
+/// targets. Tracked port of `AnalysisHost::resolution_diagnostics` (+ its
+/// `module_mismatch_diag` helper): for each import/include recovered from
+/// `parsed(db, src)`'s green tree, look up the matching `ResolvedDep` in `fd`
+/// — `target: None` reports the unresolved-import/include diagnostic
+/// (E9001/E9004); `target: Some((_, tsrc))` runs the module-mismatch check
+/// against `tsrc`'s item tree for imports (E9002/E9003); includes have no
+/// mismatch check, exactly as the original. The in-scope-module and
+/// `CompactStandardLibrary` skips are preserved verbatim (both make an import
+/// emit no diagnostic at all, matching the original's `continue`s). `fd` is
+/// built host-side via `cached_source_pathname` (no I/O happens here).
+///
+/// The "searched: {list}" text embeds `from_dir` plus the import search path
+/// — a display detail that depends on host `Path::display()` formatting, an
+/// impure concern the query itself must not touch. The host precomputes
+/// `from_dir_display` (`from_dir.display().to_string()`) and `search_display`
+/// (the search path list joined with `", "`, the same way the original
+/// `resolve::searched_list` joined it) and hands them in as `Arc<str>`;
+/// [`searched_list_display`] recombines them into the exact original string.
+///
+/// `no_eq`: `Diagnostic` (external crate `compactp_diagnostics`) has no
+/// `PartialEq`, so `Arc<[Diagnostic]>` can't be compared for backdating —
+/// same rationale as `parsed` above.
+#[salsa::tracked(returns(clone), no_eq)]
+pub fn resolution_diagnostics_query(
+    db: &dyn Db,
+    src: SourceText,
+    fd: FileDeps,
+    from_dir_display: Arc<str>,
+    search_display: Arc<str>,
+) -> Arc<[Diagnostic]> {
+    let tree = crate::db::item_tree(db, src);
+    let green = crate::db::parsed(db, src).green;
+    let root = compactp_syntax::SyntaxNode::new_root(green);
+    let Some(sf) = compactp_ast::SourceFile::cast(root) else {
+        return Arc::from(Vec::new());
+    };
+    let deps = fd.deps(db);
+    let mut diags = Vec::new();
+
+    for import in sf.imports() {
+        if let Some(name) = import.name() {
+            let nm = name.text().to_string();
+            if nm == "CompactStandardLibrary" {
+                continue;
+            }
+            if tree
+                .top_level()
+                .any(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == nm)
+            {
+                continue; // satisfied by an in-scope module
+            }
+            push_import_diag(
+                db,
+                &deps,
+                &nm,
+                &nm,
+                name.text_range(),
+                &from_dir_display,
+                &search_display,
+                &mut diags,
+            );
+        } else if let Some(ptok) = import.path() {
+            let raw = crate::string_lit_text(ptok.text());
+            let span = ptok.text_range();
+            let Some(expected) = crate::path_module_name(&raw) else {
+                continue;
+            };
+            push_import_diag(
+                db,
+                &deps,
+                &raw,
+                &expected,
+                span,
+                &from_dir_display,
+                &search_display,
+                &mut diags,
+            );
+        }
+    }
+
+    for inc in sf.includes() {
+        if let Some(tok) = inc.path() {
+            let raw = crate::string_lit_text(tok.text());
+            let target = deps
+                .iter()
+                .find(|d| d.is_include && d.raw == raw)
+                .and_then(|d| d.target);
+            if target.is_none() {
+                diags.push(unresolved_include_diag_display(
+                    &raw,
+                    &from_dir_display,
+                    &search_display,
+                    tok.text_range(),
+                ));
+            }
+        }
+    }
+
+    Arc::from(diags)
+}
+
+/// One import's diagnostic contribution: find the matching non-include
+/// `ResolvedDep` for `raw`; push the unresolved-import diagnostic if it
+/// didn't resolve, else run the module-mismatch check on the resolved
+/// target's item tree.
+#[allow(clippy::too_many_arguments)]
+fn push_import_diag(
+    db: &dyn Db,
+    deps: &[ResolvedDep],
+    raw: &str,
+    expected_module: &str,
+    span: text_size::TextRange,
+    from_dir_display: &str,
+    search_display: &str,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let target = deps
+        .iter()
+        .find(|d| !d.is_include && d.raw == raw)
+        .and_then(|d| d.target);
+    match target {
+        None => diags.push(unresolved_import_diag_display(
+            raw,
+            from_dir_display,
+            search_display,
+            span,
+        )),
+        Some((_, tsrc)) => {
+            if let Some(d) = module_mismatch_diag_query(db, tsrc, expected_module, span) {
+                diags.push(d);
+            }
+        }
+    }
+}
+
+/// Error iff `tsrc`'s single top-level module does not match `expected`. Port
+/// of `AnalysisHost::module_mismatch_diag`; the host's `analyze(target)` disk
+/// read becomes a plain `item_tree(db, tsrc)` — `tsrc` already arrived via a
+/// resolved `ResolvedDep`, materialized once, host-side, so no I/O happens
+/// here.
+fn module_mismatch_diag_query(
+    db: &dyn Db,
+    tsrc: SourceText,
+    expected: &str,
+    span: text_size::TextRange,
+) -> Option<Diagnostic> {
+    let tree = crate::db::item_tree(db, tsrc);
+    match crate::resolve::single_top_level_module(&tree) {
+        None => Some(Diagnostic::error(
+            DiagnosticCode::new("E", 9003),
+            format!("imported file does not contain a single `module {expected}`"),
+            span,
+        )),
+        Some((_, sym)) if sym.name != expected => Some(Diagnostic::error(
+            DiagnosticCode::new("E", 9002),
+            format!(
+                "imported file defines module `{}` rather than expected `{expected}`",
+                sym.name
+            ),
+            span,
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Recombines the host-precomputed `from_dir_display`/`search_display`
+/// strings into the exact "searched: ..." list the original
+/// `resolve::searched_list(from_dir, search)` produced: `from_dir` alone when
+/// the search path is empty, else `from_dir, <search paths joined by ", ">` —
+/// `search_display` is already that same join, computed host-side the same
+/// way `searched_list` did it.
+fn searched_list_display(from_dir_display: &str, search_display: &str) -> String {
+    if search_display.is_empty() {
+        from_dir_display.to_string()
+    } else {
+        format!("{from_dir_display}, {search_display}")
+    }
+}
+
+fn unresolved_import_diag_display(
+    raw: &str,
+    from_dir_display: &str,
+    search_display: &str,
+    span: text_size::TextRange,
+) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticCode::new("E", 9001),
+        format!(
+            "cannot resolve import `{raw}` (searched: {})",
+            searched_list_display(from_dir_display, search_display)
+        ),
+        span,
+    )
+}
+
+fn unresolved_include_diag_display(
+    raw: &str,
+    from_dir_display: &str,
+    search_display: &str,
+    span: text_size::TextRange,
+) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticCode::new("E", 9004),
+        format!(
+            "cannot resolve include `{raw}` (searched: {})",
+            searched_list_display(from_dir_display, search_display)
+        ),
+        span,
+    )
 }
 
 #[cfg(test)]

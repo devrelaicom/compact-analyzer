@@ -76,22 +76,33 @@ fn uint_bound(u: &compactp_ast::UintType) -> TyKind {
     }
 }
 
-/// The `TyKind` of a literal expression. A `true`/`false` token is `Boolean`;
-/// numeric/string literals are `Unknown` at the foundation (the `Uint` lattice
-/// and byte/string typing are later rules).
+/// The `TyKind` of a literal expression. `true`/`false` -> `Boolean`; a decimal
+/// or hex integer literal `n` -> `TyKind::Uint(Some(n+1))` (the minimal range
+/// `[0, n]`), or `Uint(None)` when `n+1` overflows `u128`; other literals
+/// (string, etc.) -> `Unknown`.
 fn literal_ty_kind(lit: &compactp_ast::expr::LiteralExpr) -> TyKind {
     use compactp_syntax::SyntaxKind;
-    let has = |k: SyntaxKind| {
-        lit.syntax()
-            .children_with_tokens()
-            .filter_map(|e| e.into_token())
-            .any(|t| t.kind() == k)
-    };
-    if has(SyntaxKind::TRUE_KW) || has(SyntaxKind::FALSE_KW) {
-        TyKind::Boolean
-    } else {
-        TyKind::Unknown
+    let tokens: Vec<_> = lit
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .collect();
+    if tokens
+        .iter()
+        .any(|t| matches!(t.kind(), SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW))
+    {
+        return TyKind::Boolean;
     }
+    if let Some(tok) = tokens
+        .iter()
+        .find(|t| matches!(t.kind(), SyntaxKind::INT_LIT | SyntaxKind::HEX_LIT))
+    {
+        // n -> minimal range [0, n] = exclusive upper n+1. Overflow -> None
+        // (still a Uint; e.g. a 2^200 literal is Uint(None) <: Field).
+        let bound = parse_int_literal(tok.text()).and_then(|n| n.checked_add(1));
+        return TyKind::Uint(bound);
+    }
+    TyKind::Unknown
 }
 
 /// The `CircuitDef` CST node for the circuit at item-tree index `index`, found
@@ -274,15 +285,66 @@ mod tests {
     }
 
     #[test]
-    fn non_primitive_literal_return_is_unknown() {
+    fn integer_literal_return_is_typed_uint() {
         let db = CompactDatabase::default();
-        // A numeric literal: the Uint lattice is a later rule, so it is Unknown
-        // at the foundation.
         let src = SourceText::new(&db, Arc::from("export circuit foo(): Field { return 1; }"));
         let idx = circuit_index(&db, src, "foo");
         let returns = infer_circuit_returns(&db, src, idx);
         assert_eq!(returns.len(), 1);
-        assert_eq!(returns[0].1, TyKind::Unknown);
+        // 1 -> minimal range [0, 1] -> exclusive upper 2.
+        assert_eq!(returns[0].1, TyKind::Uint(Some(2)));
+    }
+
+    #[test]
+    fn integer_literal_types_to_minimal_uint() {
+        let db = CompactDatabase::default();
+        // 5 -> Uint<0..6>
+        let a = SourceText::new(&db, Arc::from("export circuit f(): Field { return 5; }"));
+        let ia = circuit_index(&db, a, "f");
+        assert_eq!(
+            infer_circuit_returns(&db, a, ia)[0].1,
+            TyKind::Uint(Some(6))
+        );
+        // 0 -> Uint<0..1>
+        let b = SourceText::new(&db, Arc::from("export circuit f(): Field { return 0; }"));
+        let ib = circuit_index(&db, b, "f");
+        assert_eq!(
+            infer_circuit_returns(&db, b, ib)[0].1,
+            TyKind::Uint(Some(1))
+        );
+        // hex 0xFF -> Uint<0..256>
+        let c = SourceText::new(&db, Arc::from("export circuit f(): Field { return 0xFF; }"));
+        let ic = circuit_index(&db, c, "f");
+        assert_eq!(
+            infer_circuit_returns(&db, c, ic)[0].1,
+            TyKind::Uint(Some(256))
+        );
+    }
+
+    #[test]
+    fn literal_into_uint_range_accept_and_reject() {
+        let db = CompactDatabase::default();
+        // In range: 5 (Uint<0..6>) <: Uint<0..10> -> no diagnostic
+        let ok = SourceText::new(
+            &db,
+            Arc::from("export circuit f(): Uint<0..10> { return 5; }"),
+        );
+        assert!(type_diagnostics_query(&db, ok).is_empty());
+        // Out of range: 11 (Uint<0..12>) not <: Uint<0..10> -> one diagnostic
+        let bad = SourceText::new(
+            &db,
+            Arc::from("export circuit f(): Uint<0..10> { return 11; }"),
+        );
+        let diags = type_diagnostics_query(&db, bad);
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("Uint<0..12>") && diags[0].message.contains("Uint<0..10>"),
+            "message uses normalized Uint display: {:?}",
+            diags[0].message
+        );
+        // Uint literal into Field is always fine.
+        let field = SourceText::new(&db, Arc::from("export circuit f(): Field { return 5; }"));
+        assert!(type_diagnostics_query(&db, field).is_empty());
     }
 
     #[test]
@@ -366,19 +428,25 @@ mod tests {
     #[test]
     fn unknown_operand_or_expectation_suppresses() {
         let db = CompactDatabase::default();
-        // Boolean literal into a Uint return: Boolean </: Uint -> rejects
-        // (matches compactc: `Uint<8> return true` is a type error).
+        // Boolean literal into a Uint return: rejects (Boolean </: Uint).
         let a = SourceText::new(
             &db,
             Arc::from("export circuit foo(): Uint<0..7> { return true; }"),
         );
         assert_eq!(type_diagnostics_query(&db, a).len(), 1);
-        // A return type the checker does not model (Bytes) still suppresses.
+        // Integer literal into a Boolean return: rejects (Uint </: Boolean),
+        // matching compactc (`Boolean return 5` is a type error).
         let b = SourceText::new(
+            &db,
+            Arc::from("export circuit foo(): Boolean { return 1; }"),
+        );
+        assert_eq!(type_diagnostics_query(&db, b).len(), 1);
+        // A return type the checker does not model (Bytes) still suppresses.
+        let c = SourceText::new(
             &db,
             Arc::from("export circuit foo(): Bytes<32> { return true; }"),
         );
-        assert!(type_diagnostics_query(&db, b).is_empty());
+        assert!(type_diagnostics_query(&db, c).is_empty());
     }
 
     #[test]

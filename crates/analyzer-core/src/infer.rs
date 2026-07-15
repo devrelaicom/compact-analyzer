@@ -28,6 +28,7 @@ pub(crate) fn type_node_kind(ty: &compactp_ast::Type) -> TyKind {
         Type::Boolean(_) => TyKind::Boolean,
         Type::Field(_) => TyKind::Field,
         Type::Uint(u) => uint_bound(u),
+        Type::Bytes(b) => bytes_size(b),
         _ => TyKind::Unknown,
     }
 }
@@ -77,6 +78,21 @@ fn uint_bound(u: &compactp_ast::UintType) -> TyKind {
                 None => TyKind::Uint(None), // hi is huge (>= 2^128) or non-literal-huge
             }
         }
+        _ => TyKind::Unknown,
+    }
+}
+
+/// Lower a `Bytes<n>` annotation to `TyKind::Bytes(n)`. Byte counts are small,
+/// so the length is a `u32`; a non-literal size (a generic numeric parameter)
+/// or one overflowing `u32` lowers to `Unknown` (conservatively suppresses —
+/// corpus-safe, since accepted files with a concrete `Bytes<n>` always have a
+/// literal, small `n`). Reuses `parse_int_literal` (decimal/hex/octal/binary).
+fn bytes_size(b: &compactp_ast::BytesType) -> TyKind {
+    match b
+        .size()
+        .and_then(|s| parse_int_literal(&s.syntax().text().to_string()))
+    {
+        Some(n) if n <= u32::MAX as u128 => TyKind::Bytes(n as u32),
         _ => TyKind::Unknown,
     }
 }
@@ -450,6 +466,47 @@ mod tests {
     }
 
     #[test]
+    fn bytes_annotation_lowers_to_size() {
+        let db = CompactDatabase::default();
+        // Bytes<32> -> Bytes(32)
+        let a = SourceText::new(&db, Arc::from("export circuit f(): Bytes<32> { }"));
+        let ia = circuit_index(&db, a, "f");
+        let ca = circuit_node_by_index(&db, a, ia).unwrap();
+        assert_eq!(
+            type_node_kind(&ca.return_type().unwrap()),
+            TyKind::Bytes(32)
+        );
+        // Bytes<1>
+        let b = SourceText::new(&db, Arc::from("export circuit f(): Bytes<1> { }"));
+        let ib = circuit_index(&db, b, "f");
+        let cb = circuit_node_by_index(&db, b, ib).unwrap();
+        assert_eq!(type_node_kind(&cb.return_type().unwrap()), TyKind::Bytes(1));
+        // Generic/non-literal size -> Unknown (suppresses; not our diagnostic)
+        let c = SourceText::new(&db, Arc::from("export circuit f(): Bytes<N> { }"));
+        let ic = circuit_index(&db, c, "f");
+        let cc = circuit_node_by_index(&db, c, ic).unwrap();
+        assert_eq!(type_node_kind(&cc.return_type().unwrap()), TyKind::Unknown);
+    }
+
+    #[test]
+    fn uint_literal_into_bytes_return_rejects() {
+        let db = CompactDatabase::default();
+        // return 5 (Uint<0..6>) into Bytes<32>: Uint not <: Bytes -> one diagnostic
+        // (matches compactc: "mismatch ... actual Uint<0..6> ... declared Bytes<32>").
+        let src = SourceText::new(
+            &db,
+            Arc::from("export circuit f(): Bytes<32> { return 5; }"),
+        );
+        let diags = type_diagnostics_query(&db, src);
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("Uint<0..6>") && diags[0].message.contains("Bytes<32>"),
+            "message uses normalized display: {:?}",
+            diags[0].message
+        );
+    }
+
+    #[test]
     fn unknown_operand_or_expectation_suppresses() {
         let db = CompactDatabase::default();
         // Boolean literal into a Uint return: rejects (Boolean </: Uint).
@@ -465,10 +522,10 @@ mod tests {
             Arc::from("export circuit foo(): Boolean { return 1; }"),
         );
         assert_eq!(type_diagnostics_query(&db, b).len(), 1);
-        // A return type the checker does not model (Bytes) still suppresses.
+        // A return type the checker does not model (Vector) still suppresses.
         let c = SourceText::new(
             &db,
-            Arc::from("export circuit foo(): Bytes<32> { return true; }"),
+            Arc::from("export circuit foo(): Vector<3, Field> { return true; }"),
         );
         assert!(type_diagnostics_query(&db, c).is_empty());
     }

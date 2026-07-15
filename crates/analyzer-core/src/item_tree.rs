@@ -233,7 +233,7 @@ impl ItemTree {
                     SymbolKind::Module,
                     it.is_exported(),
                     parent,
-                    0,
+                    generic_count(it.generic_params()),
                 );
                 // ModuleDef exposes no members accessor: iterate direct
                 // children castable to Item (verified compactp pattern).
@@ -279,9 +279,10 @@ impl ItemTree {
 }
 
 /// The number of generic parameters a definition node declares, or `0`.
-/// `T` and `#n` parameters both count. Generic over any node exposing
-/// `generic_params()` (circuits, functions/witnesses, structs, enums, type
-/// aliases, contracts).
+/// `T` and `#n` parameters both count. Applies to nodes exposing
+/// `generic_params()` (modules, circuits, circuit signatures, witnesses,
+/// structs, type aliases); enums and contracts have no such accessor and are
+/// recorded as `0` at their construction sites.
 fn generic_count(params: Option<GenericParamList>) -> u32 {
     params.map(|p| p.params().count() as u32).unwrap_or(0)
 }

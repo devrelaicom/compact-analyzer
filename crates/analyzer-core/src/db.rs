@@ -841,9 +841,10 @@ pub fn resolution_diagnostics_query(
 }
 
 /// Resolve a `Definition::Item` to its `Symbol`. The current file's symbols
-/// come from `item_tree(src)`; a cross-file target's `SourceText` is reached
-/// via a materialized `fd` dep (as `resolve_external_module_member` does). A
-/// target neither in the current file nor in `fd` yields `None` (suppresses).
+/// come from `item_tree(src)`; a cross-file target's `SourceText` is reached by
+/// matching its `FileId` against a materialized `fd` dep's target (includes and
+/// imports alike). A target neither in the current file nor in `fd` yields
+/// `None` (suppresses).
 fn item_symbol(
     db: &dyn Db,
     file: crate::FileId,

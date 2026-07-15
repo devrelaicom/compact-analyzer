@@ -162,15 +162,35 @@ impl crate::AnalysisHost {
             .descendants()
             .filter_map(compactp_ast::LedgerDecl::cast)
             .find(|d| d.name().is_some_and(|t| t.text_range() == name_range))?;
-        let head = match ledger.ty()? {
-            compactp_ast::Type::Ref(r) => r.name()?.text().to_string(),
-            _ => return Some("Cell".to_string()), // builtin scalar type → Cell
+        let (head, head_range) = match ledger.ty()? {
+            compactp_ast::Type::Ref(r) => {
+                let tok = r.name()?;
+                (tok.text().to_string(), tok.text_range())
+            }
+            _ => return Some("Cell".to_string()), // builtin scalar type -> Cell
         };
-        // R1-M7 (accepted limitation): this is a name match only, with no
-        // type information to disambiguate. A user type named identically to
-        // a builtin ADT head (e.g. `struct Map { ... }; ledger m: Map;`)
-        // will be mapped to that builtin's method surface instead of being
-        // treated as a plain struct-typed (implicit-Cell) field.
+        // Resolve the type head. If it resolves to a user-defined named type
+        // (struct / enum / type alias), this field is that user type -> implicit
+        // Cell. Builtin ADT names (Counter/Map/…) are not indexed, so they do
+        // not resolve, and fall through to the KNOWN-name check below. This
+        // supersedes the pure name-match (fixes R1-M7).
+        let head_start = head_range.start();
+        let resolves_to_user_type = matches!(
+            self.resolve(crate::FilePosition { file: *file, offset: head_start }),
+            Some(crate::Definition::Item { file: df, index: di })
+                if self
+                    .analyze(df)
+                    .and_then(|a| a.item_tree.symbols.get(di as usize).map(|s| s.kind))
+                    .is_some_and(|k| matches!(
+                        k,
+                        crate::SymbolKind::Struct
+                            | crate::SymbolKind::Enum
+                            | crate::SymbolKind::TypeAlias
+                    ))
+        );
+        if resolves_to_user_type {
+            return Some("Cell".to_string());
+        }
         const KNOWN: &[&str] = &[
             "Counter",
             "Cell",
@@ -184,7 +204,7 @@ impl crate::AnalysisHost {
         Some(if KNOWN.contains(&head.as_str()) {
             head
         } else {
-            "Cell".to_string() // user/struct-typed field → implicit Cell
+            "Cell".to_string()
         })
     }
 }
@@ -371,6 +391,30 @@ mod tests {
         );
         let tree = host.analyze(file).unwrap().item_tree.clone();
         let idx = tree.symbols.iter().position(|s| s.name == "f").unwrap();
+        assert_eq!(
+            host.ledger_field_adt(&crate::Definition::Item {
+                file,
+                index: idx as u32
+            }),
+            Some("Cell".to_string())
+        );
+    }
+
+    #[test]
+    fn user_struct_named_like_builtin_is_cell_not_builtin() {
+        // R1-M7 fix: without the stdlib import, `struct Map` is the user type, so a
+        // `ledger m: Map` field must map to implicit Cell — NOT the builtin Map ADT.
+        let mut host = crate::AnalysisHost::new();
+        let file = host
+            .vfs_mut()
+            .file_id(std::path::Path::new("/t/shadow.compact"));
+        host.vfs_mut().set_overlay(
+            file,
+            "struct Map { x: Field; }\nexport ledger m: Map;\n".to_string(),
+            1,
+        );
+        let tree = host.analyze(file).unwrap().item_tree.clone();
+        let idx = tree.symbols.iter().position(|s| s.name == "m").unwrap();
         assert_eq!(
             host.ledger_field_adt(&crate::Definition::Item {
                 file,

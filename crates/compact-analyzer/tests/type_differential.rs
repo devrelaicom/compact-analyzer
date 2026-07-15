@@ -155,6 +155,66 @@ const FIXTURES: &[Fixture] = &[
         native_rejects: false,
         rule: "generic-specialization",
     },
+    Fixture {
+        name: "vec_covariant_ok.compact",
+        native_rejects: false,
+        rule: "tuple-vector-covariance",
+    },
+    Fixture {
+        name: "vec_len_mismatch.compact",
+        native_rejects: true,
+        rule: "tuple-vector-covariance",
+    },
+    Fixture {
+        name: "vec_elem_over_range.compact",
+        native_rejects: true,
+        rule: "tuple-vector-covariance",
+    },
+    Fixture {
+        name: "tuple_covariant_ok.compact",
+        native_rejects: false,
+        rule: "tuple-vector-covariance",
+    },
+    Fixture {
+        name: "tuple_arity_mismatch.compact",
+        native_rejects: true,
+        rule: "tuple-vector-covariance",
+    },
+    Fixture {
+        name: "tuple_elem_mismatch.compact",
+        native_rejects: true,
+        rule: "tuple-vector-covariance",
+    },
+    Fixture {
+        name: "vec_tuple_equiv_ok.compact",
+        native_rejects: false,
+        rule: "tuple-vector-covariance",
+    },
+    Fixture {
+        name: "nested_seq_ok.compact",
+        native_rejects: false,
+        rule: "tuple-vector-covariance",
+    },
+    Fixture {
+        name: "ledger_arg_ok.compact",
+        native_rejects: false,
+        rule: "ledger-adt-typing",
+    },
+    Fixture {
+        name: "ledger_arg_mismatch.compact",
+        native_rejects: true,
+        rule: "ledger-adt-typing",
+    },
+    Fixture {
+        name: "ledger_decrement_mismatch.compact",
+        native_rejects: true,
+        rule: "ledger-adt-typing",
+    },
+    Fixture {
+        name: "ledger_generic_method_ok.compact",
+        native_rejects: false,
+        rule: "ledger-adt-typing",
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

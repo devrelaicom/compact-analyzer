@@ -174,6 +174,14 @@ pub struct Workspace {
     pub stdlib: Option<(crate::FileId, SourceText)>,
     #[returns(clone)]
     pub file_deps: std::sync::Arc<std::collections::BTreeMap<crate::FileId, FileDeps>>,
+    /// `FileId -> SourceText` for every file reachable as a resolution target
+    /// (indexed files, resolved import/include targets, stdlib). Lets
+    /// `source_text_for` recover a target's text with an O(1) map lookup that
+    /// depends only on this map — not on every file's `FileDeps`. Republished
+    /// by the host solely on structural change (a file enters/leaves the
+    /// workspace), never on an in-body edit.
+    #[returns(clone)]
+    pub file_srcs: std::sync::Arc<std::collections::BTreeMap<crate::FileId, SourceText>>,
 }
 
 /// Item tree for `src`, memoized on the `SourceText` input. Projects
@@ -578,7 +586,7 @@ fn resolve_member(
     let crate::Definition::Item { file: rfile, index } = &receiver_def else {
         return None;
     };
-    let rsrc = source_text_for(db, *rfile, file, src, fd, ws)?;
+    let rsrc = source_text_for(db, *rfile, file, src, ws)?;
     let tree = item_tree(db, rsrc);
     if tree.symbols[*index as usize].kind != crate::SymbolKind::Enum {
         return None;
@@ -690,13 +698,17 @@ fn field_of(
     name: &str,
     this_file: crate::FileId,
     this_src: SourceText,
-    fd: FileDeps,
+    // No longer read directly: `source_text_for` (below) dropped its `fd`
+    // parameter in favor of `Workspace.file_srcs`. Kept in the signature
+    // (rather than removed) so both call sites' argument lists stay
+    // unchanged — a call-site-stable, behavior-preserving no-op.
+    _fd: FileDeps,
     ws: Workspace,
 ) -> Option<crate::Definition> {
     let crate::Definition::Item { file, index } = parent_def else {
         return None;
     };
-    let psrc = source_text_for(db, *file, this_file, this_src, fd, ws)?;
+    let psrc = source_text_for(db, *file, this_file, this_src, ws)?;
     let tree = item_tree(db, psrc);
     let (idx, _) = tree
         .children_of(*index)
@@ -708,19 +720,15 @@ fn field_of(
 }
 
 /// Maps a `FileId` reachable from the resolution context back to its
-/// `SourceText`. The host's `analyze(file)` reads any file via the VFS; a
-/// tracked arm has no VFS, so it recovers a target's `SourceText` from the
-/// inputs at hand: the current file (`this_src`), `ws.stdlib`, this file's
-/// resolved deps, or — for a transitively-included file — some indexed file's
-/// resolved deps in `ws.file_deps`. Every cross-file `Definition` a resolution
-/// arm can produce carries a `FileId` whose `SourceText` is present in one of
-/// those places.
+/// `SourceText`, via `Workspace.file_srcs` (O(1), and dependency-narrow: it
+/// depends only on `file_srcs`, not on every file's `FileDeps`). The current
+/// file and stdlib are checked first so a resolution that never leaves the
+/// current file takes no `Workspace` dependency at all.
 fn source_text_for(
     db: &dyn Db,
     target: crate::FileId,
     this_file: crate::FileId,
     this_src: SourceText,
-    fd: FileDeps,
     ws: Workspace,
 ) -> Option<SourceText> {
     if target == this_file {
@@ -731,23 +739,7 @@ fn source_text_for(
     {
         return Some(ssrc);
     }
-    for dep in fd.deps(db).iter() {
-        if let Some((tfile, tsrc)) = dep.target
-            && tfile == target
-        {
-            return Some(tsrc);
-        }
-    }
-    for fdep in ws.file_deps(db).values() {
-        for dep in fdep.deps(db).iter() {
-            if let Some((tfile, tsrc)) = dep.target
-                && tfile == target
-            {
-                return Some(tsrc);
-            }
-        }
-    }
-    None
+    ws.file_srcs(db).get(&target).copied()
 }
 
 /// Error diagnostics for imports/includes in `src`, given `fd`'s resolved
@@ -1039,7 +1031,12 @@ mod tests {
             Arc::from("circuit helper(): [] {}\nmodule M { circuit inner(): [] {} }"),
         );
         let fd = FileDeps::new(&db, Arc::from(Vec::new()));
-        let ws = Workspace::new(&db, None, Arc::new(std::collections::BTreeMap::new()));
+        let ws = Workspace::new(
+            &db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
         // Top-level `helper` resolves from anywhere.
         let d = resolve_in_file(
             &db,
@@ -1076,7 +1073,12 @@ mod tests {
         let fd = FileDeps::new(&db, Arc::from(Vec::new()));
         // No file_deps map entries needed here: the import resolves through the
         // in-scope module `M`, never touching the filesystem/deps arm.
-        let ws = Workspace::new(&db, None, Arc::new(std::collections::BTreeMap::new()));
+        let ws = Workspace::new(
+            &db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
         let d = resolve_imports(&db, crate::FileId::from_raw_for_test(0), src, fd, ws, "ex");
         assert!(matches!(d, Some(crate::Definition::Item { index, .. }) if index != 0));
     }
@@ -1092,5 +1094,31 @@ mod tests {
         // only the string-path import survives.
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].raw, "bar/baz");
+    }
+
+    #[test]
+    fn source_text_for_reads_file_srcs_map() {
+        let db = CompactDatabase::default();
+        let this_src = SourceText::new(&db, Arc::from("circuit here(): [] {}"));
+        let other_src = SourceText::new(&db, Arc::from("circuit there(): [] {}"));
+        let this = crate::FileId::from_raw_for_test(0);
+        let other = crate::FileId::from_raw_for_test(1);
+        let mut srcs = std::collections::BTreeMap::new();
+        srcs.insert(other, other_src);
+        let ws = Workspace::new(
+            &db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(srcs),
+        );
+        // `other` is neither `this_file` nor stdlib nor in this file's deps:
+        // it must be recovered from `file_srcs`.
+        let got = source_text_for(&db, other, this, this_src, ws);
+        assert_eq!(got, Some(other_src));
+        // A file present nowhere resolves to None.
+        assert_eq!(
+            source_text_for(&db, crate::FileId::from_raw_for_test(9), this, this_src, ws),
+            None
+        );
     }
 }

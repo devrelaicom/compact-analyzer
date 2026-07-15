@@ -80,6 +80,8 @@ impl AnalysisHost {
             None => {
                 let src = crate::db::SourceText::new(&self.db, text);
                 self.sources.insert(file, (ptr, src));
+                // Keyset grew: republish the workspace-wide file_srcs map.
+                self.republish_file_srcs();
                 Some(src)
             }
         }
@@ -161,7 +163,8 @@ impl AnalysisHost {
             }
             None => {
                 let map = self.current_file_deps_map();
-                self.workspace_input = Some(crate::db::Workspace::new(&self.db, stdlib, map));
+                let srcs = self.current_file_srcs_map();
+                self.workspace_input = Some(crate::db::Workspace::new(&self.db, stdlib, map, srcs));
             }
         }
         file
@@ -179,7 +182,8 @@ impl AnalysisHost {
             return ws;
         }
         let map = self.current_file_deps_map();
-        let ws = crate::db::Workspace::new(&self.db, None, map);
+        let srcs = self.current_file_srcs_map();
+        let ws = crate::db::Workspace::new(&self.db, None, map, srcs);
         self.workspace_input = Some(ws);
         ws
     }
@@ -191,6 +195,16 @@ impl AnalysisHost {
         &self,
     ) -> Arc<std::collections::BTreeMap<FileId, crate::db::FileDeps>> {
         Arc::new(self.dep_inputs.iter().map(|(&f, &fd)| (f, fd)).collect())
+    }
+
+    /// Snapshot of the `FileId -> SourceText` map published to `Workspace`,
+    /// built from the host's `sources`. Every resolution target's text lives
+    /// here: `index_file` provisions each dep target via `source_for` before
+    /// publishing, so `sources` is the complete set of reachable files.
+    fn current_file_srcs_map(
+        &self,
+    ) -> Arc<std::collections::BTreeMap<FileId, crate::db::SourceText>> {
+        Arc::new(self.sources.iter().map(|(&f, &(_, s))| (f, s)).collect())
     }
 
     /// Republishes `Workspace.file_deps` from `dep_inputs`. Called ONLY when the
@@ -206,7 +220,27 @@ impl AnalysisHost {
                 ws.set_file_deps(&mut self.db).to(map);
             }
             None => {
-                self.workspace_input = Some(crate::db::Workspace::new(&self.db, None, map));
+                let srcs = self.current_file_srcs_map();
+                self.workspace_input = Some(crate::db::Workspace::new(&self.db, None, map, srcs));
+            }
+        }
+    }
+
+    /// Republishes `Workspace.file_srcs` from `sources`. Called only when the
+    /// `sources` keyset changes (a file enters/leaves the workspace) — a
+    /// structural event, exactly as `file_deps` is republished only on its own
+    /// keyset change. In-body edits reuse a file's existing `SourceText` input
+    /// (see `source_for`), so they never reach here.
+    fn republish_file_srcs(&mut self) {
+        use salsa::Setter as _;
+        let srcs = self.current_file_srcs_map();
+        match self.workspace_input {
+            Some(ws) => {
+                ws.set_file_srcs(&mut self.db).to(srcs);
+            }
+            None => {
+                let deps = self.current_file_deps_map();
+                self.workspace_input = Some(crate::db::Workspace::new(&self.db, None, deps, srcs));
             }
         }
     }
@@ -326,6 +360,9 @@ impl AnalysisHost {
     /// removal, an LRU, ...) is a v2b concern.
     pub fn forget_file(&mut self, file: FileId) {
         self.sources.remove(&file);
+        // Keyset shrank: republish the workspace-wide file_srcs map so the
+        // removed file's key disappears from `Workspace.file_srcs`.
+        self.republish_file_srcs();
         // Also drop the file's `FileDeps` input and republish the workspace-wide
         // map so the removed file's key disappears from `Workspace.file_deps`
         // (the keyset shrank — `republish_file_deps_map` recomputes from the

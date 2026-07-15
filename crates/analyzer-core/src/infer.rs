@@ -358,15 +358,21 @@ fn return_mismatch_diag(
 
 impl crate::AnalysisHost {
     /// Type diagnostics for `file` (foundation: primitive-literal return
-    /// mismatch). Thin bridge over the tracked `type_diagnostics_query`,
-    /// mirroring `resolution_diagnostics`. Single-file typing: no `FileDeps`/
-    /// `Workspace` inputs are needed for the slice. Editor surfacing (Problems
-    /// panel + toggle) is wired in v2b.final, which consumes this method.
+    /// mismatch) plus generic-specialization (arity) diagnostics. Thin
+    /// bridge over the tracked `type_diagnostics_query`, mirroring
+    /// `resolution_diagnostics`, merged with `generic_diagnostics` so this
+    /// is the single type-diagnostics surface the differential harness (and,
+    /// later, the editor) consumes. Single-file typing: no `FileDeps`/
+    /// `Workspace` inputs are needed for the `type_diagnostics_query` slice.
+    /// Editor surfacing (Problems panel + toggle) is wired in v2b.final,
+    /// which consumes this method.
     pub fn type_diagnostics(&mut self, file: crate::FileId) -> Vec<Diagnostic> {
         let Some(src) = self.src_of(file) else {
             return Vec::new();
         };
-        type_diagnostics_query(self.db_ref(), src).to_vec()
+        let mut diags = type_diagnostics_query(self.db_ref(), src).to_vec();
+        diags.extend(self.generic_diagnostics(file));
+        diags
     }
 }
 
@@ -743,5 +749,26 @@ mod tests {
         );
         let diags = host.type_diagnostics(file);
         assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn type_diagnostics_includes_generic_arity() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/g.compact"));
+        // Box<T> used with no args -> generic-arity diagnostic surfaces via
+        // the merged type_diagnostics.
+        host.vfs_mut().set_overlay(
+            file,
+            "struct Box<T> { v: T; }\nexport circuit m(): Box { return default<Box>; }".to_string(),
+            1,
+        );
+        let diags = host.type_diagnostics(file);
+        assert!(
+            diags.iter().any(|d| d.code.number == 3003),
+            "expected an E3003 generic-arity diagnostic, got: {:?}",
+            diags.iter().map(|d| d.code.number).collect::<Vec<_>>()
+        );
     }
 }

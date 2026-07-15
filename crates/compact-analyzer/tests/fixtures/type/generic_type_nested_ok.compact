@@ -1,0 +1,4 @@
+struct Box<T> { v: T; }
+export circuit f(): Box<Box<Field>> {
+  return default<Box<Box<Field>>>;
+}

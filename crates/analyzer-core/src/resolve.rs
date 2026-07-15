@@ -387,6 +387,21 @@ impl crate::AnalysisHost {
         )
         .to_vec()
     }
+
+    /// Generic-specialization diagnostics for `file` (type-reference arity).
+    /// Resolution-fed (arity lives on the referenced definition), so this
+    /// indexes the file to materialize its dependency edges, then calls the
+    /// tracked `generic_diagnostics_query`. Merged into `type_diagnostics`
+    /// (v2b.5); editor surfacing is v2b.final.
+    pub fn generic_diagnostics(&mut self, file: FileId) -> Vec<Diagnostic> {
+        let Some(src) = self.src_of(file) else {
+            return Vec::new();
+        };
+        self.ensure_indexed(file);
+        let fd = self.file_deps(file);
+        let ws = self.workspace();
+        crate::db::generic_diagnostics_query(self.db_ref(), file, src, fd, ws).to_vec()
+    }
 }
 
 /// The sole top-level symbol iff it is exactly one and a module. Mirrors the

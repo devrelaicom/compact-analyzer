@@ -840,6 +840,106 @@ pub fn resolution_diagnostics_query(
     Arc::from(diags)
 }
 
+/// Resolve a `Definition::Item` to its `Symbol`. The current file's symbols
+/// come from `item_tree(src)`; a cross-file target's `SourceText` is reached by
+/// matching its `FileId` against a materialized `fd` dep's target (includes and
+/// imports alike). A target neither in the current file nor in `fd` yields
+/// `None` (suppresses).
+fn item_symbol(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    def_file: crate::FileId,
+    index: u32,
+) -> Option<crate::Symbol> {
+    if def_file == file {
+        return item_tree(db, src).symbols.get(index as usize).cloned();
+    }
+    let (_, tsrc) = fd
+        .deps(db)
+        .iter()
+        .filter_map(|d| d.target)
+        .find(|(f, _)| *f == def_file)?;
+    item_tree(db, tsrc).symbols.get(index as usize).cloned()
+}
+
+/// The generic-arity mismatch diagnostic (`E3003`). Wording tracks compactc's
+/// ("mismatch between actual number A and declared number D of generic
+/// parameters for Name"); wording is not gated by the harness.
+fn generic_arity_diag(
+    actual: u32,
+    declared: u32,
+    name: &str,
+    span: text_size::TextRange,
+) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticCode::new("E", 3003),
+        format!(
+            "mismatch between actual number {actual} and declared number {declared} of generic parameters for {name}"
+        ),
+        span,
+    )
+}
+
+/// Generic-specialization diagnostics for `src`: every `TypeRef` whose name
+/// resolves to a named-type definition (struct / enum / type alias) must carry
+/// exactly the definition's declared number of generic arguments. Resolution
+/// is required (arity lives on the *definition*), so this query is
+/// resolution-fed like `resolution_diagnostics_query`. Suppresses whenever the
+/// name does not resolve to a countable named-type definition — never a false
+/// positive.
+#[salsa::tracked(returns(clone), no_eq)]
+pub fn generic_diagnostics_query(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+) -> Arc<[Diagnostic]> {
+    let green = crate::db::parsed(db, src).green;
+    let root = compactp_syntax::SyntaxNode::new_root(green);
+    let mut diags = Vec::new();
+
+    for tref in root.descendants().filter_map(compactp_ast::TypeRef::cast) {
+        let Some(name_tok) = tref.name() else {
+            continue;
+        };
+        // Resolve the type name to its definition.
+        let def = resolve_query(db, file, src, fd, ws, name_tok.text_range().start());
+        let Some(crate::Definition::Item {
+            file: def_file,
+            index,
+        }) = def
+        else {
+            continue; // unresolved, or a local/generic-param binding -> suppress
+        };
+        let Some(sym) = item_symbol(db, file, src, fd, def_file, index) else {
+            continue; // target unreachable -> suppress
+        };
+        // Only named *type* declarations carry a checkable generic arity.
+        if !matches!(
+            sym.kind,
+            crate::SymbolKind::Struct | crate::SymbolKind::Enum | crate::SymbolKind::TypeAlias
+        ) {
+            continue;
+        }
+        let actual = tref
+            .generic_args()
+            .map(|a| a.args().count() as u32)
+            .unwrap_or(0);
+        if actual != sym.generic_param_count {
+            diags.push(generic_arity_diag(
+                actual,
+                sym.generic_param_count,
+                name_tok.text(),
+                tref.syntax().text_range(),
+            ));
+        }
+    }
+    Arc::from(diags)
+}
+
 /// One import's diagnostic contribution: find the matching non-include
 /// `ResolvedDep` for `raw`; push the unresolved-import diagnostic if it
 /// didn't resolve, else run the module-mismatch check on the resolved
@@ -1114,6 +1214,54 @@ mod tests {
         assert_eq!(
             source_text_for(&db, crate::FileId::from_raw_for_test(9), this, this_src, ws),
             None
+        );
+    }
+
+    #[test]
+    fn generic_typeref_arity_is_checked() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+
+        fn diags(src: &str) -> Vec<compactp_diagnostics::Diagnostic> {
+            let mut host = AnalysisHost::new();
+            let file = host.vfs_mut().file_id(Path::new("/t/a.compact"));
+            host.vfs_mut().set_overlay(file, src.to_string(), 1);
+            host.generic_diagnostics(file)
+        }
+
+        // Correct arity: no diagnostic.
+        assert!(
+            diags("struct Box<T> { v: T; }\nexport circuit m(): Box<Field> { return default<Box<Field>>; }")
+                .is_empty()
+        );
+        // Missing args (0 vs 1): the struct name appears in two independent
+        // TypeRef positions here -- the circuit's return-type annotation and
+        // the argument to `default<...>` -- each a genuine, separately
+        // spanned arity violation, so two diagnostics are expected (one per
+        // TypeRef, per the query's contract), both naming Box.
+        let d = diags("struct Box<T> { v: T; }\nexport circuit m(): Box { return default<Box>; }");
+        assert_eq!(d.len(), 2);
+        for diag in &d {
+            assert!(
+                diag.message.contains("actual number 0")
+                    && diag.message.contains("declared number 1")
+                    && diag.message.contains("Box")
+            );
+        }
+        // Wrong count (1 vs 2); again two TypeRef positions (return type +
+        // `default<...>` argument).
+        assert_eq!(
+            diags("struct Pair<A, B> { a: A; b: B; }\nexport circuit m(): Pair<Field> { return default<Pair<Field>>; }").len(),
+            2
+        );
+        // Args on a non-generic struct (1 vs 0); again two TypeRef positions.
+        assert_eq!(
+            diags("struct Point { x: Field; }\nexport circuit m(): Point<Field> { return default<Point<Field>>; }").len(),
+            2
+        );
+        // Unresolved name suppresses (never a false positive).
+        assert!(
+            diags("export circuit m(): Nope<Field> { return default<Nope<Field>>; }").is_empty()
         );
     }
 }

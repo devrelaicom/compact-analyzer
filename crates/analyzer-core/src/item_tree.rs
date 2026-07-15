@@ -2,7 +2,7 @@
 //! rendered signature, doc comment, and container. This is the flat,
 //! cheap-to-rebuild structure everything in M2 navigates over.
 
-use compactp_ast::{AstNode, Item};
+use compactp_ast::{AstNode, GenericParamList, Item};
 use compactp_syntax::{SyntaxKind, SyntaxNode};
 use text_size::TextRange;
 
@@ -38,6 +38,10 @@ pub struct Symbol {
     pub exported: bool,
     /// Index of the containing symbol (module, struct, enum, contract).
     pub parent: Option<u32>,
+    /// Number of generic parameters the declaration takes (`0` when it has
+    /// none or cannot be generic). Read by the generic-arity check to compare
+    /// against a use site's supplied generic-argument count.
+    pub generic_param_count: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -83,6 +87,7 @@ impl ItemTree {
                     SymbolKind::Circuit,
                     it.is_exported(),
                     parent,
+                    generic_count(it.generic_params()),
                 );
             }
             Item::CircuitDecl(it) => {
@@ -92,6 +97,7 @@ impl ItemTree {
                     SymbolKind::CircuitSig,
                     it.is_exported(),
                     parent,
+                    generic_count(it.generic_params()),
                 );
             }
             Item::WitnessDecl(it) => {
@@ -101,6 +107,7 @@ impl ItemTree {
                     SymbolKind::Witness,
                     it.is_exported(),
                     parent,
+                    generic_count(it.generic_params()),
                 );
             }
             Item::LedgerDecl(it) => {
@@ -110,6 +117,7 @@ impl ItemTree {
                     SymbolKind::Ledger,
                     it.is_exported(),
                     parent,
+                    0,
                 );
             }
             Item::TypeDecl(it) => {
@@ -119,6 +127,7 @@ impl ItemTree {
                     SymbolKind::TypeAlias,
                     it.is_exported(),
                     parent,
+                    generic_count(it.generic_params()),
                 );
             }
             Item::ConstructorDef(it) => {
@@ -132,6 +141,7 @@ impl ItemTree {
                     doc: leading_docs(node),
                     exported: false,
                     parent,
+                    generic_param_count: 0,
                 });
             }
             Item::StructDef(it) => {
@@ -141,6 +151,7 @@ impl ItemTree {
                     SymbolKind::Struct,
                     it.is_exported(),
                     parent,
+                    generic_count(it.generic_params()),
                 );
                 for field in it.fields() {
                     if let Some(name) = field.name() {
@@ -160,6 +171,7 @@ impl ItemTree {
                             doc: leading_docs(field.syntax()),
                             exported: it.is_exported(),
                             parent: Some(idx),
+                            generic_param_count: 0,
                         });
                     }
                 }
@@ -171,6 +183,7 @@ impl ItemTree {
                     SymbolKind::Enum,
                     it.is_exported(),
                     parent,
+                    0,
                 );
                 for variant in it.variants() {
                     if let Some(name) = variant.name() {
@@ -183,6 +196,7 @@ impl ItemTree {
                             doc: None,
                             exported: it.is_exported(),
                             parent: Some(idx),
+                            generic_param_count: 0,
                         });
                     }
                 }
@@ -194,6 +208,7 @@ impl ItemTree {
                     SymbolKind::Contract,
                     it.is_exported(),
                     parent,
+                    0,
                 );
                 for circuit in it.circuits() {
                     if let Some(name) = circuit.name() {
@@ -206,6 +221,7 @@ impl ItemTree {
                             doc: leading_docs(circuit.syntax()),
                             exported: it.is_exported(),
                             parent: Some(idx),
+                            generic_param_count: 0,
                         });
                     }
                 }
@@ -217,6 +233,7 @@ impl ItemTree {
                     SymbolKind::Module,
                     it.is_exported(),
                     parent,
+                    generic_count(it.generic_params()),
                 );
                 // ModuleDef exposes no members accessor: iterate direct
                 // children castable to Item (verified compactp pattern).
@@ -236,6 +253,7 @@ impl ItemTree {
         kind: SymbolKind,
         exported: bool,
         parent: Option<u32>,
+        generic_param_count: u32,
     ) -> u32 {
         let (name_text, name_range) = match &name {
             Some(token) => (token.text().to_string(), token.text_range()),
@@ -255,8 +273,18 @@ impl ItemTree {
             doc: leading_docs(node),
             exported,
             parent,
+            generic_param_count,
         })
     }
+}
+
+/// The number of generic parameters a definition node declares, or `0`.
+/// `T` and `#n` parameters both count. Applies to nodes exposing
+/// `generic_params()` (modules, circuits, circuit signatures, witnesses,
+/// structs, type aliases); enums and contracts have no such accessor and are
+/// recorded as `0` at their construction sites.
+fn generic_count(params: Option<GenericParamList>) -> u32 {
+    params.map(|p| p.params().count() as u32).unwrap_or(0)
 }
 
 /// Renders a one-line signature: the item's tokens up to (not including)
@@ -409,6 +437,24 @@ mod tests {
         );
         let t = tree("circuit bare(): [] { }");
         assert_eq!(find(&t, "bare").doc, None);
+    }
+
+    #[test]
+    fn records_generic_param_count() {
+        let t = tree(
+            "export struct Box<T> { v: T; }\n\
+             export struct Pair<A, B> { a: A; b: B; }\n\
+             export struct Point { x: Field; y: Field; }\n\
+             export enum Color { Red, Green }\n\
+             export circuit id<T>(x: T): T { return x; }\n\
+             export circuit plain(x: Field): Field { return x; }",
+        );
+        assert_eq!(find(&t, "Box").generic_param_count, 1);
+        assert_eq!(find(&t, "Pair").generic_param_count, 2);
+        assert_eq!(find(&t, "Point").generic_param_count, 0);
+        assert_eq!(find(&t, "Color").generic_param_count, 0);
+        assert_eq!(find(&t, "id").generic_param_count, 1);
+        assert_eq!(find(&t, "plain").generic_param_count, 0);
     }
 
     #[test]

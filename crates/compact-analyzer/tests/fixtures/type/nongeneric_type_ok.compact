@@ -1,0 +1,4 @@
+struct Point { x: Field; y: Field; }
+export circuit f(): Point {
+  return default<Point>;
+}

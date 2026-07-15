@@ -125,6 +125,36 @@ const FIXTURES: &[Fixture] = &[
         native_rejects: true,
         rule: "cast-primitives",
     },
+    Fixture {
+        name: "generic_type_ok.compact",
+        native_rejects: false,
+        rule: "generic-specialization",
+    },
+    Fixture {
+        name: "generic_type_missing_args.compact",
+        native_rejects: true,
+        rule: "generic-specialization",
+    },
+    Fixture {
+        name: "generic_type_wrong_count.compact",
+        native_rejects: true,
+        rule: "generic-specialization",
+    },
+    Fixture {
+        name: "generic_args_on_nongeneric.compact",
+        native_rejects: true,
+        rule: "generic-specialization",
+    },
+    Fixture {
+        name: "nongeneric_type_ok.compact",
+        native_rejects: false,
+        rule: "generic-specialization",
+    },
+    Fixture {
+        name: "generic_type_nested_ok.compact",
+        native_rejects: false,
+        rule: "generic-specialization",
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

@@ -1,0 +1,3 @@
+export circuit foo(): Field {
+  return true;
+}

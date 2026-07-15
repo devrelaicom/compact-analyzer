@@ -160,7 +160,7 @@ fn cast_error(cast: &compactp_ast::expr::CastExpr) -> Option<(TyKind, TyKind)> {
         .children()
         .find_map(compactp_ast::expr::Expr::cast)?;
     let src = expr_ty_kind(&operand);
-    (!can_cast(src, tgt)).then_some((src, tgt))
+    (!can_cast(&src, &tgt)).then_some((src, tgt))
 }
 
 /// The illegal-cast diagnostic (`E3002`). Wording tracks compactc's
@@ -327,8 +327,8 @@ pub fn type_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnostic]>
                 continue;
             }
             // Return-mismatch only fires on a return type the checker models.
-            if declared != TyKind::Unknown && !is_subtype(ret.kind, declared) {
-                diags.push(return_mismatch_diag(db, ret.kind, declared, name, ret.span));
+            if declared != TyKind::Unknown && !is_subtype(&ret.kind, &declared) {
+                diags.push(return_mismatch_diag(db, ret.kind, declared.clone(), name, ret.span));
             }
         }
     }

@@ -11,9 +11,10 @@
 //! `analyzer-core` — [`ty_display`] is the projection the IDE layer consumes.
 
 use crate::db::Db;
+use std::sync::Arc;
 
 /// A Compact type, as far as the foundation models it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TyKind {
     /// `Boolean`.
     Boolean,
@@ -34,6 +35,14 @@ pub enum TyKind {
     /// [`can_cast`]. Byte counts are small, so the length is a `u32`; a
     /// non-literal or overflowing size lowers to `Unknown` upstream.
     Bytes(u32),
+    /// `[T0, …, Tk]`. An empty tuple is the unit type `[]`. A tuple and a
+    /// `Vector` of equal length compare element-wise (they are the same
+    /// "sequence" type to the compiler).
+    Tuple(Arc<[TyKind]>),
+    /// `Vector<n, T>` — presents as `n` elements each of type `T`; equivalent
+    /// to the homogeneous n-element tuple. A non-literal or overflowing size
+    /// lowers to `Unknown` upstream, so `n` is always a real `u32` here.
+    Vector(u32, Arc<TyKind>),
 }
 
 /// A salsa-interned type id. Under `#[salsa::interned]` this is `Ty<'db>` with
@@ -43,13 +52,18 @@ pub enum TyKind {
 #[salsa::interned]
 #[derive(Debug)]
 pub struct Ty {
-    #[returns(copy)]
+    #[returns(clone)]
     pub kind: TyKind,
 }
 
 /// Display projection for the IDE layer (hover / completion detail).
 pub fn ty_display(db: &dyn Db, ty: Ty) -> String {
-    match ty.kind(db) {
+    display_kind(&ty.kind(db))
+}
+
+/// Pure display projection over a `TyKind`; `ty_display` delegates to this.
+pub(crate) fn display_kind(kind: &TyKind) -> String {
+    match kind {
         TyKind::Boolean => "Boolean".to_string(),
         TyKind::Field => "Field".to_string(),
         TyKind::Unknown => "?".to_string(),
@@ -65,6 +79,11 @@ pub fn ty_display(db: &dyn Db, ty: Ty) -> String {
         }
         TyKind::Uint(None) => "Uint<0..?>".to_string(),
         TyKind::Bytes(n) => format!("Bytes<{n}>"),
+        TyKind::Tuple(elems) => {
+            let inner = elems.iter().map(display_kind).collect::<Vec<_>>().join(", ");
+            format!("[{inner}]")
+        }
+        TyKind::Vector(n, elem) => format!("Vector<{n}, {}>", display_kind(elem)),
     }
 }
 
@@ -72,7 +91,7 @@ pub fn ty_display(db: &dyn Db, ty: Ty) -> String {
 /// expected, per the compiler's type checker (verified against compact 0.5.1).
 /// `Unknown` on either side yields `true` — the checker only *suppresses* on an
 /// unmodeled type, it never manufactures a mismatch from one.
-pub(crate) fn is_subtype(sub: TyKind, sup: TyKind) -> bool {
+pub(crate) fn is_subtype(sub: &TyKind, sup: &TyKind) -> bool {
     match (sub, sup) {
         (TyKind::Unknown, _) | (_, TyKind::Unknown) => true,
         (TyKind::Boolean, TyKind::Boolean) => true,
@@ -80,11 +99,45 @@ pub(crate) fn is_subtype(sub: TyKind, sup: TyKind) -> bool {
         // Every Uint is a subtype of Field (widening to Field always allowed).
         (TyKind::Uint(_), TyKind::Field) => true,
         // Uint<0..a> <: Uint<0..b> iff a <= b (range containment).
-        (TyKind::Uint(a), TyKind::Uint(b)) => uint_upper_le(a, b),
+        (TyKind::Uint(a), TyKind::Uint(b)) => uint_upper_le(*a, *b),
         // Bytes<n> <: Bytes<m> iff n == m; Bytes is unrelated to all else.
         (TyKind::Bytes(a), TyKind::Bytes(b)) => a == b,
+        // Tuple & Vector are one sequence relation (all four combinations).
+        (
+            TyKind::Tuple(_) | TyKind::Vector(_, _),
+            TyKind::Tuple(_) | TyKind::Vector(_, _),
+        ) => seq_subtype(sub, sup),
         // Everything else (Boolean/Field/Uint cross, Field->Uint, Bytes
         // cross-kind) is unrelated.
+        _ => false,
+    }
+}
+
+/// Number of elements a sequence type presents, or `None` if not a sequence.
+fn seq_len(t: &TyKind) -> Option<u32> {
+    match t {
+        TyKind::Tuple(v) => Some(v.len() as u32),
+        TyKind::Vector(n, _) => Some(*n),
+        _ => None,
+    }
+}
+
+/// The element type at index `i` of a sequence (a Vector yields its single
+/// element type for every index). Callers only pass `i < seq_len`.
+fn seq_elem(t: &TyKind, i: u32) -> &TyKind {
+    match t {
+        TyKind::Tuple(v) => &v[i as usize],
+        TyKind::Vector(_, e) => e,
+        _ => unreachable!("seq_elem on non-sequence"),
+    }
+}
+
+/// Equal length + element-wise covariance, recursing through `is_subtype`.
+fn seq_subtype(sub: &TyKind, sup: &TyKind) -> bool {
+    match (seq_len(sub), seq_len(sup)) {
+        (Some(a), Some(b)) if a == b => {
+            (0..a).all(|i| is_subtype(seq_elem(sub, i), seq_elem(sup, i)))
+        }
         _ => false,
     }
 }
@@ -115,14 +168,16 @@ fn uint_upper_le(a: Option<u128>, b: Option<u128>) -> bool {
 /// unmodeled type; it never manufactures a cast error from one). Any pair not
 /// *confirmed* illegal is treated as legal — conservative, never a false
 /// positive.
-pub(crate) fn can_cast(src: TyKind, tgt: TyKind) -> bool {
+pub(crate) fn can_cast(src: &TyKind, tgt: &TyKind) -> bool {
     match (src, tgt) {
         (TyKind::Unknown, _) | (_, TyKind::Unknown) => true,
         // Boolean cannot cast to or from Bytes.
         (TyKind::Boolean, TyKind::Bytes(_)) | (TyKind::Bytes(_), TyKind::Boolean) => false,
         // Bytes-to-Bytes must preserve size.
         (TyKind::Bytes(a), TyKind::Bytes(b)) => a == b,
-        // Every other pair among modeled primitives is castable.
+        // Every other pair among modeled primitives is castable. A composite
+        // type falls into this catch-all (cast legality of composites is not
+        // modeled — suppress, never a false positive).
         _ => true,
     }
 }
@@ -212,74 +267,124 @@ mod tests {
     fn subtype_lattice_matches_compiler() {
         use TyKind::*;
         // reflexive within a kind
-        assert!(is_subtype(Boolean, Boolean));
-        assert!(is_subtype(Field, Field));
+        assert!(is_subtype(&Boolean, &Boolean));
+        assert!(is_subtype(&Field, &Field));
         // Uint containment (a <: b iff a <= b)
-        assert!(is_subtype(Uint(Some(6)), Uint(Some(10)))); // 0..5 into 0..10 -> literal 5 case
-        assert!(!is_subtype(Uint(Some(12)), Uint(Some(10)))); // 0..12 into 0..10 -> literal 11 case
-        assert!(is_subtype(Uint(Some(10)), Uint(Some(10))));
-        assert!(is_subtype(Uint(Some(256)), Uint(Some(65536)))); // Uint8 into Uint16
-        assert!(!is_subtype(Uint(Some(65536)), Uint(Some(256)))); // Uint16 into Uint8
+        assert!(is_subtype(&Uint(Some(6)), &Uint(Some(10)))); // 0..5 into 0..10 -> literal 5 case
+        assert!(!is_subtype(&Uint(Some(12)), &Uint(Some(10)))); // 0..12 into 0..10 -> literal 11 case
+        assert!(is_subtype(&Uint(Some(10)), &Uint(Some(10))));
+        assert!(is_subtype(&Uint(Some(256)), &Uint(Some(65536)))); // Uint8 into Uint16
+        assert!(!is_subtype(&Uint(Some(65536)), &Uint(Some(256)))); // Uint16 into Uint8
         // Uint <: Field, one way only
-        assert!(is_subtype(Uint(Some(256)), Field));
-        assert!(!is_subtype(Field, Uint(Some(256))));
+        assert!(is_subtype(&Uint(Some(256)), &Field));
+        assert!(!is_subtype(&Field, &Uint(Some(256))));
         // Boolean isolated
-        assert!(!is_subtype(Boolean, Field));
-        assert!(!is_subtype(Field, Boolean));
-        assert!(!is_subtype(Boolean, Uint(Some(256))));
-        assert!(!is_subtype(Uint(Some(256)), Boolean));
+        assert!(!is_subtype(&Boolean, &Field));
+        assert!(!is_subtype(&Field, &Boolean));
+        assert!(!is_subtype(&Boolean, &Uint(Some(256))));
+        assert!(!is_subtype(&Uint(Some(256)), &Boolean));
         // conservative on non-representable bounds (never a false positive)
-        assert!(is_subtype(Uint(Some(5)), Uint(None))); // concrete fits huge
-        assert!(!is_subtype(Uint(None), Uint(Some(5)))); // huge cannot fit concrete
-        assert!(is_subtype(Uint(None), Uint(None))); // undecidable -> conservative accept
-        assert!(is_subtype(Uint(None), Field)); // any Uint <: Field
+        assert!(is_subtype(&Uint(Some(5)), &Uint(None))); // concrete fits huge
+        assert!(!is_subtype(&Uint(None), &Uint(Some(5)))); // huge cannot fit concrete
+        assert!(is_subtype(&Uint(None), &Uint(None))); // undecidable -> conservative accept
+        assert!(is_subtype(&Uint(None), &Field)); // any Uint <: Field
         // Unknown suppresses in both directions
-        assert!(is_subtype(Unknown, Field));
-        assert!(is_subtype(Boolean, Unknown));
+        assert!(is_subtype(&Unknown, &Field));
+        assert!(is_subtype(&Boolean, &Unknown));
     }
 
     #[test]
     fn bytes_subtype_is_same_size_only() {
         use TyKind::*;
         // reflexive by size
-        assert!(is_subtype(Bytes(32), Bytes(32)));
-        assert!(is_subtype(Bytes(1), Bytes(1)));
+        assert!(is_subtype(&Bytes(32), &Bytes(32)));
+        assert!(is_subtype(&Bytes(1), &Bytes(1)));
         // different size is unrelated (both directions)
-        assert!(!is_subtype(Bytes(4), Bytes(32)));
-        assert!(!is_subtype(Bytes(32), Bytes(4)));
+        assert!(!is_subtype(&Bytes(4), &Bytes(32)));
+        assert!(!is_subtype(&Bytes(32), &Bytes(4)));
         // Bytes is unrelated to every other kind
-        assert!(!is_subtype(Bytes(32), Field));
-        assert!(!is_subtype(Field, Bytes(32)));
-        assert!(!is_subtype(Bytes(32), Uint(Some(256))));
-        assert!(!is_subtype(Uint(Some(256)), Bytes(32)));
-        assert!(!is_subtype(Bytes(32), Boolean));
-        assert!(!is_subtype(Boolean, Bytes(32)));
+        assert!(!is_subtype(&Bytes(32), &Field));
+        assert!(!is_subtype(&Field, &Bytes(32)));
+        assert!(!is_subtype(&Bytes(32), &Uint(Some(256))));
+        assert!(!is_subtype(&Uint(Some(256)), &Bytes(32)));
+        assert!(!is_subtype(&Bytes(32), &Boolean));
+        assert!(!is_subtype(&Boolean, &Bytes(32)));
         // Unknown still suppresses in both directions
-        assert!(is_subtype(Unknown, Bytes(32)));
-        assert!(is_subtype(Bytes(32), Unknown));
+        assert!(is_subtype(&Unknown, &Bytes(32)));
+        assert!(is_subtype(&Bytes(32), &Unknown));
     }
 
     #[test]
     fn can_cast_matches_compiler() {
         use TyKind::*;
         // The only illegal casts among modeled primitives:
-        assert!(!can_cast(Boolean, Bytes(32))); // Boolean -> Bytes
-        assert!(!can_cast(Bytes(32), Boolean)); // Bytes -> Boolean
-        assert!(!can_cast(Bytes(32), Bytes(4))); // Bytes size change
-        assert!(!can_cast(Bytes(4), Bytes(32)));
+        assert!(!can_cast(&Boolean, &Bytes(32))); // Boolean -> Bytes
+        assert!(!can_cast(&Bytes(32), &Boolean)); // Bytes -> Boolean
+        assert!(!can_cast(&Bytes(32), &Bytes(4))); // Bytes size change
+        assert!(!can_cast(&Bytes(4), &Bytes(32)));
         // Everything else is castable:
-        assert!(can_cast(Bytes(32), Bytes(32))); // identity
-        assert!(can_cast(Boolean, Field));
-        assert!(can_cast(Field, Boolean));
-        assert!(can_cast(Boolean, Uint(Some(256))));
-        assert!(can_cast(Uint(Some(6)), Boolean));
-        assert!(can_cast(Uint(Some(6)), Bytes(32))); // Uint <-> Bytes any size
-        assert!(can_cast(Bytes(32), Uint(Some(256))));
-        assert!(can_cast(Field, Bytes(4)));
-        assert!(can_cast(Bytes(4), Field));
-        assert!(can_cast(Uint(Some(256)), Uint(Some(6)))); // Uint->Uint ignores bounds
+        assert!(can_cast(&Bytes(32), &Bytes(32))); // identity
+        assert!(can_cast(&Boolean, &Field));
+        assert!(can_cast(&Field, &Boolean));
+        assert!(can_cast(&Boolean, &Uint(Some(256))));
+        assert!(can_cast(&Uint(Some(6)), &Boolean));
+        assert!(can_cast(&Uint(Some(6)), &Bytes(32))); // Uint <-> Bytes any size
+        assert!(can_cast(&Bytes(32), &Uint(Some(256))));
+        assert!(can_cast(&Field, &Bytes(4)));
+        assert!(can_cast(&Bytes(4), &Field));
+        assert!(can_cast(&Uint(Some(256)), &Uint(Some(6)))); // Uint->Uint ignores bounds
         // Unknown on either side -> legal (suppress).
-        assert!(can_cast(Unknown, Bytes(32)));
-        assert!(can_cast(Boolean, Unknown));
+        assert!(can_cast(&Unknown, &Bytes(32)));
+        assert!(can_cast(&Boolean, &Unknown));
+    }
+
+    #[test]
+    fn tuple_and_vector_display() {
+        use std::sync::Arc;
+        let db = CompactDatabase::default();
+        let tup = TyKind::Tuple(Arc::from(vec![TyKind::Uint(Some(256)), TyKind::Boolean]));
+        assert_eq!(ty_display(&db, Ty::new(&db, tup)), "[Uint<8>, Boolean]");
+        let vec = TyKind::Vector(3, Arc::new(TyKind::Uint(Some(256))));
+        assert_eq!(ty_display(&db, Ty::new(&db, vec)), "Vector<3, Uint<8>>");
+        // Empty tuple is the unit type.
+        assert_eq!(ty_display(&db, Ty::new(&db, TyKind::Tuple(Arc::from(vec![])))), "[]");
+    }
+
+    #[test]
+    fn sequence_subtyping_matches_compiler() {
+        use std::sync::Arc;
+        use TyKind::*;
+        let u8k = || Uint(Some(256));
+        let u16k = || Uint(Some(65536));
+        let tup = |v: Vec<TyKind>| Tuple(Arc::from(v));
+        let vec = |n, t| Vector(n, Arc::new(t));
+
+        // Element-wise covariance: [Uint8, Uint8] <: [Uint16, Field]
+        assert!(is_subtype(&tup(vec![u8k(), u8k()]), &tup(vec![u16k(), Field])));
+        // Narrowing an element rejects: [Uint16, Uint16] </: [Uint8, Uint8]
+        assert!(!is_subtype(&tup(vec![u16k(), u16k()]), &tup(vec![u8k(), u8k()])));
+        // Non-covariant element rejects: [Uint8, Boolean] </: [Uint16, Field]
+        assert!(!is_subtype(&tup(vec![u8k(), Boolean]), &tup(vec![u16k(), Field])));
+        // Arity mismatch rejects.
+        assert!(!is_subtype(&tup(vec![u8k(), u8k()]), &tup(vec![u8k()])));
+        // Vector covariance + length: Vector<3,Uint8> <: Vector<3,Uint16>, not Vector<2,_>.
+        assert!(is_subtype(&vec(3, u8k()), &vec(3, u16k())));
+        assert!(!is_subtype(&vec(3, u16k()), &vec(3, u8k())));
+        assert!(!is_subtype(&vec(3, u8k()), &vec(2, u8k())));
+        // THE equivalence: Vector<3,Uint8> <-> [Uint8, Uint8, Uint8], both directions,
+        // and cross-kind covariance.
+        assert!(is_subtype(&vec(3, u8k()), &tup(vec![u8k(), u8k(), u8k()])));
+        assert!(is_subtype(&tup(vec![u8k(), u8k(), u8k()]), &vec(3, u8k())));
+        assert!(is_subtype(&vec(2, u8k()), &tup(vec![u16k(), Field])));
+        assert!(is_subtype(&tup(vec![u8k(), u8k()]), &vec(2, Field)));
+        // Heterogeneous tuple into a vector rejects when an element is non-covariant.
+        assert!(!is_subtype(&tup(vec![u8k(), Boolean]), &vec(2, Field)));
+        // Nested sequences recurse.
+        assert!(is_subtype(&vec(2, tup(vec![u8k(), u8k()])), &vec(2, tup(vec![u16k(), Field]))));
+        // Unknown element suppresses that position (never a false positive).
+        assert!(is_subtype(&tup(vec![Unknown, Boolean]), &tup(vec![u8k(), Boolean])));
+        // A sequence is unrelated to a scalar.
+        assert!(!is_subtype(&tup(vec![u8k()]), &u8k()));
+        assert!(!is_subtype(&u8k(), &vec(1, u8k())));
     }
 }

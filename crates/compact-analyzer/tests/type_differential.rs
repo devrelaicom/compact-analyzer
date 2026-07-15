@@ -61,6 +61,17 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/type")
 }
 
+fn corpus_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("COMPACT_CORPUS_DIR") {
+        let p = PathBuf::from(d);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../compactp/tests/corpus");
+    p.is_dir().then_some(p)
+}
+
 #[test]
 fn rule_tagged_fixtures() {
     let dir = fixtures_dir();
@@ -102,4 +113,60 @@ fn rule_tagged_fixtures() {
             );
         }
     }
+}
+
+/// Binary corpus gate (foundation direction: no false positives). For every
+/// corpus file `compactc` ACCEPTS at the type phase, the native checker must
+/// emit zero type diagnostics. Files compactc rejects post-parse are counted
+/// and reported but not asserted against native rejection — the full
+/// biconditional is the v2b release gate, reached as rules land. Skips when
+/// the toolchain or corpus is absent.
+#[test]
+fn corpus_no_false_positives() {
+    let Some(tc) = Toolchain::discover(None) else {
+        eprintln!("corpus gate SKIPPED: compactc absent");
+        return;
+    };
+    let Some(dir) = corpus_dir() else {
+        eprintln!("corpus gate SKIPPED: no COMPACT_CORPUS_DIR and no ../compactp checkout");
+        return;
+    };
+    let files = analyzer_core::discover_compact_files(&[dir]);
+    assert!(
+        files.len() > 100,
+        "expected a large corpus, got {}",
+        files.len()
+    );
+
+    let mut accepted = 0usize;
+    let mut compiler_rejected = 0usize;
+    let mut indeterminate = 0usize;
+    let mut false_positives: Vec<PathBuf> = Vec::new();
+
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match compiler_verdict(&tc, &path) {
+            CompilerVerdict::Accept => {
+                accepted += 1;
+                if native_rejects(&text, &path) {
+                    false_positives.push(path);
+                }
+            }
+            CompilerVerdict::RejectParse | CompilerVerdict::Indeterminate => indeterminate += 1,
+            CompilerVerdict::RejectPostParse => compiler_rejected += 1,
+        }
+    }
+
+    eprintln!(
+        "corpus gate: accepted={accepted} compiler_rejected(post-parse)={compiler_rejected} indeterminate={indeterminate} false_positives={}",
+        false_positives.len()
+    );
+    assert!(
+        false_positives.is_empty(),
+        "native emitted type diagnostics on {} file(s) compactc accepts (false positives): {:?}",
+        false_positives.len(),
+        false_positives
+    );
 }

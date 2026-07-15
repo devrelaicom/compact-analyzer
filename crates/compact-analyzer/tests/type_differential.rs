@@ -85,6 +85,11 @@ const FIXTURES: &[Fixture] = &[
         native_rejects: true,
         rule: "uint-lattice",
     },
+    Fixture {
+        name: "uint_octal_over_range.compact",
+        native_rejects: true,
+        rule: "uint-lattice",
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

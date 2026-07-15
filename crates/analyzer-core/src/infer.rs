@@ -33,12 +33,17 @@ pub(crate) fn type_node_kind(ty: &compactp_ast::Type) -> TyKind {
 }
 
 /// Parse a `Uint` size or an integer-literal token's text to a `u128`.
-/// Accepts decimal and `0x`/`0X` hex. `None` if the text is not a plain integer
-/// literal (e.g. a generic numeric parameter identifier) or overflows `u128`.
+/// Accepts decimal, `0x`/`0X` hex, `0o`/`0O` octal, and `0b`/`0B` binary.
+/// `None` if the text is not a plain integer literal (e.g. a generic numeric
+/// parameter identifier) or overflows `u128`.
 fn parse_int_literal(text: &str) -> Option<u128> {
     let t = text.trim();
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
         u128::from_str_radix(hex, 16).ok()
+    } else if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+        u128::from_str_radix(oct, 8).ok()
+    } else if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        u128::from_str_radix(bin, 2).ok()
     } else {
         t.parse::<u128>().ok()
     }
@@ -76,10 +81,10 @@ fn uint_bound(u: &compactp_ast::UintType) -> TyKind {
     }
 }
 
-/// The `TyKind` of a literal expression. `true`/`false` -> `Boolean`; a decimal
-/// or hex integer literal `n` -> `TyKind::Uint(Some(n+1))` (the minimal range
-/// `[0, n]`), or `Uint(None)` when `n+1` overflows `u128`; other literals
-/// (string, etc.) -> `Unknown`.
+/// The `TyKind` of a literal expression. `true`/`false` -> `Boolean`; a decimal,
+/// hex, octal, or binary integer literal `n` -> `TyKind::Uint(Some(n+1))` (the
+/// minimal range `[0, n]`), or `Uint(None)` when `n+1` overflows `u128`; other
+/// literals (string, etc.) -> `Unknown`.
 fn literal_ty_kind(lit: &compactp_ast::expr::LiteralExpr) -> TyKind {
     use compactp_syntax::SyntaxKind;
     let tokens: Vec<_> = lit
@@ -93,10 +98,12 @@ fn literal_ty_kind(lit: &compactp_ast::expr::LiteralExpr) -> TyKind {
     {
         return TyKind::Boolean;
     }
-    if let Some(tok) = tokens
-        .iter()
-        .find(|t| matches!(t.kind(), SyntaxKind::INT_LIT | SyntaxKind::HEX_LIT))
-    {
+    if let Some(tok) = tokens.iter().find(|t| {
+        matches!(
+            t.kind(),
+            SyntaxKind::INT_LIT | SyntaxKind::HEX_LIT | SyntaxKind::OCT_LIT | SyntaxKind::BIN_LIT
+        )
+    }) {
         // n -> minimal range [0, n] = exclusive upper n+1. Overflow -> None
         // (still a Uint; e.g. a 2^200 literal is Uint(None) <: Field).
         let bound = parse_int_literal(tok.text()).and_then(|n| n.checked_add(1));
@@ -318,6 +325,23 @@ mod tests {
         assert_eq!(
             infer_circuit_returns(&db, c, ic)[0].1,
             TyKind::Uint(Some(256))
+        );
+        // octal 0o10 (8) -> Uint<0..9>
+        let d = SourceText::new(&db, Arc::from("export circuit f(): Field { return 0o10; }"));
+        let id = circuit_index(&db, d, "f");
+        assert_eq!(
+            infer_circuit_returns(&db, d, id)[0].1,
+            TyKind::Uint(Some(9))
+        );
+        // binary 0b1010 (10) -> Uint<0..11>
+        let e = SourceText::new(
+            &db,
+            Arc::from("export circuit f(): Field { return 0b1010; }"),
+        );
+        let ie = circuit_index(&db, e, "f");
+        assert_eq!(
+            infer_circuit_returns(&db, e, ie)[0].1,
+            TyKind::Uint(Some(11))
         );
     }
 

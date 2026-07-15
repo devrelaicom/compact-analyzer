@@ -36,6 +36,12 @@ pub struct AnalysisHost {
     /// we skip `set_text` and avoid bumping the salsa revision. Same ABA-safe
     /// coupling as before: the `SourceText` input retains the `Arc<str>`.
     sources: HashMap<FileId, (usize, crate::db::SourceText)>,
+    /// One stable `FileDeps` salsa input per file, set by `index_file`'s
+    /// resolution pass. Mirrors `sources`' create-or-update pattern.
+    dep_inputs: HashMap<FileId, crate::db::FileDeps>,
+    /// The `Workspace` singleton input (currently just the stdlib handle),
+    /// provisioned lazily on first use (`workspace()`) or by `register_stdlib`.
+    workspace_input: Option<crate::db::Workspace>,
     vfs: Vfs,
     stdlib: Option<FileId>,
     import_search_path: Vec<PathBuf>,
@@ -59,6 +65,8 @@ impl AnalysisHost {
         Self {
             db: crate::db::CompactDatabase::default(),
             sources: HashMap::new(),
+            dep_inputs: HashMap::new(),
+            workspace_input: None,
             vfs: Vfs::new(),
             stdlib: None,
             import_search_path: Vec::new(),
@@ -105,15 +113,41 @@ impl AnalysisHost {
         &mut self.vfs
     }
 
-    /// Registers the materialized stdlib stub so the resolver can target it.
+    /// Registers the materialized stdlib stub so the resolver can target it,
+    /// and publishes it as the `Workspace` singleton's `stdlib` field so
+    /// tracked resolution queries can read it purely.
     pub fn register_stdlib(&mut self, path: &std::path::Path) -> FileId {
+        use salsa::Setter as _;
         let file = self.vfs.file_id(path);
         self.stdlib = Some(file);
+        let src = self.source_for(file);
+        let stdlib = src.map(|s| (file, s));
+        match self.workspace_input {
+            Some(ws) => {
+                ws.set_stdlib(&mut self.db).to(stdlib);
+            }
+            None => {
+                self.workspace_input = Some(crate::db::Workspace::new(&self.db, stdlib));
+            }
+        }
         file
     }
 
     pub fn stdlib_file(&self) -> Option<FileId> {
         self.stdlib
+    }
+
+    /// The `Workspace` singleton, provisioned empty if the stdlib was never
+    /// registered. Forward-declared here for Tasks 5-9's resolution queries,
+    /// which will read it; only exercised by this task's tests so far.
+    #[allow(dead_code)]
+    pub(crate) fn workspace(&mut self) -> crate::db::Workspace {
+        if let Some(ws) = self.workspace_input {
+            return ws;
+        }
+        let ws = crate::db::Workspace::new(&self.db, None);
+        self.workspace_input = Some(ws);
+        ws
     }
 
     /// Directories consulted (after the importing file's own directory) when
@@ -204,15 +238,56 @@ impl AnalysisHost {
 
         let from_dir = self.vfs().path(file).parent().map(|d| d.to_path_buf());
         let search = self.import_search_path();
-        let mut deps = std::collections::BTreeSet::new();
+        let mut edges = std::collections::BTreeSet::new();
+        let mut resolved: Vec<crate::db::ResolvedDep> = Vec::new();
         if let Some(from_dir) = from_dir {
             for dep in raw_deps.iter() {
-                if let Some(path) = crate::find_source_pathname(&from_dir, &search, &dep.raw) {
-                    deps.insert(self.vfs_mut().file_id(&path));
+                let target = crate::find_source_pathname(&from_dir, &search, &dep.raw).map(|path| {
+                    let fid = self.vfs_mut().file_id(&path);
+                    (fid, self.source_for(fid).expect("resolved path is readable"))
+                });
+                if let Some((fid, _)) = target {
+                    edges.insert(fid);
                 }
+                resolved.push(crate::db::ResolvedDep {
+                    raw: dep.raw.clone(),
+                    is_include: dep.is_include,
+                    target,
+                });
             }
         }
-        self.workspace.set_file(file, symbols, deps);
+        self.publish_file_deps(file, resolved);
+        self.workspace.set_file(file, symbols, edges);
+    }
+
+    /// Create-or-update the `FileDeps` salsa input for `file` from `index_file`'s
+    /// resolution pass. Mirrors `source_for`'s create-or-update pattern.
+    fn publish_file_deps(&mut self, file: FileId, resolved: Vec<crate::db::ResolvedDep>) {
+        use salsa::Setter as _;
+        let arc: Arc<[crate::db::ResolvedDep]> = Arc::from(resolved);
+        match self.dep_inputs.get(&file).copied() {
+            Some(fd) => {
+                fd.set_deps(&mut self.db).to(arc);
+            }
+            None => {
+                let fd = crate::db::FileDeps::new(&self.db, arc);
+                self.dep_inputs.insert(file, fd);
+            }
+        }
+    }
+
+    /// The `FileDeps` salsa input for `file`, provisioned empty if `file` was
+    /// never indexed (e.g. it was only resolved as someone else's dep target).
+    /// Forward-declared here for Tasks 5-9's resolution queries, which will
+    /// read it; only exercised by this task's tests so far.
+    #[allow(dead_code)]
+    pub(crate) fn file_deps(&mut self, file: FileId) -> crate::db::FileDeps {
+        if let Some(fd) = self.dep_inputs.get(&file).copied() {
+            return fd;
+        }
+        let fd = crate::db::FileDeps::new(&self.db, Arc::from(Vec::new()));
+        self.dep_inputs.insert(file, fd);
+        fd
     }
 
     /// Evicts a file (deleted on disk) from the workspace index.
@@ -417,5 +492,46 @@ mod tests {
         host.index_file(main_id);
 
         assert_eq!(host.dependents_of(foo), vec![main_id]);
+    }
+
+    #[test]
+    fn index_file_publishes_resolved_dep_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Foo.compact"), "module Foo {}").unwrap();
+        let main = dir.path().join("main.compact");
+        std::fs::write(&main, "import \"Foo\";\ninclude \"missing\";").unwrap();
+
+        let mut host = AnalysisHost::new();
+        let foo = host.vfs_mut().file_id(&dir.path().join("Foo.compact"));
+        let main_id = host.vfs_mut().file_id(&main);
+        host.index_file(foo);
+        host.index_file(main_id);
+
+        let fd = host.file_deps(main_id);
+        let deps = crate::db::FileDeps::deps(fd, &host.db);
+        // The string-path import resolves to Foo; the include does not resolve.
+        let foo_dep = deps.iter().find(|d| d.raw == "Foo").unwrap();
+        assert!(matches!(foo_dep.target, Some((f, _)) if f == foo));
+        let miss = deps.iter().find(|d| d.raw == "missing").unwrap();
+        assert!(miss.is_include && miss.target.is_none());
+    }
+
+    #[test]
+    fn register_stdlib_publishes_workspace_singleton() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdlib_path = dir.path().join("std.compact");
+        std::fs::write(&stdlib_path, "module Std {}").unwrap();
+
+        let mut host = AnalysisHost::new();
+        // Before registration, the singleton is provisioned empty (no stdlib).
+        let ws0 = host.workspace();
+        assert!(crate::db::Workspace::stdlib(ws0, &host.db).is_none());
+
+        let stdlib_id = host.register_stdlib(&stdlib_path);
+        let ws1 = host.workspace();
+        // Same handle across calls, now carrying the registered stdlib file.
+        assert!(ws0 == ws1);
+        let stdlib = crate::db::Workspace::stdlib(ws1, &host.db);
+        assert!(matches!(stdlib, Some((f, _)) if f == stdlib_id));
     }
 }

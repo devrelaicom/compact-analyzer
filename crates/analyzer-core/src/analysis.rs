@@ -553,4 +553,122 @@ mod tests {
         let stdlib = crate::db::Workspace::stdlib(ws1, &host.db);
         assert!(matches!(stdlib, Some((f, _)) if f == stdlib_id));
     }
+
+    /// Cross-file resolution memo reuse (Task 11, step 1): editing the
+    /// *importing* file's circuit body must not touch the *imported* file's
+    /// `item_tree` memo at all. This is cross-FILE isolation — a completely
+    /// different mechanism from same-file backdating (`item_tree` firewall):
+    /// editing main.compact never changes lib.compact's `SourceText` salsa
+    /// input, so lib's `parsed`/`item_tree` queries never even re-run; the
+    /// memoized `Arc` from the first computation survives untouched.
+    #[test]
+    fn editing_importer_body_does_not_reresolve_imported_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // The identifier import `import L;` resolves via `find_source_pathname`,
+        // which requires the disk filename to match the imported identifier
+        // exactly (`L.compact`) — same rule `identifier_import_resolves_across_files`
+        // in resolve.rs exercises with `Foo`/`Foo.compact`.
+        let lib_path = dir.path().join("L.compact");
+        std::fs::write(&lib_path, "module L { export circuit ex(): [] {} }").unwrap();
+
+        let main_path = dir.path().join("main.compact");
+        let main_v1 = "import L;\ncircuit main(): [] { ex(); }";
+        std::fs::write(&main_path, main_v1).unwrap();
+
+        let mut host = AnalysisHost::new();
+        let lib_file = host.vfs_mut().file_id(&lib_path);
+        let main_file = host.vfs_mut().file_id(&main_path);
+        host.vfs_mut()
+            .set_overlay(main_file, main_v1.to_string(), 1);
+
+        // Resolve `ex` from main into lib.
+        let call_offset = main_v1.find("ex();").unwrap() as u32;
+        let pos1 = crate::resolve::FilePosition {
+            file: main_file,
+            offset: crate::TextSize::new(call_offset),
+        };
+        let def1 = host.resolve(pos1).expect("ex resolves across files");
+        match def1 {
+            crate::Definition::Item { file, .. } => assert_eq!(file, lib_file),
+            crate::Definition::Local { .. } => panic!("expected a cross-file item"),
+        }
+
+        // Capture lib's item_tree Arc before the edit.
+        let lib_src = host
+            .source_for(lib_file)
+            .expect("lib was provisioned as main's import dep target");
+        let lib_tree_before = crate::db::item_tree(host.db_ref(), lib_src);
+
+        // Edit main's circuit BODY only — its import of L is untouched.
+        let main_v2 = "import L;\ncircuit main(): [] { ex(); ex(); }";
+        host.vfs_mut()
+            .set_overlay(main_file, main_v2.to_string(), 2);
+
+        // Re-resolve `ex` from the edited main.
+        let call_offset2 = main_v2.find("ex();").unwrap() as u32;
+        let pos2 = crate::resolve::FilePosition {
+            file: main_file,
+            offset: crate::TextSize::new(call_offset2),
+        };
+        let def2 = host
+            .resolve(pos2)
+            .expect("ex still resolves across files after the body edit");
+        assert_eq!(def1, def2);
+
+        // lib's item_tree Arc must be pointer-identical: lib's SourceText
+        // input never changed, so its item_tree memo was never re-run.
+        let lib_src_after = host.source_for(lib_file).unwrap();
+        let lib_tree_after = crate::db::item_tree(host.db_ref(), lib_src_after);
+        assert!(
+            std::sync::Arc::ptr_eq(&lib_tree_before, &lib_tree_after),
+            "editing main's body must not re-run lib's item_tree (cross-file isolation)"
+        );
+    }
+
+    /// Trivia-only edit does not re-resolve, downstream firewall (Task 11,
+    /// step 2). A comment-only edit to a file must leave `resolve()`'s
+    /// answer equal, and must be observable as a *downstream* backdate: NOT
+    /// on `item_tree` itself (it is a direct dependent of the `no_eq`
+    /// `parsed` query, so it always re-executes and reallocates its `Arc` —
+    /// see `trivia_only_edit_backdates_item_tree` in `db.rs`), but on
+    /// `file_symbols`, which depends on `item_tree`'s *value* and therefore
+    /// skips re-execution (same `Arc`) once `item_tree`'s change is
+    /// backdated.
+    #[test]
+    fn trivia_only_edit_does_not_reresolve_downstream() {
+        let text1 = "export circuit c(): [] {}\ncircuit main(): [] { c(); }";
+        let (mut host, file) = host_with(text1);
+
+        let call_offset = text1.find("c();").unwrap() as u32;
+        let pos1 = crate::resolve::FilePosition {
+            file,
+            offset: crate::TextSize::new(call_offset),
+        };
+        let def1 = host.resolve(pos1).expect("c resolves");
+
+        let src_before = host.source_for(file).unwrap();
+        let symbols_before = crate::db::file_symbols(host.db_ref(), src_before);
+
+        // Comment-only edit: items are byte-identical, only trivia changed.
+        let text2 = "export circuit c(): [] {}\ncircuit main(): [] { c(); } // note";
+        host.vfs_mut().set_overlay(file, text2.to_string(), 2);
+
+        let call_offset2 = text2.find("c();").unwrap() as u32;
+        let pos2 = crate::resolve::FilePosition {
+            file,
+            offset: crate::TextSize::new(call_offset2),
+        };
+        let def2 = host
+            .resolve(pos2)
+            .expect("c still resolves after the trivia-only edit");
+        assert_eq!(def1, def2, "resolve() must return an equal Definition");
+
+        let src_after = host.source_for(file).unwrap();
+        let symbols_after = crate::db::file_symbols(host.db_ref(), src_after);
+        assert!(
+            std::sync::Arc::ptr_eq(&symbols_before, &symbols_after),
+            "file_symbols must backdate (same Arc) across a trivia-only edit \
+             — the firewall is observable downstream of item_tree, not on it"
+        );
+    }
 }

@@ -1,9 +1,14 @@
-//! The native checker's type universe. `Ty` is a salsa-interned, lifetime-free
-//! (`'static`) type id: equality is id comparison and types are shared
-//! workspace-wide. The foundation ships only the constructors the
-//! primitive-literal slice needs; the universe grows one rule at a time
-//! (v2b.3…N). `Ty` never escapes `analyzer-core` — [`ty_display`] is the
-//! projection the IDE layer consumes.
+//! The native checker's type universe. `Ty` is a salsa-interned type id:
+//! equality is id comparison and types are shared workspace-wide. Under the
+//! `#[salsa::interned]` macro `Ty` carries an *elided* `'db` lifetime (it is
+//! `Ty<'db>`, tied to the database borrow it was interned under); ordinary
+//! signature elision means no code in this crate spells the lifetime out, but
+//! `Ty` is **not** `'static`. In particular a `#[salsa::tracked]` query cannot
+//! return a `Ty<'db>` inside a collection (e.g. `Arc<[(_, Ty)]>`) — carry the
+//! `'static` `TyKind` from queries and intern `Ty` at the display boundary. The
+//! foundation ships only the constructors the primitive-literal slice needs;
+//! the universe grows one rule at a time (v2b.3…N). `Ty` never escapes
+//! `analyzer-core` — [`ty_display`] is the projection the IDE layer consumes.
 
 use crate::db::Db;
 
@@ -20,9 +25,10 @@ pub enum TyKind {
     Unknown,
 }
 
-/// A salsa-interned type. Lifetime-free (all fields are `'static`), so a `Ty`
-/// is a `Copy`, workspace-shared id — two independently constructed
-/// `Boolean`s are the same `Ty`.
+/// A salsa-interned type id. Under `#[salsa::interned]` this is `Ty<'db>` with
+/// an elidable lifetime (elided at every call site here), tied to the database
+/// borrow it was produced under — it is **not** `'static`. Equality is id
+/// comparison: two independently constructed `Boolean`s are the same `Ty`.
 #[salsa::interned]
 #[derive(Debug)]
 pub struct Ty {

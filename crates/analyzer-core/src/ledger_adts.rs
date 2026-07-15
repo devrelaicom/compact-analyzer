@@ -17,6 +17,9 @@
 use compactp_ast::AstNode;
 use std::collections::BTreeMap;
 
+use crate::ty::TyKind;
+use std::sync::LazyLock;
+
 /// One in-circuit method of a ledger ADT.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct LedgerMethod {
@@ -54,6 +57,76 @@ impl LedgerAdtTable {
     pub(crate) fn methods(&self, adt: &str) -> &[LedgerMethod] {
         self.by_adt.get(adt).map(Vec::as_slice).unwrap_or(&[])
     }
+}
+
+/// A ledger ADT method's typed signature. Types the universe does not model
+/// (generic params `T`/`K`/`V`, library types) are `TyKind::Unknown`.
+pub struct LedgerMethodSig {
+    pub params: Vec<TyKind>,
+    pub ret: TyKind,
+}
+
+/// Parse a curated `sig` string (`name(p: T, …): RET`) into a typed signature
+/// by synthesizing `circuit <sig> { }`, reparsing, and lowering each `Type`
+/// via `type_node_kind`. A malformed sig (no `CircuitDef`) yields an empty,
+/// `Unknown`-return signature (suppresses — the asset is authoring-checked).
+pub(crate) fn parse_method_sig(sig: &str) -> LedgerMethodSig {
+    let source = format!("circuit {sig} {{ }}");
+    let result = compactp_parser::parse(&source);
+    let root = compactp_syntax::SyntaxNode::new_root(result.green);
+    let Some(cd) = root
+        .descendants()
+        .filter_map(compactp_ast::CircuitDef::cast)
+        .next()
+    else {
+        return LedgerMethodSig {
+            params: Vec::new(),
+            ret: TyKind::Unknown,
+        };
+    };
+    let params = cd
+        .params()
+        .map(|p| {
+            p.ty()
+                .map(|t| crate::infer::type_node_kind(&t))
+                .unwrap_or(TyKind::Unknown)
+        })
+        .collect();
+    let ret = cd
+        .return_type()
+        .map(|t| crate::infer::type_node_kind(&t))
+        .unwrap_or(TyKind::Unknown);
+    LedgerMethodSig { params, ret }
+}
+
+/// The typed method surface, parsed once from the embedded JSON table:
+/// `adt -> method name -> typed signature`.
+static SURFACES: LazyLock<
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, LedgerMethodSig>>,
+> = LazyLock::new(|| {
+    let table = LedgerAdtTable::load();
+    table
+        .by_adt
+        .iter()
+        .map(|(adt, methods)| {
+            let sigs = methods
+                .iter()
+                .map(|m| (m.name.clone(), parse_method_sig(&m.sig)))
+                .collect();
+            (adt.clone(), sigs)
+        })
+        .collect()
+});
+
+/// Typed signature for one ADT method, or `None` if the ADT or method is not
+/// in the curated surface. The curated table omits js-only / coin methods, so
+/// a `None` here must **suppress**, never emit an "unknown method" diagnostic.
+pub(crate) fn ledger_method_sig(adt: &str, method: &str) -> Option<LedgerMethodSig> {
+    let s = SURFACES.get(adt)?.get(method)?;
+    Some(LedgerMethodSig {
+        params: s.params.clone(),
+        ret: s.ret.clone(),
+    })
 }
 
 impl crate::AnalysisHost {
@@ -112,6 +185,36 @@ impl crate::AnalysisHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_method_sig_lowers_concrete_and_generic() {
+        use crate::ty::TyKind;
+        // Concrete param + unit return.
+        let s = parse_method_sig("increment(amount: Uint<16>): []");
+        assert_eq!(s.params, vec![TyKind::Uint(Some(65536))]);
+        assert_eq!(s.ret, TyKind::Tuple(std::sync::Arc::from(vec![])));
+        // Concrete return.
+        let r = parse_method_sig("read(): Uint<64>");
+        assert!(r.params.is_empty());
+        assert_eq!(r.ret, TyKind::Uint(Some(1u128 << 64)));
+        // Generic param/return -> Unknown (suppresses downstream).
+        let g = parse_method_sig("lookup(key: K): V");
+        assert_eq!(g.params, vec![TyKind::Unknown]);
+        assert_eq!(g.ret, TyKind::Unknown);
+        // Bytes param.
+        let b = parse_method_sig("insertHash(hash: Bytes<32>): []");
+        assert_eq!(b.params, vec![TyKind::Bytes(32)]);
+    }
+
+    #[test]
+    fn ledger_method_sig_reads_the_table() {
+        use crate::ty::TyKind;
+        let inc = ledger_method_sig("Counter", "increment").unwrap();
+        assert_eq!(inc.params, vec![TyKind::Uint(Some(65536))]);
+        // Unknown ADT or method -> None.
+        assert!(ledger_method_sig("Counter", "bogus").is_none());
+        assert!(ledger_method_sig("Nonsense", "increment").is_none());
+    }
 
     #[test]
     fn table_parses_and_covers_all_adts() {

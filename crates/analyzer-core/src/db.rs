@@ -161,11 +161,18 @@ pub struct FileDeps {
     pub deps: Arc<[ResolvedDep]>,
 }
 
-/// Workspace singleton: the stdlib file's `(FileId, SourceText)`, or `None`.
+/// Workspace singleton. Holds the stdlib file's `(FileId, SourceText)` (or
+/// `None`) plus a `FileId -> FileDeps` map so tracked resolution queries can
+/// reach a *target* file's own cross-file edges (needed for the transitive
+/// include walk). The host republishes `file_deps` only when its keyset
+/// changes (a file added/removed); per-file dep *content* changes flow
+/// through the individual `FileDeps` inputs.
 #[salsa::input]
 pub struct Workspace {
     #[returns(clone)]
     pub stdlib: Option<(crate::FileId, SourceText)>,
+    #[returns(clone)]
+    pub file_deps: std::sync::Arc<std::collections::BTreeMap<crate::FileId, FileDeps>>,
 }
 
 /// Item tree for `src`, memoized on the `SourceText` input. Projects
@@ -181,15 +188,99 @@ pub fn item_tree(db: &dyn Db, src: SourceText) -> Arc<ItemTree> {
     crate::db::parsed(db, src).item_tree
 }
 
-/// Throwaway spike: proves a tracked query can read a *second* file's
-/// `item_tree` (reached via a `FileDeps` entry) purely, with no I/O. Deleted
-/// in Task 5 once the real cross-file resolution queries land.
+/// File-scope name resolution as a tracked query: enclosing-module siblings,
+/// then top-level items, then included files' top-level decls, then imports.
+/// The port of `Resolver::resolve_in_file_scope`; all cross-file targets come
+/// from `fd`/`ws` (no I/O).
 #[salsa::tracked(returns(clone))]
-pub fn spike_cross_file(db: &dyn Db, fd: FileDeps, raw: String) -> Option<String> {
-    let dep = fd.deps(db).iter().find(|d| d.raw == raw)?.clone();
-    let (_, target_src) = dep.target?;
-    let tree = crate::db::item_tree(db, target_src);
-    tree.top_level().next().map(|(_, s)| s.name.clone())
+pub fn resolve_in_file(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    offset: text_size::TextSize,
+    name: String,
+) -> Option<crate::Definition> {
+    let tree = crate::db::item_tree(db, src);
+
+    // Inside a module, siblings are visible first.
+    if let Some(m) = crate::resolve::enclosing_module(&tree, offset)
+        && let Some((idx, _)) = tree.children_of(m).find(|(_, s)| s.name == name)
+    {
+        return Some(crate::Definition::Item { file, index: idx });
+    }
+
+    // Top-level items.
+    if let Some((idx, _)) = tree.top_level().find(|(_, s)| s.name == name) {
+        return Some(crate::Definition::Item { file, index: idx });
+    }
+
+    // Included files' top-level declarations are spliced into this scope.
+    if let Some(d) = resolve_includes(db, file, fd, ws, &name, &mut vec![file]) {
+        return Some(d);
+    }
+
+    // Imports, in order.
+    resolve_imports(db, file, src, fd, ws, &name)
+}
+
+/// Resolves `name` against the top-level declarations of files reachable by
+/// `include` from `file`, depth-first. A plain `db`-taking recursive helper
+/// (NOT a tracked query) carrying the explicit `active` cycle guard, so the
+/// cyclic include graph never becomes a salsa cycle; it still benefits from
+/// `item_tree` memoization. A target's own `FileDeps` (needed to recurse into
+/// *its* includes) is looked up in `ws.file_deps`; a target that was never
+/// indexed (`None`) is skipped — matching the resolver's "unreadable include:
+/// skip, never die" ethos.
+pub(crate) fn resolve_includes(
+    db: &dyn Db,
+    _file: crate::FileId,
+    fd: FileDeps,
+    ws: Workspace,
+    name: &str,
+    active: &mut Vec<crate::FileId>,
+) -> Option<crate::Definition> {
+    let deps = fd.deps(db);
+    for dep in deps.iter().filter(|d| d.is_include) {
+        let Some((tfile, tsrc)) = dep.target else {
+            continue;
+        };
+        if active.contains(&tfile) {
+            continue; // cycle along the active include path
+        }
+        let ttree = crate::db::item_tree(db, tsrc);
+        if let Some((idx, _)) = ttree.top_level().find(|(_, s)| s.name == name) {
+            return Some(crate::Definition::Item {
+                file: tfile,
+                index: idx,
+            });
+        }
+        // Recurse into the include's own includes, via the workspace-wide map.
+        let Some(tfd) = ws.file_deps(db).get(&tfile).copied() else {
+            continue; // target not indexed: skip
+        };
+        active.push(tfile);
+        let found = resolve_includes(db, tfile, tfd, ws, name, active);
+        active.pop();
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// Resolves `name` through the file's imports, in declaration order.
+// Task 6 implements this.
+fn resolve_imports(
+    _db: &dyn Db,
+    _file: crate::FileId,
+    _src: SourceText,
+    _fd: FileDeps,
+    _ws: Workspace,
+    _name: &str,
+) -> Option<crate::Definition> {
+    None
 }
 
 #[cfg(test)]
@@ -226,24 +317,6 @@ mod tests {
     }
 
     #[test]
-    fn spike_reads_another_files_item_tree_purely() {
-        let db = CompactDatabase::default();
-        let target_src = SourceText::new(&db, Arc::from("export circuit tgt(): [] {}"));
-        let deps: Arc<[ResolvedDep]> = Arc::from(vec![ResolvedDep {
-            raw: "T".to_string(),
-            is_include: false,
-            target: Some((crate::FileId::from_raw_for_test(1), target_src)),
-        }]);
-        let fd = FileDeps::new(&db, deps);
-        // The spike resolves raw "T" to its target's first top-level symbol name.
-        assert_eq!(
-            spike_cross_file(&db, fd, "T".to_string()).as_deref(),
-            Some("tgt")
-        );
-        assert_eq!(spike_cross_file(&db, fd, "Nope".to_string()), None);
-    }
-
-    #[test]
     fn trivia_only_edit_backdates_item_tree() {
         use salsa::Setter as _;
         let mut db = CompactDatabase::default();
@@ -276,6 +349,41 @@ mod tests {
         assert!(
             Arc::ptr_eq(&s1, &s2),
             "file_symbols must backdate (same Arc) across a trivia-only edit"
+        );
+    }
+
+    #[test]
+    fn resolve_in_file_finds_top_level_and_enclosing_module() {
+        let db = CompactDatabase::default();
+        let src = SourceText::new(
+            &db,
+            Arc::from("circuit helper(): [] {}\nmodule M { circuit inner(): [] {} }"),
+        );
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = Workspace::new(&db, None, Arc::new(std::collections::BTreeMap::new()));
+        // Top-level `helper` resolves from anywhere.
+        let d = resolve_in_file(
+            &db,
+            crate::FileId::from_raw_for_test(0),
+            src,
+            fd,
+            ws,
+            0u32.into(),
+            "helper".to_string(),
+        );
+        assert!(matches!(d, Some(crate::Definition::Item { .. })));
+        // A name that does not exist resolves to None.
+        assert!(
+            resolve_in_file(
+                &db,
+                crate::FileId::from_raw_for_test(0),
+                src,
+                fd,
+                ws,
+                0u32.into(),
+                "nope".to_string(),
+            )
+            .is_none()
         );
     }
 

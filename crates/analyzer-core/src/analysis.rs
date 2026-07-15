@@ -127,7 +127,8 @@ impl AnalysisHost {
                 ws.set_stdlib(&mut self.db).to(stdlib);
             }
             None => {
-                self.workspace_input = Some(crate::db::Workspace::new(&self.db, stdlib));
+                let map = self.current_file_deps_map();
+                self.workspace_input = Some(crate::db::Workspace::new(&self.db, stdlib, map));
             }
         }
         file
@@ -145,9 +146,37 @@ impl AnalysisHost {
         if let Some(ws) = self.workspace_input {
             return ws;
         }
-        let ws = crate::db::Workspace::new(&self.db, None);
+        let map = self.current_file_deps_map();
+        let ws = crate::db::Workspace::new(&self.db, None, map);
         self.workspace_input = Some(ws);
         ws
+    }
+
+    /// Snapshot of the `FileId -> FileDeps` map published to `Workspace`, built
+    /// from the host's per-file `dep_inputs`. Cross-file resolution queries
+    /// (e.g. the transitive include walk) look a *target*'s `FileDeps` up here.
+    fn current_file_deps_map(
+        &self,
+    ) -> Arc<std::collections::BTreeMap<FileId, crate::db::FileDeps>> {
+        Arc::new(self.dep_inputs.iter().map(|(&f, &fd)| (f, fd)).collect())
+    }
+
+    /// Republishes `Workspace.file_deps` from `dep_inputs`. Called ONLY when the
+    /// keyset changes (a `FileDeps` input was newly created) — republishing on
+    /// every content update would bump the salsa revision and over-invalidate
+    /// every resolution query. Per-file dep *content* changes flow through the
+    /// individual `FileDeps` inputs, not this map.
+    fn republish_file_deps_map(&mut self) {
+        use salsa::Setter as _;
+        let map = self.current_file_deps_map();
+        match self.workspace_input {
+            Some(ws) => {
+                ws.set_file_deps(&mut self.db).to(map);
+            }
+            None => {
+                self.workspace_input = Some(crate::db::Workspace::new(&self.db, None, map));
+            }
+        }
     }
 
     /// Directories consulted (after the importing file's own directory) when
@@ -276,6 +305,8 @@ impl AnalysisHost {
             None => {
                 let fd = crate::db::FileDeps::new(&self.db, arc);
                 self.dep_inputs.insert(file, fd);
+                // Keyset grew: republish the workspace-wide map.
+                self.republish_file_deps_map();
             }
         }
     }
@@ -291,6 +322,8 @@ impl AnalysisHost {
         }
         let fd = crate::db::FileDeps::new(&self.db, Arc::from(Vec::new()));
         self.dep_inputs.insert(file, fd);
+        // Keyset grew: republish the workspace-wide map.
+        self.republish_file_deps_map();
         fd
     }
 

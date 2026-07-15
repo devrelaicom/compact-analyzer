@@ -15,7 +15,7 @@ use compactp_ast::AstNode;
 use compactp_diagnostics::{Diagnostic, DiagnosticCode};
 
 use crate::db::{Db, SourceText, item_tree, parsed};
-use crate::ty::{Ty, TyKind, ty_display};
+use crate::ty::{Ty, TyKind, is_subtype, ty_display};
 
 /// Lower a CST `Type` node to a `TyKind`. Only the primitives the foundation
 /// models map to a concrete kind; everything else is `Unknown`.
@@ -157,9 +157,8 @@ pub fn type_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnostic]>
         }
         let name = &tree.symbols[idx as usize].name;
         for (range, kind) in circuit_return_kinds(&circuit) {
-            let actual = kind;
-            if actual != TyKind::Unknown && actual != declared {
-                diags.push(return_mismatch_diag(db, actual, declared, name, range));
+            if !is_subtype(kind, declared) {
+                diags.push(return_mismatch_diag(db, kind, declared, name, range));
             }
         }
     }

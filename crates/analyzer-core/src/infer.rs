@@ -12,16 +12,16 @@ use std::sync::Arc;
 
 use compactp_ast::AstNode;
 
+use compactp_diagnostics::{Diagnostic, DiagnosticCode};
+
 use crate::db::{Db, SourceText, item_tree, parsed};
-use crate::ty::TyKind;
+use crate::ty::{Ty, TyKind, ty_display};
 
 /// Lower a CST `Type` node to a `TyKind`. Only the primitives the foundation
 /// models map to a concrete kind; everything else is `Unknown`.
 ///
-/// Not yet called outside this module's tests: Task 5 (the return-mismatch
-/// diagnostic) is the first non-test caller, typing a circuit's declared
+/// Called by `type_diagnostics_query` to type a circuit's declared
 /// return-type annotation for comparison against `infer_circuit_returns`.
-#[allow(dead_code)]
 pub(crate) fn type_node_kind(ty: &compactp_ast::Type) -> TyKind {
     use compactp_ast::Type;
     match ty {
@@ -102,6 +102,83 @@ pub fn infer_circuit_returns(
     Arc::from(out)
 }
 
+/// Type diagnostics for `src` (foundation rule: primitive-literal return
+/// mismatch). For each circuit with a declared return type the foundation
+/// models (`Boolean`/`Field`), every primitive-literal `return` operand whose
+/// `Ty` differs from the declared type yields one diagnostic. An `Unknown`
+/// declared type or operand suppresses the rule (never a false positive).
+///
+/// `no_eq`: `Diagnostic` (external crate) has no `PartialEq`, so
+/// `Arc<[Diagnostic]>` can't be compared for backdating — same rationale and
+/// shape as `resolution_diagnostics_query` in `db.rs`.
+#[salsa::tracked(returns(clone), no_eq)]
+pub fn type_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnostic]> {
+    let tree = item_tree(db, src);
+    let mut diags = Vec::new();
+    for (idx, sym) in tree
+        .symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.kind == crate::SymbolKind::Circuit)
+    {
+        let idx = idx as u32;
+        let Some(circuit) = circuit_node_by_index(db, src, idx) else {
+            continue;
+        };
+        let declared = circuit
+            .return_type()
+            .map(|t| type_node_kind(&t))
+            .unwrap_or(TyKind::Unknown);
+        if declared == TyKind::Unknown {
+            continue; // only fire on return types the foundation models
+        }
+        for (range, kind) in infer_circuit_returns(db, src, idx).iter() {
+            let actual = *kind;
+            if actual != TyKind::Unknown && actual != declared {
+                diags.push(return_mismatch_diag(
+                    db, actual, declared, &sym.name, *range,
+                ));
+            }
+        }
+    }
+    Arc::from(diags)
+}
+
+/// The return-type-mismatch diagnostic. Wording tracks `compactc`'s
+/// ("mismatch between actual return type X and declared return type Y of
+/// circuit Z"); wording is not gated by the harness.
+fn return_mismatch_diag(
+    db: &dyn Db,
+    actual: TyKind,
+    declared: TyKind,
+    circuit_name: &str,
+    span: text_size::TextRange,
+) -> Diagnostic {
+    let actual = ty_display(db, Ty::new(db, actual));
+    let declared = ty_display(db, Ty::new(db, declared));
+    Diagnostic::error(
+        DiagnosticCode::new("E", 3001),
+        format!(
+            "mismatch between actual return type {actual} and declared return type {declared} of circuit {circuit_name}"
+        ),
+        span,
+    )
+}
+
+impl crate::AnalysisHost {
+    /// Type diagnostics for `file` (foundation: primitive-literal return
+    /// mismatch). Thin bridge over the tracked `type_diagnostics_query`,
+    /// mirroring `resolution_diagnostics`. Single-file typing: no `FileDeps`/
+    /// `Workspace` inputs are needed for the slice. Editor surfacing (Problems
+    /// panel + toggle) is wired in v2b.final, which consumes this method.
+    pub fn type_diagnostics(&mut self, file: crate::FileId) -> Vec<Diagnostic> {
+        let Some(src) = self.src_of(file) else {
+            return Vec::new();
+        };
+        type_diagnostics_query(self.db_ref(), src).to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +233,65 @@ mod tests {
             type_node_kind(&circuit.return_type().unwrap()),
             TyKind::Boolean
         );
+    }
+
+    #[test]
+    fn return_mismatch_emits_one_type_diagnostic() {
+        let db = CompactDatabase::default();
+        let src = SourceText::new(
+            &db,
+            Arc::from("export circuit foo(): Field { return true; }"),
+        );
+        let diags = type_diagnostics_query(&db, src);
+        assert_eq!(diags.len(), 1, "one mismatch");
+        assert_eq!(diags[0].code.prefix, "E");
+        assert_eq!(diags[0].code.number, 3001);
+        assert!(
+            diags[0].message.contains("Boolean") && diags[0].message.contains("Field"),
+            "message names both types: {:?}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn matching_return_emits_no_diagnostic() {
+        let db = CompactDatabase::default();
+        let src = SourceText::new(
+            &db,
+            Arc::from("export circuit foo(): Boolean { return true; }"),
+        );
+        assert!(type_diagnostics_query(&db, src).is_empty());
+    }
+
+    #[test]
+    fn unknown_operand_or_expectation_suppresses() {
+        let db = CompactDatabase::default();
+        // Unknown declared type (a Uint): no rule fires yet.
+        let a = SourceText::new(
+            &db,
+            Arc::from("export circuit foo(): Uint<0..7> { return true; }"),
+        );
+        assert!(type_diagnostics_query(&db, a).is_empty());
+        // Unknown operand (numeric literal) into a modeled type: suppressed.
+        let b = SourceText::new(
+            &db,
+            Arc::from("export circuit foo(): Boolean { return 1; }"),
+        );
+        assert!(type_diagnostics_query(&db, b).is_empty());
+    }
+
+    #[test]
+    fn host_bridge_reports_return_mismatch() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/foo.compact"));
+        host.vfs_mut().set_overlay(
+            file,
+            "export circuit foo(): Field { return true; }".to_string(),
+            1,
+        );
+        let diags = host.type_diagnostics(file);
+        assert_eq!(diags.len(), 1);
     }
 }

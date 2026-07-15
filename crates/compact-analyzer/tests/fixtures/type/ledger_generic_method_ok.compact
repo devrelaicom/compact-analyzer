@@ -1,0 +1,4 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+export ledger m: Map<Uint<8>, Boolean>;
+export circuit f(): [] { m.insert(1, true); }

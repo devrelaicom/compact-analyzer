@@ -98,6 +98,52 @@ impl AnalysisHost {
         }
     }
 
+    /// Bridge accessor for the resolution dispatcher: exposes the private
+    /// `source_for` provisioner to `resolve.rs`'s host bridge under the name the
+    /// task brief uses.
+    pub(crate) fn src_of(&mut self, file: FileId) -> Option<crate::db::SourceText> {
+        self.source_for(file)
+    }
+
+    /// Borrow the salsa database, for the host bridge to hand to tracked queries
+    /// (`resolve_query`) defined in `db.rs`.
+    pub(crate) fn db_ref(&self) -> &crate::db::CompactDatabase {
+        &self.db
+    }
+
+    /// Ensures `file` and every file transitively reachable from it by `include`
+    /// are indexed, so the tracked resolution queries can read each hop's
+    /// `FileDeps` from the workspace map. The host `resolve()` bridge calls this
+    /// before dispatching: unlike the old imperative resolver (which walked the
+    /// include graph lazily off the VFS), the salsa path resolves includes
+    /// purely from pre-published `FileDeps`, so the graph must be materialized
+    /// first. Already-indexed files are left untouched (their inputs stay
+    /// current via `did_change`/watcher re-indexing); the explicit `seen` set
+    /// makes an include cycle terminate. Import (non-include) targets need no
+    /// indexing — their `SourceText` rides along in the `ResolvedDep`.
+    pub(crate) fn ensure_indexed(&mut self, file: FileId) {
+        let mut stack = vec![file];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(f) = stack.pop() {
+            if !seen.insert(f) {
+                continue;
+            }
+            if !self.dep_inputs.contains_key(&f) {
+                self.index_file(f);
+            }
+            let targets: Vec<FileId> = match self.dep_inputs.get(&f).copied() {
+                Some(fd) => fd
+                    .deps(&self.db)
+                    .iter()
+                    .filter(|d| d.is_include)
+                    .filter_map(|d| d.target.map(|(t, _)| t))
+                    .collect(),
+                None => Vec::new(),
+            };
+            stack.extend(targets);
+        }
+    }
+
     /// Access to the curated ledger-ADT method table (owned by the
     /// `ledger_adts` module, which implements the public accessors on top of
     /// this private getter).
@@ -139,9 +185,8 @@ impl AnalysisHost {
     }
 
     /// The `Workspace` singleton, provisioned empty if the stdlib was never
-    /// registered. Forward-declared here for Tasks 5-9's resolution queries,
-    /// which will read it; only exercised by this task's tests so far.
-    #[allow(dead_code)]
+    /// registered. Read by the host `resolve()` bridge and the tracked
+    /// resolution queries.
     pub(crate) fn workspace(&mut self) -> crate::db::Workspace {
         if let Some(ws) = self.workspace_input {
             return ws;
@@ -313,9 +358,7 @@ impl AnalysisHost {
 
     /// The `FileDeps` salsa input for `file`, provisioned empty if `file` was
     /// never indexed (e.g. it was only resolved as someone else's dep target).
-    /// Forward-declared here for Tasks 5-9's resolution queries, which will
-    /// read it; only exercised by this task's tests so far.
-    #[allow(dead_code)]
+    /// Read by the host `resolve()` bridge and the tracked resolution queries.
     pub(crate) fn file_deps(&mut self, file: FileId) -> crate::db::FileDeps {
         if let Some(fd) = self.dep_inputs.get(&file).copied() {
             return fd;

@@ -415,6 +415,338 @@ pub(crate) fn resolve_external_module_member(
     })
 }
 
+/// Tracked top-level resolution dispatcher: the salsa port of
+/// `AnalysisHost::resolve`. Classifies the token at `offset` by its parent CST
+/// kind (there is no reference node in the Compact CST) and routes to the
+/// matching arm. Pure — every cross-file target arrives via `fd`/`ws`; the host
+/// bridge (`AnalysisHost::resolve`) provisions those inputs (indexing the file
+/// and its transitive includes) before calling in.
+#[salsa::tracked(returns(clone))]
+pub fn resolve_query(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    offset: text_size::TextSize,
+) -> Option<crate::Definition> {
+    use compactp_syntax::SyntaxKind;
+    let green = crate::db::parsed(db, src).green;
+    let root = compactp_syntax::SyntaxNode::new_root(green);
+    let token = crate::resolve::ident_at_offset(&root, offset)?;
+    let name = token.text().to_string();
+    let parent = token.parent()?;
+
+    match parent.kind() {
+        // Definition sites resolve to themselves. Shorthand `{a}` binds `a`;
+        // `name: pat` labels a field — both hit the pattern-site early return.
+        SyntaxKind::IDENT_PAT | SyntaxKind::STRUCT_PAT_FIELD => {
+            return crate::resolve::local_from_pattern_site(file, &token);
+        }
+        SyntaxKind::FOR_STMT => {
+            return Some(crate::Definition::Local {
+                file,
+                name: name.clone(),
+                name_range: token.text_range(),
+                detail: format!("for {name}"),
+            });
+        }
+        SyntaxKind::GENERIC_PARAM => {
+            return Some(crate::resolve::generic_definition(file, &parent, &token));
+        }
+        _ => {}
+    }
+
+    // Names of item declarations resolve to the item itself.
+    if let Some(def) = item_declaration_at(db, file, src, &parent, &token) {
+        return Some(def);
+    }
+
+    match parent.kind() {
+        SyntaxKind::NAME_EXPR
+        | SyntaxKind::CALL_EXPR
+        | SyntaxKind::TYPE_REF
+        | SyntaxKind::STRUCT_EXPR
+        | SyntaxKind::TYPE_SIZE => resolve_name_at(db, file, src, fd, ws, &root, offset, &name),
+        SyntaxKind::STRUCT_FIELD_INIT => {
+            resolve_struct_literal_field(db, file, src, fd, ws, &root, &parent, &name)
+        }
+        SyntaxKind::MEMBER_EXPR => resolve_member(db, file, src, fd, ws, &root, &parent, &name),
+        SyntaxKind::IMPORT_SPECIFIER => resolve_import_specifier(db, file, src, ws, &parent, &name),
+        _ => None,
+    }
+}
+
+/// Tracked entry point for "resolve `name` as if referenced at `offset`",
+/// independent of whatever token actually sits at `offset`. Used by rename's
+/// per-use-site conflict check (via the `AnalysisHost::resolve_name_at`
+/// bridge); the top-level dispatcher calls the inner `resolve_name_at` helper
+/// directly.
+#[salsa::tracked(returns(clone))]
+pub fn resolve_name_query(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    offset: text_size::TextSize,
+    name: String,
+) -> Option<crate::Definition> {
+    let green = crate::db::parsed(db, src).green;
+    let root = compactp_syntax::SyntaxNode::new_root(green);
+    resolve_name_at(db, file, src, fd, ws, &root, offset, &name)
+}
+
+/// Resolves `name` as if referenced at `offset`: locals first (nearest scope
+/// wins), then file scope + imports (the tracked `resolve_in_file`). Port of
+/// `AnalysisHost::resolve_name_at`.
+#[allow(clippy::too_many_arguments)]
+fn resolve_name_at(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    root: &compactp_syntax::SyntaxNode,
+    offset: text_size::TextSize,
+    name: &str,
+) -> Option<crate::Definition> {
+    if let Some(local) = crate::resolve::resolve_local_name(file, root, offset, name) {
+        return Some(local);
+    }
+    resolve_in_file(db, file, src, fd, ws, offset, name.to_string())
+}
+
+/// Struct-literal field label: resolve the struct name (from its own position),
+/// then find the matching `StructField` child. Port of
+/// `AnalysisHost::resolve_struct_literal_field`.
+#[allow(clippy::too_many_arguments)]
+fn resolve_struct_literal_field(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    root: &compactp_syntax::SyntaxNode,
+    field_init: &compactp_syntax::SyntaxNode,
+    name: &str,
+) -> Option<crate::Definition> {
+    let struct_expr = field_init
+        .ancestors()
+        .find(|n| n.kind() == compactp_syntax::SyntaxKind::STRUCT_EXPR)
+        .and_then(compactp_ast::expr::StructExpr::cast)?;
+    let struct_name = struct_expr.name()?.text().to_string();
+    let struct_off = struct_expr.syntax().text_range().start();
+    let struct_def = resolve_name_at(db, file, src, fd, ws, root, struct_off, &struct_name)?;
+    field_of(
+        db,
+        &struct_def,
+        crate::SymbolKind::StructField,
+        name,
+        file,
+        src,
+        fd,
+        ws,
+    )
+}
+
+/// Member access: the only syntactically decidable case is a `NAME_EXPR`
+/// receiver resolving to an enum → the member is a variant. Everything else
+/// (ledger ADT methods, struct field access) needs types → None. Port of
+/// `AnalysisHost::resolve_member`.
+#[allow(clippy::too_many_arguments)]
+fn resolve_member(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    root: &compactp_syntax::SyntaxNode,
+    member: &compactp_syntax::SyntaxNode,
+    name: &str,
+) -> Option<crate::Definition> {
+    let receiver = member
+        .children()
+        .find(|n| n.kind() == compactp_syntax::SyntaxKind::NAME_EXPR)
+        .and_then(compactp_ast::expr::NameExpr::cast)?;
+    let receiver_name = receiver.ident()?.text().to_string();
+    let receiver_off = receiver.syntax().text_range().start();
+    let receiver_def = resolve_name_at(db, file, src, fd, ws, root, receiver_off, &receiver_name)?;
+    let crate::Definition::Item { file: rfile, index } = &receiver_def else {
+        return None;
+    };
+    let rsrc = source_text_for(db, *rfile, file, src, fd, ws)?;
+    let tree = item_tree(db, rsrc);
+    if tree.symbols[*index as usize].kind != crate::SymbolKind::Enum {
+        return None;
+    }
+    field_of(
+        db,
+        &receiver_def,
+        crate::SymbolKind::EnumVariant,
+        name,
+        file,
+        src,
+        fd,
+        ws,
+    )
+}
+
+/// Import specifier: only the ORIGINAL name in `import { orig as alias }` is a
+/// reference into the imported module (the alias is a binding). Resolve it
+/// through this import, bypassing the specifier's own alias filtering. Port of
+/// `AnalysisHost::resolve_import_specifier`.
+fn resolve_import_specifier(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    ws: Workspace,
+    specifier: &compactp_syntax::SyntaxNode,
+    name: &str,
+) -> Option<crate::Definition> {
+    let spec = compactp_ast::ImportSpecifier::cast(specifier.clone())?;
+    let original = spec.name()?;
+    if original.text() != name {
+        return None;
+    }
+    let import = specifier
+        .ancestors()
+        .find(|n| n.kind() == compactp_syntax::SyntaxKind::IMPORT)
+        .and_then(compactp_ast::Import::cast)?;
+    let tree = item_tree(db, src);
+    match import.name() {
+        Some(t) if t.text() == "CompactStandardLibrary" => {
+            let (std_file, std_src) = ws.stdlib(db)?;
+            let std_tree = item_tree(db, std_src);
+            let (idx, _) = std_tree
+                .top_level()
+                .find(|(_, s)| s.exported && s.name == name)?;
+            Some(crate::Definition::Item {
+                file: std_file,
+                index: idx,
+            })
+        }
+        Some(t) => {
+            let (module_idx, _) = tree
+                .top_level()
+                .find(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == t.text())?;
+            let (idx, _) = tree
+                .children_of(module_idx)
+                .find(|(_, s)| s.exported && s.name == name)?;
+            Some(crate::Definition::Item { file, index: idx })
+        }
+        None => None,
+    }
+}
+
+/// If `token` names an item declaration in `src`, return that item. Port of
+/// `AnalysisHost::item_declaration_at`.
+fn item_declaration_at(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    parent: &compactp_syntax::SyntaxNode,
+    token: &compactp_syntax::SyntaxToken,
+) -> Option<crate::Definition> {
+    use compactp_syntax::SyntaxKind;
+    let is_decl_kind = matches!(
+        parent.kind(),
+        SyntaxKind::CIRCUIT_DEF
+            | SyntaxKind::CIRCUIT_DECL
+            | SyntaxKind::WITNESS_DECL
+            | SyntaxKind::LEDGER_DECL
+            | SyntaxKind::STRUCT_DEF
+            | SyntaxKind::STRUCT_FIELD
+            | SyntaxKind::ENUM_DEF
+            | SyntaxKind::ENUM_VARIANT
+            | SyntaxKind::MODULE_DEF
+            | SyntaxKind::TYPE_DECL
+            | SyntaxKind::CONTRACT_DECL
+            | SyntaxKind::CONTRACT_CIRCUIT
+    );
+    if !is_decl_kind {
+        return None;
+    }
+    let tree = item_tree(db, src);
+    let range = token.text_range();
+    let index = tree.symbols.iter().position(|s| s.name_range == range)?;
+    Some(crate::Definition::Item {
+        file,
+        index: index as u32,
+    })
+}
+
+/// Child symbol of `parent_def` with the given kind and name. Port of
+/// `AnalysisHost::field_of`; the target file's `item_tree` is read via
+/// [`source_text_for`] rather than the host's `analyze`.
+#[allow(clippy::too_many_arguments)]
+fn field_of(
+    db: &dyn Db,
+    parent_def: &crate::Definition,
+    kind: crate::SymbolKind,
+    name: &str,
+    this_file: crate::FileId,
+    this_src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+) -> Option<crate::Definition> {
+    let crate::Definition::Item { file, index } = parent_def else {
+        return None;
+    };
+    let psrc = source_text_for(db, *file, this_file, this_src, fd, ws)?;
+    let tree = item_tree(db, psrc);
+    let (idx, _) = tree
+        .children_of(*index)
+        .find(|(_, s)| s.kind == kind && s.name == name)?;
+    Some(crate::Definition::Item {
+        file: *file,
+        index: idx,
+    })
+}
+
+/// Maps a `FileId` reachable from the resolution context back to its
+/// `SourceText`. The host's `analyze(file)` reads any file via the VFS; a
+/// tracked arm has no VFS, so it recovers a target's `SourceText` from the
+/// inputs at hand: the current file (`this_src`), `ws.stdlib`, this file's
+/// resolved deps, or — for a transitively-included file — some indexed file's
+/// resolved deps in `ws.file_deps`. Every cross-file `Definition` a resolution
+/// arm can produce carries a `FileId` whose `SourceText` is present in one of
+/// those places.
+fn source_text_for(
+    db: &dyn Db,
+    target: crate::FileId,
+    this_file: crate::FileId,
+    this_src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+) -> Option<SourceText> {
+    if target == this_file {
+        return Some(this_src);
+    }
+    if let Some((sfile, ssrc)) = ws.stdlib(db)
+        && sfile == target
+    {
+        return Some(ssrc);
+    }
+    for dep in fd.deps(db).iter() {
+        if let Some((tfile, tsrc)) = dep.target
+            && tfile == target
+        {
+            return Some(tsrc);
+        }
+    }
+    for fdep in ws.file_deps(db).values() {
+        for dep in fdep.deps(db).iter() {
+            if let Some((tfile, tsrc)) = dep.target
+                && tfile == target
+            {
+                return Some(tsrc);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -102,6 +102,30 @@ fn uint_upper_le(a: Option<u128>, b: Option<u128>) -> bool {
     }
 }
 
+/// Cast legality: `true` iff `src as tgt` is accepted by the compiler's type
+/// checker (verified against compact 0.5.1 / compiler 0.31.1). Casts are far
+/// more permissive than subtyping ([`is_subtype`]) — every `Boolean`/`Field`/
+/// `Uint` pair interconverts, and `Field`/`Uint` interconvert with `Bytes` of
+/// any size. The *only* rejected casts among modeled primitives:
+///   - `Boolean` <-> `Bytes` (either direction), and
+///   - `Bytes<a>` <-> `Bytes<b>` with `a != b` (Bytes casts must preserve size).
+///
+/// `Unknown` on either side yields `true` (the checker only suppresses on an
+/// unmodeled type; it never manufactures a cast error from one). Any pair not
+/// *confirmed* illegal is treated as legal — conservative, never a false
+/// positive.
+pub(crate) fn can_cast(src: TyKind, tgt: TyKind) -> bool {
+    match (src, tgt) {
+        (TyKind::Unknown, _) | (_, TyKind::Unknown) => true,
+        // Boolean cannot cast to or from Bytes.
+        (TyKind::Boolean, TyKind::Bytes(_)) | (TyKind::Bytes(_), TyKind::Boolean) => false,
+        // Bytes-to-Bytes must preserve size.
+        (TyKind::Bytes(a), TyKind::Bytes(b)) => a == b,
+        // Every other pair among modeled primitives is castable.
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +256,29 @@ mod tests {
         // Unknown still suppresses in both directions
         assert!(is_subtype(Unknown, Bytes(32)));
         assert!(is_subtype(Bytes(32), Unknown));
+    }
+
+    #[test]
+    fn can_cast_matches_compiler() {
+        use TyKind::*;
+        // The only illegal casts among modeled primitives:
+        assert!(!can_cast(Boolean, Bytes(32))); // Boolean -> Bytes
+        assert!(!can_cast(Bytes(32), Boolean)); // Bytes -> Boolean
+        assert!(!can_cast(Bytes(32), Bytes(4))); // Bytes size change
+        assert!(!can_cast(Bytes(4), Bytes(32)));
+        // Everything else is castable:
+        assert!(can_cast(Bytes(32), Bytes(32))); // identity
+        assert!(can_cast(Boolean, Field));
+        assert!(can_cast(Field, Boolean));
+        assert!(can_cast(Boolean, Uint(Some(256))));
+        assert!(can_cast(Uint(Some(6)), Boolean));
+        assert!(can_cast(Uint(Some(6)), Bytes(32))); // Uint <-> Bytes any size
+        assert!(can_cast(Bytes(32), Uint(Some(256))));
+        assert!(can_cast(Field, Bytes(4)));
+        assert!(can_cast(Bytes(4), Field));
+        assert!(can_cast(Uint(Some(256)), Uint(Some(6)))); // Uint->Uint ignores bounds
+        // Unknown on either side -> legal (suppress).
+        assert!(can_cast(Unknown, Bytes(32)));
+        assert!(can_cast(Boolean, Unknown));
     }
 }

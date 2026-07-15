@@ -11,6 +11,7 @@
 //! no-op when no usable toolchain is found.
 
 mod compile;
+mod differential;
 mod discovery;
 mod format;
 mod locate;
@@ -18,6 +19,7 @@ mod parse;
 mod process;
 
 pub use compile::{CompileOutcome, CompileStatus, compile_file};
+pub use differential::{CompilerVerdict, classify};
 pub use discovery::Toolchain;
 pub use format::format_source;
 pub use locate::locate;

@@ -1,7 +1,8 @@
 //! Type inference (foundation slice) + type diagnostics.
 //!
 //! The inference entry point is `infer_circuit_returns`: one tracked query per
-//! circuit body, typing the primitive-literal operand of each `return`. It
+//! circuit body, typing each `return` operand the checker models (a primitive
+//! literal — `Boolean`/`Uint`/`Field` — or a cast, typed as its target). It
 //! reads `item_tree`/`parsed` directly (single-file typing) — no resolution
 //! queries are needed for the slice. The universe of expressions it types
 //! grows one rule at a time. Incrementality is file-granular at the foundation
@@ -15,7 +16,7 @@ use compactp_ast::AstNode;
 use compactp_diagnostics::{Diagnostic, DiagnosticCode};
 
 use crate::db::{Db, SourceText, item_tree, parsed};
-use crate::ty::{Ty, TyKind, is_subtype, ty_display};
+use crate::ty::{Ty, TyKind, can_cast, is_subtype, ty_display};
 
 /// Lower a CST `Type` node to a `TyKind`. Only the primitives the foundation
 /// models map to a concrete kind; everything else is `Unknown`.
@@ -28,6 +29,7 @@ pub(crate) fn type_node_kind(ty: &compactp_ast::Type) -> TyKind {
         Type::Boolean(_) => TyKind::Boolean,
         Type::Field(_) => TyKind::Field,
         Type::Uint(u) => uint_bound(u),
+        Type::Bytes(b) => bytes_size(b),
         _ => TyKind::Unknown,
     }
 }
@@ -81,6 +83,21 @@ fn uint_bound(u: &compactp_ast::UintType) -> TyKind {
     }
 }
 
+/// Lower a `Bytes<n>` annotation to `TyKind::Bytes(n)`. Byte counts are small,
+/// so the length is a `u32`; a non-literal size (a generic numeric parameter)
+/// or one overflowing `u32` lowers to `Unknown` (conservatively suppresses —
+/// corpus-safe, since accepted files with a concrete `Bytes<n>` always have a
+/// literal, small `n`). Reuses `parse_int_literal` (decimal/hex/octal/binary).
+fn bytes_size(b: &compactp_ast::BytesType) -> TyKind {
+    match b
+        .size()
+        .and_then(|s| parse_int_literal(&s.syntax().text().to_string()))
+    {
+        Some(n) if n <= u32::MAX as u128 => TyKind::Bytes(n as u32),
+        _ => TyKind::Unknown,
+    }
+}
+
 /// The `TyKind` of a literal expression. `true`/`false` -> `Boolean`; a decimal,
 /// hex, octal, or binary integer literal `n` -> `TyKind::Uint(Some(n+1))` (the
 /// minimal range `[0, n]`), or `Uint(None)` when `n+1` overflows `u128`; other
@@ -110,6 +127,57 @@ fn literal_ty_kind(lit: &compactp_ast::expr::LiteralExpr) -> TyKind {
         return TyKind::Uint(bound);
     }
     TyKind::Unknown
+}
+
+/// The result `TyKind` of an expression the checker models: a primitive
+/// literal (its own type), or a cast `e as T` (its *target* type `T`, per the
+/// extracted rule — a cast's result is exactly its annotation, independent of
+/// the operand). Any other expression -> `Unknown` (suppresses). Cast operands
+/// nest naturally (an `(e as A) as B` types to `B`).
+fn expr_ty_kind(expr: &compactp_ast::expr::Expr) -> TyKind {
+    use compactp_ast::expr::Expr;
+    match expr {
+        Expr::Literal(lit) => literal_ty_kind(lit),
+        Expr::Cast(cast) => cast
+            .ty()
+            .map(|t| type_node_kind(&t))
+            .unwrap_or(TyKind::Unknown),
+        _ => TyKind::Unknown,
+    }
+}
+
+/// If `cast` is an `src as tgt` the checker can attribute as **illegal**,
+/// returns `(src, tgt)` for the diagnostic. The operand's source type must be
+/// known — a primitive-literal or (nested) cast operand is typed here (a
+/// parameter / local / arbitrary expression types to `Unknown`, and
+/// `can_cast(Unknown, _)` is
+/// `true`, so it suppresses). The operand is the `CAST_EXPR`'s `Expr` child
+/// (the target `Type` child does not cast to `Expr`).
+fn cast_error(cast: &compactp_ast::expr::CastExpr) -> Option<(TyKind, TyKind)> {
+    let tgt = type_node_kind(&cast.ty()?);
+    let operand = cast
+        .syntax()
+        .children()
+        .find_map(compactp_ast::expr::Expr::cast)?;
+    let src = expr_ty_kind(&operand);
+    (!can_cast(src, tgt)).then_some((src, tgt))
+}
+
+/// The illegal-cast diagnostic (`E3002`). Wording tracks compactc's
+/// ("cannot cast from type X to type Y"); wording is not gated by the harness.
+fn cast_error_diag(
+    db: &dyn Db,
+    src: TyKind,
+    tgt: TyKind,
+    span: text_size::TextRange,
+) -> Diagnostic {
+    let src = ty_display(db, Ty::new(db, src));
+    let tgt = ty_display(db, Ty::new(db, tgt));
+    Diagnostic::error(
+        DiagnosticCode::new("E", 3002),
+        format!("cannot cast from type {src} to type {tgt}"),
+        span,
+    )
 }
 
 /// The `CircuitDef` CST node for the circuit at item-tree index `index`, found
@@ -158,12 +226,24 @@ fn circuit_node_map(db: &dyn Db, src: SourceText) -> Vec<(u32, compactp_ast::Cir
         .collect()
 }
 
-/// Types the primitive-literal operand of each `return` in a circuit body:
-/// `(return-statement range, TyKind)`. The shared core of the inference entry
-/// point and the diagnostics query — both call this on an already-located
-/// `CircuitDef`, so the file's green tree is walked once per consumer, not once
-/// per circuit.
-fn circuit_return_kinds(circuit: &compactp_ast::CircuitDef) -> Vec<(text_size::TextRange, TyKind)> {
+/// One `return` operand the checker models: its span, its result type, and —
+/// when the operand is an illegal cast the checker can attribute — the
+/// `(src, tgt)` of that cast. Both the inference entry point and the
+/// diagnostics query read this single per-body walk (preserving the v2b.3
+/// one-walk property).
+struct ReturnTy {
+    span: text_size::TextRange,
+    /// Result type of the operand (a cast's result is its target type).
+    kind: TyKind,
+    /// `Some((src, tgt))` iff the operand is an illegal `src as tgt` cast with
+    /// a known (literal) source. The return-lattice check is skipped for such
+    /// operands — compactc reports only the cast error.
+    cast_error: Option<(TyKind, TyKind)>,
+}
+
+/// Types each `return` operand the checker models (primitive literals and
+/// casts) in a circuit body. One green-tree walk per consumer.
+fn circuit_returns(circuit: &compactp_ast::CircuitDef) -> Vec<ReturnTy> {
     let Some(body) = circuit.body() else {
         return Vec::new();
     };
@@ -172,19 +252,33 @@ fn circuit_return_kinds(circuit: &compactp_ast::CircuitDef) -> Vec<(text_size::T
         let compactp_ast::Stmt::Return(ret) = stmt else {
             continue;
         };
-        let Some(compactp_ast::expr::Expr::Literal(lit)) = ret.value() else {
+        let Some(value) = ret.value() else {
             continue;
         };
-        out.push((ret.syntax().text_range(), literal_ty_kind(&lit)));
+        let cast_error = match &value {
+            compactp_ast::expr::Expr::Cast(cast) => cast_error(cast),
+            _ => None,
+        };
+        // Only model literals and casts; skip operands the checker can't type.
+        if matches!(
+            value,
+            compactp_ast::expr::Expr::Literal(_) | compactp_ast::expr::Expr::Cast(_)
+        ) {
+            out.push(ReturnTy {
+                span: ret.syntax().text_range(),
+                kind: expr_ty_kind(&value),
+                cast_error,
+            });
+        }
     }
     out
 }
 
 /// Inference entry point for one circuit body: `(return-statement range,
-/// TyKind)` for each `return` whose operand is a primitive literal the checker
-/// can type. Carries the `'static` `TyKind` (not `Ty<'db>`): salsa forbids a
-/// tracked return of `Arc<[(_, Ty<'db>)]>`. `Ty` is interned downstream, at the
-/// display boundary.
+/// TyKind)` for each `return` whose operand is a primitive literal or cast the
+/// checker can type. Carries the `'static` `TyKind` (not `Ty<'db>`): salsa
+/// forbids a tracked return of `Arc<[(_, Ty<'db>)]>`. `Ty` is interned
+/// downstream, at the display boundary.
 #[salsa::tracked(returns(clone))]
 pub fn infer_circuit_returns(
     db: &dyn Db,
@@ -194,14 +288,22 @@ pub fn infer_circuit_returns(
     let Some(circuit) = circuit_node_by_index(db, src, circuit_index) else {
         return Arc::from(Vec::new());
     };
-    Arc::from(circuit_return_kinds(&circuit))
+    Arc::from(
+        circuit_returns(&circuit)
+            .into_iter()
+            .map(|r| (r.span, r.kind))
+            .collect::<Vec<_>>(),
+    )
 }
 
-/// Type diagnostics for `src` (foundation rule: primitive-literal return
-/// mismatch). For each circuit with a declared return type the foundation
-/// models (`Boolean`/`Field`), every primitive-literal `return` operand whose
-/// `Ty` differs from the declared type yields one diagnostic. An `Unknown`
-/// declared type or operand suppresses the rule (never a false positive).
+/// Type diagnostics for `src`: an illegal-cast return operand (`E3002`), and
+/// a return-mismatch (`E3001`) against a declared return type the checker
+/// models (`Boolean`/`Field`/`Uint`/`Bytes`). For each circuit, every `return`
+/// operand the checker can type (a primitive literal or a cast) is checked in
+/// turn: an illegal cast is reported on its own; otherwise a mismatch between
+/// the operand's type and the declared return type fires. An `Unknown`
+/// declared type or operand suppresses the corresponding rule (never a false
+/// positive).
 ///
 /// `no_eq`: `Diagnostic` (external crate) has no `PartialEq`, so
 /// `Arc<[Diagnostic]>` can't be compared for backdating — same rationale and
@@ -215,13 +317,18 @@ pub fn type_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnostic]>
             .return_type()
             .map(|t| type_node_kind(&t))
             .unwrap_or(TyKind::Unknown);
-        if declared == TyKind::Unknown {
-            continue; // only fire on return types the checker models
-        }
         let name = &tree.symbols[idx as usize].name;
-        for (range, kind) in circuit_return_kinds(&circuit) {
-            if !is_subtype(kind, declared) {
-                diags.push(return_mismatch_diag(db, kind, declared, name, range));
+        for ret in circuit_returns(&circuit) {
+            // An illegal cast is reported on its own (compactc reports only the
+            // cast error) and suppresses the return-mismatch for that operand —
+            // regardless of whether the declared return type is modeled.
+            if let Some((s, t)) = ret.cast_error {
+                diags.push(cast_error_diag(db, s, t, ret.span));
+                continue;
+            }
+            // Return-mismatch only fires on a return type the checker models.
+            if declared != TyKind::Unknown && !is_subtype(ret.kind, declared) {
+                diags.push(return_mismatch_diag(db, ret.kind, declared, name, ret.span));
             }
         }
     }
@@ -450,6 +557,47 @@ mod tests {
     }
 
     #[test]
+    fn bytes_annotation_lowers_to_size() {
+        let db = CompactDatabase::default();
+        // Bytes<32> -> Bytes(32)
+        let a = SourceText::new(&db, Arc::from("export circuit f(): Bytes<32> { }"));
+        let ia = circuit_index(&db, a, "f");
+        let ca = circuit_node_by_index(&db, a, ia).unwrap();
+        assert_eq!(
+            type_node_kind(&ca.return_type().unwrap()),
+            TyKind::Bytes(32)
+        );
+        // Bytes<1>
+        let b = SourceText::new(&db, Arc::from("export circuit f(): Bytes<1> { }"));
+        let ib = circuit_index(&db, b, "f");
+        let cb = circuit_node_by_index(&db, b, ib).unwrap();
+        assert_eq!(type_node_kind(&cb.return_type().unwrap()), TyKind::Bytes(1));
+        // Generic/non-literal size -> Unknown (suppresses; not our diagnostic)
+        let c = SourceText::new(&db, Arc::from("export circuit f(): Bytes<N> { }"));
+        let ic = circuit_index(&db, c, "f");
+        let cc = circuit_node_by_index(&db, c, ic).unwrap();
+        assert_eq!(type_node_kind(&cc.return_type().unwrap()), TyKind::Unknown);
+    }
+
+    #[test]
+    fn uint_literal_into_bytes_return_rejects() {
+        let db = CompactDatabase::default();
+        // return 5 (Uint<0..6>) into Bytes<32>: Uint not <: Bytes -> one diagnostic
+        // (matches compactc: "mismatch ... actual Uint<0..6> ... declared Bytes<32>").
+        let src = SourceText::new(
+            &db,
+            Arc::from("export circuit f(): Bytes<32> { return 5; }"),
+        );
+        let diags = type_diagnostics_query(&db, src);
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("Uint<0..6>") && diags[0].message.contains("Bytes<32>"),
+            "message uses normalized display: {:?}",
+            diags[0].message
+        );
+    }
+
+    #[test]
     fn unknown_operand_or_expectation_suppresses() {
         let db = CompactDatabase::default();
         // Boolean literal into a Uint return: rejects (Boolean </: Uint).
@@ -465,10 +613,10 @@ mod tests {
             Arc::from("export circuit foo(): Boolean { return 1; }"),
         );
         assert_eq!(type_diagnostics_query(&db, b).len(), 1);
-        // A return type the checker does not model (Bytes) still suppresses.
+        // A return type the checker does not model (Vector) still suppresses.
         let c = SourceText::new(
             &db,
-            Arc::from("export circuit foo(): Bytes<32> { return true; }"),
+            Arc::from("export circuit foo(): Vector<3, Field> { return true; }"),
         );
         assert!(type_diagnostics_query(&db, c).is_empty());
     }
@@ -490,6 +638,96 @@ mod tests {
             "diagnostic names the right circuit: {:?}",
             diags[0].message
         );
+    }
+
+    #[test]
+    fn cast_return_types_to_target() {
+        let db = CompactDatabase::default();
+        // x as Uint<8> -> result type Uint<8> (exclusive upper 256), regardless of operand.
+        let a = SourceText::new(
+            &db,
+            Arc::from("export circuit f(x: Field): Field { return x as Uint<8>; }"),
+        );
+        let ia = circuit_index(&db, a, "f");
+        assert_eq!(
+            infer_circuit_returns(&db, a, ia)[0].1,
+            TyKind::Uint(Some(256))
+        );
+        // x as Bytes<32> -> result type Bytes(32).
+        let b = SourceText::new(
+            &db,
+            Arc::from("export circuit f(x: Field): Bytes<32> { return x as Bytes<32>; }"),
+        );
+        let ib = circuit_index(&db, b, "f");
+        assert_eq!(infer_circuit_returns(&db, b, ib)[0].1, TyKind::Bytes(32));
+    }
+
+    #[test]
+    fn cast_flows_through_return_lattice() {
+        let db = CompactDatabase::default();
+        // Cast into a WIDER Uint: Uint<8> <: Uint<16> -> accept.
+        let ok = SourceText::new(
+            &db,
+            Arc::from("export circuit f(x: Field): Uint<16> { return x as Uint<8>; }"),
+        );
+        assert!(type_diagnostics_query(&db, ok).is_empty());
+        // Cast into a NARROWER Uint: Uint<8> not <: Uint<0..10> -> reject.
+        let bad = SourceText::new(
+            &db,
+            Arc::from("export circuit f(x: Field): Uint<0..10> { return x as Uint<8>; }"),
+        );
+        let diags = type_diagnostics_query(&db, bad);
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("Uint<8>") && diags[0].message.contains("Uint<0..10>"),
+            "message: {:?}",
+            diags[0].message
+        );
+        // Legal same-size Bytes cast into a DIFFERENT-size Bytes return: reject
+        // (cast is legal identity -> Bytes<4>; Bytes<4> not <: Bytes<32>).
+        let bytes = SourceText::new(
+            &db,
+            Arc::from("export circuit f(x: Bytes<4>): Bytes<32> { return x as Bytes<4>; }"),
+        );
+        assert_eq!(type_diagnostics_query(&db, bytes).len(), 1);
+    }
+
+    #[test]
+    fn illegal_cast_from_literal_emits_diagnostic() {
+        let db = CompactDatabase::default();
+        // true as Bytes<32>: Boolean -> Bytes is illegal -> E3002.
+        let src = SourceText::new(
+            &db,
+            Arc::from("export circuit f(): Bytes<32> { return true as Bytes<32>; }"),
+        );
+        let diags = type_diagnostics_query(&db, src);
+        assert_eq!(diags.len(), 1, "one cast error");
+        assert_eq!(diags[0].code.prefix, "E");
+        assert_eq!(diags[0].code.number, 3002);
+        assert!(
+            diags[0].message.contains("cannot cast")
+                && diags[0].message.contains("Boolean")
+                && diags[0].message.contains("Bytes<32>"),
+            "message: {:?}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn legal_literal_casts_emit_nothing() {
+        let db = CompactDatabase::default();
+        // Uint literal casts are all legal; Boolean -> non-Bytes is legal.
+        for code in [
+            "export circuit f(): Bytes<32> { return 5 as Bytes<32>; }", // Uint -> Bytes ok
+            "export circuit f(): Boolean { return 5 as Boolean; }",     // Uint -> Boolean ok
+            "export circuit f(): Uint<8> { return true as Uint<8>; }",  // Boolean -> Uint ok
+        ] {
+            let src = SourceText::new(&db, Arc::from(code));
+            assert!(
+                type_diagnostics_query(&db, src).is_empty(),
+                "expected no diagnostic for: {code}"
+            );
+        }
     }
 
     #[test]

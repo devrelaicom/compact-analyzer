@@ -90,6 +90,41 @@ const FIXTURES: &[Fixture] = &[
         native_rejects: true,
         rule: "uint-lattice",
     },
+    Fixture {
+        name: "cast_into_wider_uint_ok.compact",
+        native_rejects: false,
+        rule: "cast-primitives",
+    },
+    Fixture {
+        name: "cast_into_narrower_uint.compact",
+        native_rejects: true,
+        rule: "cast-primitives",
+    },
+    Fixture {
+        name: "cast_bytes_into_field_ok.compact",
+        native_rejects: false,
+        rule: "cast-primitives",
+    },
+    Fixture {
+        name: "illegal_cast_bool_to_bytes.compact",
+        native_rejects: true,
+        rule: "cast-primitives",
+    },
+    Fixture {
+        name: "bytes_return_ok.compact",
+        native_rejects: false,
+        rule: "cast-primitives",
+    },
+    Fixture {
+        name: "bytes_return_size_mismatch.compact",
+        native_rejects: true,
+        rule: "cast-primitives",
+    },
+    Fixture {
+        name: "uint_literal_into_bytes.compact",
+        native_rejects: true,
+        rule: "cast-primitives",
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

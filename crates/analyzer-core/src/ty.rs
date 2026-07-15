@@ -29,6 +29,11 @@ pub enum TyKind {
     /// compares it conservatively (never a false positive). `Uint<k>` and
     /// `Uint<lo..hi>` both lower to this single canonical form.
     Uint(Option<u128>),
+    /// A `Bytes<n>` byte array of length `n`. Implicitly assignable only to
+    /// `Bytes<n>` of the *same* length (see [`is_subtype`]); castable per
+    /// [`can_cast`]. Byte counts are small, so the length is a `u32`; a
+    /// non-literal or overflowing size lowers to `Unknown` upstream.
+    Bytes(u32),
 }
 
 /// A salsa-interned type id. Under `#[salsa::interned]` this is `Ty<'db>` with
@@ -59,6 +64,7 @@ pub fn ty_display(db: &dyn Db, ty: Ty) -> String {
             format!("Uint<0..{hi}>")
         }
         TyKind::Uint(None) => "Uint<0..?>".to_string(),
+        TyKind::Bytes(n) => format!("Bytes<{n}>"),
     }
 }
 
@@ -75,7 +81,10 @@ pub(crate) fn is_subtype(sub: TyKind, sup: TyKind) -> bool {
         (TyKind::Uint(_), TyKind::Field) => true,
         // Uint<0..a> <: Uint<0..b> iff a <= b (range containment).
         (TyKind::Uint(a), TyKind::Uint(b)) => uint_upper_le(a, b),
-        // Everything else (Boolean/Field/Uint cross, Field->Uint) is unrelated.
+        // Bytes<n> <: Bytes<m> iff n == m; Bytes is unrelated to all else.
+        (TyKind::Bytes(a), TyKind::Bytes(b)) => a == b,
+        // Everything else (Boolean/Field/Uint cross, Field->Uint, Bytes
+        // cross-kind) is unrelated.
         _ => false,
     }
 }
@@ -91,6 +100,30 @@ fn uint_upper_le(a: Option<u128>, b: Option<u128>) -> bool {
         (Some(_), None) => true,  // concrete < 2^128 <= huge
         (None, Some(_)) => false, // huge >= 2^128 > concrete
         (None, None) => true,     // undecidable -> conservative accept
+    }
+}
+
+/// Cast legality: `true` iff `src as tgt` is accepted by the compiler's type
+/// checker (verified against compact 0.5.1 / compiler 0.31.1). Casts are far
+/// more permissive than subtyping ([`is_subtype`]) — every `Boolean`/`Field`/
+/// `Uint` pair interconverts, and `Field`/`Uint` interconvert with `Bytes` of
+/// any size. The *only* rejected casts among modeled primitives:
+///   - `Boolean` <-> `Bytes` (either direction), and
+///   - `Bytes<a>` <-> `Bytes<b>` with `a != b` (Bytes casts must preserve size).
+///
+/// `Unknown` on either side yields `true` (the checker only suppresses on an
+/// unmodeled type; it never manufactures a cast error from one). Any pair not
+/// *confirmed* illegal is treated as legal — conservative, never a false
+/// positive.
+pub(crate) fn can_cast(src: TyKind, tgt: TyKind) -> bool {
+    match (src, tgt) {
+        (TyKind::Unknown, _) | (_, TyKind::Unknown) => true,
+        // Boolean cannot cast to or from Bytes.
+        (TyKind::Boolean, TyKind::Bytes(_)) | (TyKind::Bytes(_), TyKind::Boolean) => false,
+        // Bytes-to-Bytes must preserve size.
+        (TyKind::Bytes(a), TyKind::Bytes(b)) => a == b,
+        // Every other pair among modeled primitives is castable.
+        _ => true,
     }
 }
 
@@ -160,6 +193,22 @@ mod tests {
     }
 
     #[test]
+    fn bytes_display_and_interning() {
+        let db = CompactDatabase::default();
+        assert_eq!(
+            ty_display(&db, Ty::new(&db, TyKind::Bytes(32))),
+            "Bytes<32>"
+        );
+        assert_eq!(ty_display(&db, Ty::new(&db, TyKind::Bytes(1))), "Bytes<1>");
+        // interns by size
+        let a = Ty::new(&db, TyKind::Bytes(32));
+        let b = Ty::new(&db, TyKind::Bytes(32));
+        let c = Ty::new(&db, TyKind::Bytes(4));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
     fn subtype_lattice_matches_compiler() {
         use TyKind::*;
         // reflexive within a kind
@@ -187,5 +236,50 @@ mod tests {
         // Unknown suppresses in both directions
         assert!(is_subtype(Unknown, Field));
         assert!(is_subtype(Boolean, Unknown));
+    }
+
+    #[test]
+    fn bytes_subtype_is_same_size_only() {
+        use TyKind::*;
+        // reflexive by size
+        assert!(is_subtype(Bytes(32), Bytes(32)));
+        assert!(is_subtype(Bytes(1), Bytes(1)));
+        // different size is unrelated (both directions)
+        assert!(!is_subtype(Bytes(4), Bytes(32)));
+        assert!(!is_subtype(Bytes(32), Bytes(4)));
+        // Bytes is unrelated to every other kind
+        assert!(!is_subtype(Bytes(32), Field));
+        assert!(!is_subtype(Field, Bytes(32)));
+        assert!(!is_subtype(Bytes(32), Uint(Some(256))));
+        assert!(!is_subtype(Uint(Some(256)), Bytes(32)));
+        assert!(!is_subtype(Bytes(32), Boolean));
+        assert!(!is_subtype(Boolean, Bytes(32)));
+        // Unknown still suppresses in both directions
+        assert!(is_subtype(Unknown, Bytes(32)));
+        assert!(is_subtype(Bytes(32), Unknown));
+    }
+
+    #[test]
+    fn can_cast_matches_compiler() {
+        use TyKind::*;
+        // The only illegal casts among modeled primitives:
+        assert!(!can_cast(Boolean, Bytes(32))); // Boolean -> Bytes
+        assert!(!can_cast(Bytes(32), Boolean)); // Bytes -> Boolean
+        assert!(!can_cast(Bytes(32), Bytes(4))); // Bytes size change
+        assert!(!can_cast(Bytes(4), Bytes(32)));
+        // Everything else is castable:
+        assert!(can_cast(Bytes(32), Bytes(32))); // identity
+        assert!(can_cast(Boolean, Field));
+        assert!(can_cast(Field, Boolean));
+        assert!(can_cast(Boolean, Uint(Some(256))));
+        assert!(can_cast(Uint(Some(6)), Boolean));
+        assert!(can_cast(Uint(Some(6)), Bytes(32))); // Uint <-> Bytes any size
+        assert!(can_cast(Bytes(32), Uint(Some(256))));
+        assert!(can_cast(Field, Bytes(4)));
+        assert!(can_cast(Bytes(4), Field));
+        assert!(can_cast(Uint(Some(256)), Uint(Some(6)))); // Uint->Uint ignores bounds
+        // Unknown on either side -> legal (suppress).
+        assert!(can_cast(Unknown, Bytes(32)));
+        assert!(can_cast(Boolean, Unknown));
     }
 }

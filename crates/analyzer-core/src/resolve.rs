@@ -321,14 +321,16 @@ impl crate::AnalysisHost {
     /// The definition's name (for reference search and rename).
     pub fn def_name(&mut self, def: &Definition) -> Option<String> {
         match def {
-            Definition::Item { file, index } => Some(
-                self.analyze(*file)?
-                    .item_tree
-                    .symbols
-                    .get(*index as usize)?
-                    .name
-                    .clone(),
-            ),
+            Definition::Item { file, index } => {
+                let src = self.src_of(*file)?;
+                Some(
+                    crate::db::item_tree(self.db_ref(), src)
+                        .symbols
+                        .get(*index as usize)?
+                        .name
+                        .clone(),
+                )
+            }
             Definition::Local { name, .. } => Some(name.clone()),
         }
     }
@@ -337,9 +339,8 @@ impl crate::AnalysisHost {
     pub fn nav_info(&mut self, def: &Definition) -> Option<(FileId, TextRange, TextRange)> {
         match def {
             Definition::Item { file, index } => {
-                let sym = self
-                    .analyze(*file)?
-                    .item_tree
+                let src = self.src_of(*file)?;
+                let sym = crate::db::item_tree(self.db_ref(), src)
                     .symbols
                     .get(*index as usize)?
                     .clone();

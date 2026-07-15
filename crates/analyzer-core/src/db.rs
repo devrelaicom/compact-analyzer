@@ -940,6 +940,217 @@ pub fn generic_diagnostics_query(
     Arc::from(diags)
 }
 
+/// The ledger-call argument-mismatch diagnostic (`E3004`). Wording tracks
+/// compactc's ("expected first argument of M to have type T but received U");
+/// wording is not gated by the harness.
+fn ledger_arg_diag(
+    pos: usize,
+    method: &str,
+    expected: &str,
+    actual: &str,
+    span: text_size::TextRange,
+) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticCode::new("E", 3004),
+        format!(
+            "expected argument {} of {method} to have type {expected} but received {actual}",
+            pos + 1
+        ),
+        span,
+    )
+}
+
+/// If the identifier at `offset` resolves to a ledger field, its builtin ADT
+/// key (Counter/Map/…), or `None` when it is not a ledger field or its declared
+/// type resolves to a user-defined type (implicit Cell / not a builtin). Pure
+/// resolution-context twin of `AnalysisHost::ledger_field_adt`.
+fn ledger_adt_at(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    offset: text_size::TextSize,
+) -> Option<String> {
+    let def = resolve_query(db, file, src, fd, ws, offset)?;
+    let crate::Definition::Item { file: df, index } = def else {
+        return None;
+    };
+    let sym = item_symbol(db, file, src, fd, df, index)?;
+    if sym.kind != crate::SymbolKind::Ledger {
+        return None;
+    }
+    // Read the ledger field's declared type head from its own file.
+    let (_, dsrc) = if df == file {
+        (df, src)
+    } else {
+        fd.deps(db)
+            .iter()
+            .filter_map(|d| d.target)
+            .find(|(f, _)| *f == df)?
+    };
+    let green = crate::db::parsed(db, dsrc).green;
+    let root = compactp_syntax::SyntaxNode::new_root(green);
+    let ledger = root
+        .descendants()
+        .filter_map(compactp_ast::LedgerDecl::cast)
+        .find(|d| d.name().is_some_and(|t| t.text_range() == sym.name_range))?;
+    let head_tok = match ledger.ty()? {
+        compactp_ast::Type::Ref(r) => r.name()?,
+        _ => return None, // scalar-typed -> implicit Cell (no builtin ADT methods checked)
+    };
+    // If the head resolves to a user-defined named type, it is not a builtin
+    // ADT. Only run this check when the ledger field is in the SAME file as the
+    // call (`df == file`), where `src`/`fd` are the correct resolution inputs
+    // for `df`; a cross-file field's head would need `df`'s own `FileDeps`, and
+    // using the caller's `fd` could mis-resolve. Skipping the check cross-file
+    // is safe: emitting `E3004` requires a *builtin* ADT, which requires
+    // `import CompactStandardLibrary;`, and with that import a user type named
+    // like a builtin is a duplicate-binding compile error — so on any
+    // `compactc`-accepted file a builtin head is genuinely the builtin.
+    if df == file {
+        let head_off = head_tok.text_range().start();
+        if let Some(crate::Definition::Item {
+            file: hf,
+            index: hi,
+        }) = resolve_query(db, file, src, fd, ws, head_off)
+            && let Some(hs) = item_symbol(db, file, src, fd, hf, hi)
+            && matches!(
+                hs.kind,
+                crate::SymbolKind::Struct | crate::SymbolKind::Enum | crate::SymbolKind::TypeAlias
+            )
+        {
+            return None;
+        }
+    }
+    const KNOWN: &[&str] = &[
+        "Counter",
+        "Cell",
+        "Map",
+        "Set",
+        "List",
+        "MerkleTree",
+        "HistoricMerkleTree",
+        "Kernel",
+    ];
+    let head = head_tok.text().to_string();
+    KNOWN.contains(&head.as_str()).then_some(head)
+}
+
+/// Ledger method-call argument type checks (`E3004`) for `src`. For each method
+/// call `recv.method(args)` whose receiver resolves to a builtin-ADT ledger
+/// field and whose `method` is in that ADT's typed surface, any positional
+/// argument that is a typeable literal/cast is checked against a concretely
+/// modeled parameter type. Suppresses on every uncertainty (never a false
+/// positive). Resolution-fed like `generic_diagnostics_query`.
+#[salsa::tracked(returns(clone), no_eq)]
+pub fn ledger_call_diagnostics_query(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+) -> Arc<[Diagnostic]> {
+    use compactp_ast::AstNode;
+    let green = crate::db::parsed(db, src).green;
+    let root = compactp_syntax::SyntaxNode::new_root(green);
+    let mut diags = Vec::new();
+
+    for call in root
+        .descendants()
+        .filter_map(compactp_ast::expr::CallExpr::cast)
+    {
+        // A method call has a DOT token child; a plain call does not.
+        let Some(dot) = call
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| t.kind() == compactp_syntax::SyntaxKind::DOT)
+        else {
+            continue;
+        };
+        let dot_start = dot.text_range().start();
+        // Receiver: the Expr child ending at/before the DOT. Method name: CallExpr::name().
+        let Some(recv) = call
+            .syntax()
+            .children()
+            .filter_map(compactp_ast::expr::Expr::cast)
+            .find(|e| e.syntax().text_range().end() <= dot_start)
+        else {
+            continue;
+        };
+        // Only a bare NAME_EXPR receiver is identified; anything else -> suppress.
+        if recv.syntax().kind() != compactp_syntax::SyntaxKind::NAME_EXPR {
+            continue;
+        }
+        // Resolve at the receiver's IDENT token, NOT the node start: the parser
+        // attaches the statement's leading whitespace inside the NAME_EXPR, so
+        // the node start points at whitespace and `resolve_query`
+        // (`token_at_offset`) would fail. Mirrors `generic_diagnostics_query`,
+        // which resolves at `name_tok.text_range().start()`.
+        let Some(recv_off) = recv
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| t.kind() == compactp_syntax::SyntaxKind::IDENT)
+            .map(|t| t.text_range().start())
+        else {
+            continue;
+        };
+        let Some(method_tok) = call.name() else {
+            continue;
+        };
+        let method = method_tok.text().to_string();
+
+        let Some(adt) = ledger_adt_at(db, file, src, fd, ws, recv_off) else {
+            continue;
+        };
+        let Some(sig) = crate::ledger_adts::ledger_method_sig(&adt, &method) else {
+            continue;
+        };
+
+        // Positional argument Exprs after the L_PAREN (skip NAMED_ARG etc.).
+        let lparen_start = call
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| t.kind() == compactp_syntax::SyntaxKind::L_PAREN)
+            .map(|t| t.text_range().start());
+        let Some(lparen_start) = lparen_start else {
+            continue;
+        };
+        let args: Vec<compactp_ast::expr::Expr> = call
+            .syntax()
+            .children()
+            .filter_map(compactp_ast::expr::Expr::cast)
+            .filter(|e| e.syntax().text_range().start() >= lparen_start)
+            .collect();
+
+        for (i, arg) in args.iter().enumerate() {
+            let Some(param) = sig.params.get(i) else {
+                break;
+            };
+            if *param == crate::ty::TyKind::Unknown {
+                continue; // generic / unmodeled param -> suppress
+            }
+            let actual = crate::infer::expr_ty_kind(arg);
+            if actual == crate::ty::TyKind::Unknown {
+                continue; // non-literal/cast arg -> suppress
+            }
+            if !crate::ty::is_subtype(&actual, param) {
+                diags.push(ledger_arg_diag(
+                    i,
+                    &method,
+                    &crate::ty::display_kind(param),
+                    &crate::ty::display_kind(&actual),
+                    arg.syntax().text_range(),
+                ));
+            }
+        }
+    }
+    Arc::from(diags)
+}
+
 /// One import's diagnostic contribution: find the matching non-include
 /// `ResolvedDep` for `raw`; push the unresolved-import diagnostic if it
 /// didn't resolve, else run the module-mismatch check on the resolved

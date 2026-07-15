@@ -153,7 +153,7 @@ fn literal_ty_kind(lit: &compactp_ast::expr::LiteralExpr) -> TyKind {
 /// extracted rule — a cast's result is exactly its annotation, independent of
 /// the operand). Any other expression -> `Unknown` (suppresses). Cast operands
 /// nest naturally (an `(e as A) as B` types to `B`).
-fn expr_ty_kind(expr: &compactp_ast::expr::Expr) -> TyKind {
+pub(crate) fn expr_ty_kind(expr: &compactp_ast::expr::Expr) -> TyKind {
     use compactp_ast::expr::Expr;
     match expr {
         Expr::Literal(lit) => literal_ty_kind(lit),
@@ -402,20 +402,22 @@ fn return_mismatch_diag(
 
 impl crate::AnalysisHost {
     /// Type diagnostics for `file` (foundation: primitive-literal return
-    /// mismatch) plus generic-specialization (arity) diagnostics. Thin
-    /// bridge over the tracked `type_diagnostics_query`, mirroring
-    /// `resolution_diagnostics`, merged with `generic_diagnostics` so this
-    /// is the single type-diagnostics surface the differential harness (and,
-    /// later, the editor) consumes. Single-file typing: no `FileDeps`/
-    /// `Workspace` inputs are needed for the `type_diagnostics_query` slice.
-    /// Editor surfacing (Problems panel + toggle) is wired in v2b.final,
-    /// which consumes this method.
+    /// mismatch) plus generic-specialization (arity) diagnostics plus
+    /// ledger method-call argument-type diagnostics (`E3004`). Thin bridge
+    /// over the tracked `type_diagnostics_query`, mirroring
+    /// `resolution_diagnostics`, merged with `generic_diagnostics` and
+    /// `ledger_call_diagnostics` so this is the single type-diagnostics
+    /// surface the differential harness (and, later, the editor) consumes.
+    /// Single-file typing: no `FileDeps`/`Workspace` inputs are needed for
+    /// the `type_diagnostics_query` slice. Editor surfacing (Problems panel
+    /// + toggle) is wired in v2b.final, which consumes this method.
     pub fn type_diagnostics(&mut self, file: crate::FileId) -> Vec<Diagnostic> {
         let Some(src) = self.src_of(file) else {
             return Vec::new();
         };
         let mut diags = type_diagnostics_query(self.db_ref(), src).to_vec();
         diags.extend(self.generic_diagnostics(file));
+        diags.extend(self.ledger_call_diagnostics(file));
         diags
     }
 }
@@ -894,6 +896,66 @@ mod tests {
             diags.iter().any(|d| d.code.number == 3003),
             "expected an E3003 generic-arity diagnostic, got: {:?}",
             diags.iter().map(|d| d.code.number).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ledger_call_arg_mismatch_emits_e3004() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/lc.compact"));
+        host.vfs_mut().set_overlay(
+            file,
+            "pragma language_version >= 0.23;\nimport CompactStandardLibrary;\n\
+             export ledger c: Counter;\nexport circuit f(): [] { c.increment(true); }"
+                .to_string(),
+            1,
+        );
+        let diags = host.type_diagnostics(file);
+        assert!(
+            diags.iter().any(|d| d.code.number == 3004),
+            "expected E3004, got {:?}",
+            diags.iter().map(|d| d.code.number).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ledger_call_good_arg_and_generic_method_suppress() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        // Correct arg type -> no diagnostic.
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/ok.compact"));
+        host.vfs_mut().set_overlay(
+            file,
+            "pragma language_version >= 0.23;\nimport CompactStandardLibrary;\n\
+             export ledger c: Counter;\nexport circuit f(): [] { c.increment(1); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            host.type_diagnostics(file)
+                .iter()
+                .all(|d| d.code.number != 3004)
+        );
+
+        // Generic-parameter method (Map.insert with K/V) -> params Unknown -> suppress,
+        // even with a literal that would mismatch a concrete type.
+        let mut host2 = AnalysisHost::new();
+        let file2 = host2.vfs_mut().file_id(Path::new("/t/gen.compact"));
+        host2.vfs_mut().set_overlay(
+            file2,
+            "pragma language_version >= 0.23;\nimport CompactStandardLibrary;\n\
+             export ledger m: Map<Uint<8>, Boolean>;\nexport circuit f(): [] { m.insert(1, true); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            host2
+                .type_diagnostics(file2)
+                .iter()
+                .all(|d| d.code.number != 3004)
         );
     }
 }

@@ -61,10 +61,6 @@ impl LedgerAdtTable {
 
 /// A ledger ADT method's typed signature. Types the universe does not model
 /// (generic params `T`/`K`/`V`, library types) are `TyKind::Unknown`.
-// Wired into non-test code by the ledger method-call check (v2b.6 Task 6);
-// until then it is referenced only from tests. Remove this allow when the
-// `ledger_call_diagnostics_query` consumer lands.
-#[allow(dead_code)]
 pub struct LedgerMethodSig {
     pub params: Vec<TyKind>,
     pub ret: TyKind,
@@ -74,7 +70,6 @@ pub struct LedgerMethodSig {
 /// by synthesizing `circuit <sig> { }`, reparsing, and lowering each `Type`
 /// via `type_node_kind`. A malformed sig (no `CircuitDef`) yields an empty,
 /// `Unknown`-return signature (suppresses — the asset is authoring-checked).
-#[allow(dead_code)] // consumed by v2b.6 Task 6 (ledger call check); remove allow then
 pub(crate) fn parse_method_sig(sig: &str) -> LedgerMethodSig {
     let source = format!("circuit {sig} {{ }}");
     let result = compactp_parser::parse(&source);
@@ -106,7 +101,6 @@ pub(crate) fn parse_method_sig(sig: &str) -> LedgerMethodSig {
 
 /// The typed method surface, parsed once from the embedded JSON table:
 /// `adt -> method name -> typed signature`.
-#[allow(dead_code)] // consumed by v2b.6 Task 6 (ledger call check); remove allow then
 static SURFACES: LazyLock<
     std::collections::BTreeMap<String, std::collections::BTreeMap<String, LedgerMethodSig>>,
 > = LazyLock::new(|| {
@@ -127,7 +121,6 @@ static SURFACES: LazyLock<
 /// Typed signature for one ADT method, or `None` if the ADT or method is not
 /// in the curated surface. The curated table omits js-only / coin methods, so
 /// a `None` here must **suppress**, never emit an "unknown method" diagnostic.
-#[allow(dead_code)] // consumed by v2b.6 Task 6 (ledger call check); remove allow then
 pub(crate) fn ledger_method_sig(adt: &str, method: &str) -> Option<LedgerMethodSig> {
     let s = SURFACES.get(adt)?.get(method)?;
     Some(LedgerMethodSig {

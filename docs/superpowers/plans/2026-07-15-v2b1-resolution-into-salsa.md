@@ -802,44 +802,83 @@ git commit -m "feat(v2b.1): tracked resolution_diagnostics over FileDeps"
 
 ---
 
-## Task 10: Delete dead imperative internals; simplify the disk-probe memo; clippy
+## Task 10: Reconcile `resolution_diagnostics` onto the persisted `FileDeps`; delete the dead disk-probe memo; clippy
 
-With resolution reading `FileDeps`, the resolver no longer calls `cached_source_pathname`. Confirm its only remaining caller is `index_file`'s publish pass, and decide the `source_path_cache`'s fate: `index_file` currently calls `find_source_pathname` **directly** (uncached), so `cached_source_pathname` + `source_path_cache` + `source_path_cache_generation` + their three invalidation hooks are now **dead** and are deleted. (The per-index probe cost is unchanged from today — `index_file` was already uncached.)
+> **Re-scoped during execution (Task 9 divergence).** Task 9's `resolution_diagnostics` bridge did NOT use the persisted `FileDeps`; it rebuilt a *transient* `FileDeps` per call via `cached_source_pathname` (to keep the pre-existing "CR-3" memo tests green). That kept `cached_source_pathname` alive (so it is NOT dead yet) and creates a fresh salsa input per call (no cross-call memo + a slow input leak). This task **reconciles** that bridge onto the same `ensure_indexed` + `file_deps` path `resolve()` uses (Task 7), which restores memoization, ends the leak, and finally makes `cached_source_pathname` genuinely dead — then deletes it and the now-obsolete CR-3 tests.
 
 **Files:**
-- Modify: `crates/analyzer-core/src/analysis.rs` (delete `cached_source_pathname`, `source_path_cache*` fields + hooks; `forget_file`/`set_import_search_path` lose their cache-clear lines but keep `sources`/`dep_inputs` cleanup)
-- Modify: `crates/analyzer-core/src/resolve.rs` (delete any now-unused imports)
+- Modify: `crates/analyzer-core/src/resolve.rs` (`resolution_diagnostics` bridge → `ensure_indexed` + `file_deps`; delete now-unused transient-`FileDeps` construction + any now-unused imports)
+- Modify: `crates/analyzer-core/src/analysis.rs` (delete `cached_source_pathname`, `source_path_cache`, `source_path_cache_generation` + their 3 hooks; rewrite `forget_file`, `set_import_search_path`; make `index_file`'s target read graceful; delete the CR-3 memo tests)
 
 **Interfaces:**
-- Produces: `forget_file` now drops `sources` + `dep_inputs` entries for the file; `set_import_search_path` just stores the path (re-indexing republishes `FileDeps`).
+- Produces: `resolution_diagnostics(&mut self, FileId) -> Vec<Diagnostic>` (signature unchanged) now reads the persisted `FileDeps`; `forget_file` drops `sources` + `dep_inputs` and republishes the `Workspace` map (dropping the removed file's key); `set_import_search_path` just stores the path.
 
-- [ ] **Step 1: Delete dead state**
+- [ ] **Step 1: Reconcile the `resolution_diagnostics` bridge onto persisted `FileDeps`**
 
-Remove `source_path_cache`, `source_path_cache_generation`, `cached_source_pathname`, and the generation-hook logic. Update:
+Rewrite the bridge to mirror Task 7's `resolve()` bridge — index-on-demand, then read the persisted input, instead of rebuilding a transient `FileDeps` via `cached_source_pathname`:
+
+```rust
+pub fn resolution_diagnostics(&mut self, file: FileId) -> Vec<Diagnostic> {
+    let Some(src) = self.src_of(file) else { return Vec::new() };
+    self.ensure_indexed(file);            // same on-demand indexing resolve() uses (Task 7)
+    let fd = self.file_deps(file);        // persisted FileDeps — memoized, no per-call input
+    let from_dir = self.vfs().path(file).parent()
+        .map(|d| d.display().to_string()).unwrap_or_default();
+    let search = self.import_search_path().iter().map(|p| p.display().to_string())
+        .collect::<Vec<_>>().join(", ");
+    crate::db::resolution_diagnostics_query(self.db_ref(), src, fd,
+        Arc::from(from_dir.as_str()), Arc::from(search.as_str())).to_vec()
+}
+```
+
+The `resolution_diagnostics_query` itself is unchanged (Task 9). Behavior is preserved: `ensure_indexed`+`file_deps` resolves the same import/include targets `cached_source_pathname` did (both go through `find_source_pathname` on the same search path), so the same E9001–E9004 diagnostics are produced. This also deletes Task 9's transient bridge, which removes that task's two Minors (the `expect` at the old bridge, and the eager include-target reads).
+
+Run the diagnostics oracle now to confirm the reconciliation is behavior-preserving BEFORE deleting anything: `cargo test -p analyzer-core resolution_diagnostics && cargo test -p compact-analyzer --test lsp_workspace` → PASS (the E9001–E9004 tests are unchanged and must stay green).
+
+- [ ] **Step 2: Delete the now-dead disk-probe memo**
+
+`cached_source_pathname` now has no caller (Step 1 removed its last one; `index_file` calls `find_source_pathname` directly). Delete `cached_source_pathname`, the `source_path_cache` + `source_path_cache_generation` fields, their initializers in `new`, and the 3 invalidation-hook code paths.
+
+- [ ] **Step 3: Remove the obsolete CR-3 memo tests**
+
+The 4 CR-3 tests assert `cached_source_pathname`'s memoization/invalidation (e.g. `source_path_probe_is_memoized_within_an_epoch` and the 3 hook tests). They test the infrastructure just deleted, so they no longer compile/apply — **remove them**. In the report, list each removed test by name and state the replacement coverage that still exercises the underlying behavior: `index_file_publishes_resolved_dep_edges` (Task 3, resolved-vs-unresolved edges), the E9001–E9004 tests (unresolved-import/include diagnostics), and Task 11's incremental-reuse tests. Do NOT remove any test that asserts a still-live behavior — only the ones whose sole subject is the deleted memo.
+
+- [ ] **Step 4: Rewrite `forget_file`, `set_import_search_path`, and make `index_file` graceful**
 
 ```rust
 pub fn forget_file(&mut self, file: FileId) {
     self.sources.remove(&file);
     self.dep_inputs.remove(&file);
+    self.republish_file_deps_map();   // drop the removed file's key from Workspace.file_deps (keyset shrank)
 }
 
 pub fn set_import_search_path(&mut self, path: Vec<PathBuf>) {
-    self.import_search_path = path; // re-indexing republishes FileDeps under the new path
+    self.import_search_path = path;   // re-indexing republishes FileDeps under the new path
 }
 ```
 
-> The old `cached_source_pathname` doc-comment described a 3-hook invalidation contract for the memo. That contract dies with the memo; no correctness property is lost because `FileDeps` is republished by `index_file` on every content/structure change and by `set_import_search_path`-triggered re-indexing.
+Also make `index_file`'s target read graceful (remove the `.expect` panic path flagged in Tasks 3 & 9 — it contradicts the resolver's "unreadable → skip, never die" ethos): a target that resolves to a path but is unreadable becomes `target: None` (no edge, no panic):
 
-- [ ] **Step 2: Run the full oracle + lints**
+```rust
+let target = crate::find_source_pathname(&from_dir, &search, &dep.raw)
+    .and_then(|path| {
+        let fid = self.vfs_mut().file_id(&path);
+        self.source_for(fid).map(|s| (fid, s))   // unreadable → None, skip (no panic)
+    });
+```
 
-Run: `cargo test -p analyzer-core && cargo test -p compact-analyzer && cargo clippy --workspace --all-targets -- -D warnings`
-Expected: PASS + clippy clean (watch for `needless_lifetimes` on any tracked fn — elide).
+> The old `cached_source_pathname` 3-hook invalidation contract dies with the memo; no correctness property is lost because `FileDeps` is republished by `index_file` on every content/structure change and by `set_import_search_path`-triggered re-indexing. `republish_file_deps_map` must be safe to call from `forget_file` — confirm it recomputes the map from the current `dep_inputs` keyset (Task 5 added it for the keyset-grew case; keyset-shrank is the same recompute).
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 5: Full oracle + lints + fmt**
+
+Run: `cargo test -p analyzer-core && cargo test -p compact-analyzer && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
+Expected: PASS + clippy clean (watch `needless_lifetimes`) + fmt clean. If `fmt --check` fails, run `cargo fmt --all` and re-check.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add crates/analyzer-core/src/analysis.rs crates/analyzer-core/src/resolve.rs
-git commit -m "refactor(v2b.1): delete the now-dead disk-probe memo and imperative resolution state"
+git commit -m "refactor(v2b.1): reconcile resolution_diagnostics onto persisted FileDeps; delete the dead disk-probe memo"
 ```
 
 ---

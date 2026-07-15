@@ -930,7 +930,11 @@ pub(crate) fn ident_at_offset(root: &SyntaxNode, offset: TextSize) -> Option<Syn
     }
 }
 
-pub(crate) fn generic_definition(file: FileId, param_node: &SyntaxNode, token: &SyntaxToken) -> Definition {
+pub(crate) fn generic_definition(
+    file: FileId,
+    param_node: &SyntaxNode,
+    token: &SyntaxToken,
+) -> Definition {
     let numeric = param_node
         .children_with_tokens()
         .filter_map(|e| e.into_token())

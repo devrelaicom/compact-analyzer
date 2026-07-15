@@ -242,10 +242,14 @@ impl AnalysisHost {
         let mut resolved: Vec<crate::db::ResolvedDep> = Vec::new();
         if let Some(from_dir) = from_dir {
             for dep in raw_deps.iter() {
-                let target = crate::find_source_pathname(&from_dir, &search, &dep.raw).map(|path| {
-                    let fid = self.vfs_mut().file_id(&path);
-                    (fid, self.source_for(fid).expect("resolved path is readable"))
-                });
+                let target =
+                    crate::find_source_pathname(&from_dir, &search, &dep.raw).map(|path| {
+                        let fid = self.vfs_mut().file_id(&path);
+                        (
+                            fid,
+                            self.source_for(fid).expect("resolved path is readable"),
+                        )
+                    });
                 if let Some((fid, _)) = target {
                     edges.insert(fid);
                 }

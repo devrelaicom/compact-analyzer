@@ -127,7 +127,10 @@ pub fn raw_imports(db: &dyn Db, src: SourceText) -> Arc<[RawDep]> {
         } else {
             continue;
         };
-        out.push(RawDep { raw, is_include: false });
+        out.push(RawDep {
+            raw,
+            is_include: false,
+        });
     }
     for inc in sf.includes() {
         if let Some(tok) = inc.path() {
@@ -233,7 +236,10 @@ mod tests {
         }]);
         let fd = FileDeps::new(&db, deps);
         // The spike resolves raw "T" to its target's first top-level symbol name.
-        assert_eq!(spike_cross_file(&db, fd, "T".to_string()).as_deref(), Some("tgt"));
+        assert_eq!(
+            spike_cross_file(&db, fd, "T".to_string()).as_deref(),
+            Some("tgt")
+        );
         assert_eq!(spike_cross_file(&db, fd, "Nope".to_string()), None);
     }
 
@@ -245,7 +251,8 @@ mod tests {
         let t1 = crate::db::item_tree(&db, src);
         let s1 = crate::db::file_symbols(&db, src);
         // Add only a trailing comment: items are byte-identical.
-        src.set_text(&mut db).to(Arc::from("export circuit c(): [] {} // note"));
+        src.set_text(&mut db)
+            .to(Arc::from("export circuit c(): [] {} // note"));
         let t2 = crate::db::item_tree(&db, src);
         let s2 = crate::db::file_symbols(&db, src);
         // `item_tree` is a *direct* dependent of `parsed`, which is `no_eq`
@@ -257,7 +264,10 @@ mod tests {
         // So the trivia-only edit still produces a *different* Arc here --
         // but an equal one, confirming `ItemTree`'s new `PartialEq` derive
         // makes the values compare equal despite the byte-different source.
-        assert_eq!(*t1, *t2, "trivia-only edit must leave the ItemTree value unchanged");
+        assert_eq!(
+            *t1, *t2,
+            "trivia-only edit must leave the ItemTree value unchanged"
+        );
         // The backdating firewall payoff appears one hop further downstream:
         // `file_symbols` depends on `item_tree` (not `parsed`), so when
         // `item_tree`'s `changed_at` backdates, `file_symbols` sees no
@@ -272,7 +282,8 @@ mod tests {
     #[test]
     fn raw_imports_filters_stdlib_and_local_modules() {
         let db = CompactDatabase::default();
-        let text = "import CompactStandardLibrary;\nimport Foo;\nmodule Foo {}\nimport \"bar/baz\";\n";
+        let text =
+            "import CompactStandardLibrary;\nimport Foo;\nmodule Foo {}\nimport \"bar/baz\";\n";
         let src = SourceText::new(&db, Arc::from(text));
         let deps = crate::db::raw_imports(&db, src);
         // CompactStandardLibrary filtered; `Foo` satisfied by local module → filtered;

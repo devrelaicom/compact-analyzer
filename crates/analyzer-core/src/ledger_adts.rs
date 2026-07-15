@@ -237,6 +237,32 @@ mod tests {
     }
 
     #[test]
+    fn no_ledger_method_has_a_composite_param_yet() {
+        // The E3004 ledger-call arg check compares a literal/cast argument only
+        // against a *concretely modeled* param; every ledger method param today
+        // is Uint/Bytes or a generic (T/K/V -> Unknown, suppressed) — never a
+        // tuple/vector. The composite-arg x sequence-subtype path is therefore
+        // dormant and unexercised. This guard trips red if an asset refresh ever
+        // introduces a composite param, so that path gets an explicit
+        // differential fixture before it can silently (mis)fire. Extend/replace
+        // this test when composite params are intentionally modeled.
+        use crate::ty::TyKind;
+        let table = LedgerAdtTable::load();
+        for (adt, methods) in &table.by_adt {
+            for m in methods {
+                for (i, p) in parse_method_sig(&m.sig).params.iter().enumerate() {
+                    assert!(
+                        !matches!(p, TyKind::Tuple(_) | TyKind::Vector(_, _)),
+                        "ledger method {adt}.{} param {i} is now a composite ({p:?}); \
+                         the E3004 composite-param path is untested — add a fixture",
+                        m.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn table_parses_and_covers_all_adts() {
         let table = LedgerAdtTable::load();
         for adt in [

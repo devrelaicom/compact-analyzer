@@ -1,0 +1,2 @@
+pragma language_version >= 0.23;
+export circuit f(): [Uint<8>, Field] { return [1, true]; }

@@ -29,6 +29,11 @@ pub enum TyKind {
     /// compares it conservatively (never a false positive). `Uint<k>` and
     /// `Uint<lo..hi>` both lower to this single canonical form.
     Uint(Option<u128>),
+    /// A `Bytes<n>` byte array of length `n`. Implicitly assignable only to
+    /// `Bytes<n>` of the *same* length (see [`is_subtype`]); castable per
+    /// [`can_cast`]. Byte counts are small, so the length is a `u32`; a
+    /// non-literal or overflowing size lowers to `Unknown` upstream.
+    Bytes(u32),
 }
 
 /// A salsa-interned type id. Under `#[salsa::interned]` this is `Ty<'db>` with
@@ -59,6 +64,7 @@ pub fn ty_display(db: &dyn Db, ty: Ty) -> String {
             format!("Uint<0..{hi}>")
         }
         TyKind::Uint(None) => "Uint<0..?>".to_string(),
+        TyKind::Bytes(n) => format!("Bytes<{n}>"),
     }
 }
 
@@ -155,6 +161,22 @@ mod tests {
         let a = Ty::new(&db, TyKind::Uint(Some(256)));
         let b = Ty::new(&db, TyKind::Uint(Some(256)));
         let c = Ty::new(&db, TyKind::Uint(Some(255)));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn bytes_display_and_interning() {
+        let db = CompactDatabase::default();
+        assert_eq!(
+            ty_display(&db, Ty::new(&db, TyKind::Bytes(32))),
+            "Bytes<32>"
+        );
+        assert_eq!(ty_display(&db, Ty::new(&db, TyKind::Bytes(1))), "Bytes<1>");
+        // interns by size
+        let a = Ty::new(&db, TyKind::Bytes(32));
+        let b = Ty::new(&db, TyKind::Bytes(32));
+        let c = Ty::new(&db, TyKind::Bytes(4));
         assert_eq!(a, b);
         assert_ne!(a, c);
     }

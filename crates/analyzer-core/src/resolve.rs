@@ -850,13 +850,13 @@ pub(crate) fn single_top_level_module(tree: &crate::ItemTree) -> Option<(u32, &c
     (first.1.kind == crate::SymbolKind::Module).then_some(first)
 }
 
-fn searched_list(from_dir: &Path, search: &[PathBuf]) -> String {
+pub(crate) fn searched_list(from_dir: &Path, search: &[PathBuf]) -> String {
     let mut parts = vec![from_dir.display().to_string()];
     parts.extend(search.iter().map(|p| p.display().to_string()));
     parts.join(", ")
 }
 
-fn unresolved_import_diag(
+pub(crate) fn unresolved_import_diag(
     raw: &str,
     from_dir: &Path,
     search: &[PathBuf],
@@ -872,7 +872,7 @@ fn unresolved_import_diag(
     )
 }
 
-fn unresolved_include_diag(
+pub(crate) fn unresolved_include_diag(
     raw: &str,
     from_dir: &Path,
     search: &[PathBuf],
@@ -889,7 +889,7 @@ fn unresolved_include_diag(
 }
 
 /// Index of the module symbol whose range contains `offset`, if any.
-fn enclosing_module(tree: &crate::ItemTree, offset: TextSize) -> Option<u32> {
+pub(crate) fn enclosing_module(tree: &crate::ItemTree, offset: TextSize) -> Option<u32> {
     tree.symbols
         .iter()
         .enumerate()
@@ -900,7 +900,7 @@ fn enclosing_module(tree: &crate::ItemTree, offset: TextSize) -> Option<u32> {
 
 /// The `as` alias of an import specifier (no typed accessor: read the IDENT
 /// following AS_KW — verified compactp pattern).
-fn import_specifier_alias(spec: &compactp_ast::ImportSpecifier) -> Option<String> {
+pub(crate) fn import_specifier_alias(spec: &compactp_ast::ImportSpecifier) -> Option<String> {
     let mut saw_as = false;
     for element in spec.syntax().children_with_tokens() {
         if let Some(token) = element.into_token() {
@@ -916,7 +916,7 @@ fn import_specifier_alias(spec: &compactp_ast::ImportSpecifier) -> Option<String
 
 /// Finds the IDENT token at/beside `offset`. Between two tokens, prefers
 /// the identifier.
-fn ident_at_offset(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
+pub(crate) fn ident_at_offset(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
     // Same B1-core guard as `anchor_token`: this is `resolve()`'s own
     // `token_at_offset` call, reached directly from `hover`/`goto_definition`
     // /`rename`/`references` with a caller-supplied offset that may be past
@@ -930,7 +930,7 @@ fn ident_at_offset(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
     }
 }
 
-fn generic_definition(file: FileId, param_node: &SyntaxNode, token: &SyntaxToken) -> Definition {
+pub(crate) fn generic_definition(file: FileId, param_node: &SyntaxNode, token: &SyntaxToken) -> Definition {
     let numeric = param_node
         .children_with_tokens()
         .filter_map(|e| e.into_token())
@@ -947,7 +947,7 @@ fn generic_definition(file: FileId, param_node: &SyntaxNode, token: &SyntaxToken
     }
 }
 
-fn local_from_pattern_site(file: FileId, token: &SyntaxToken) -> Option<Definition> {
+pub(crate) fn local_from_pattern_site(file: FileId, token: &SyntaxToken) -> Option<Definition> {
     Some(Definition::Local {
         file,
         name: token.text().to_string(),
@@ -960,7 +960,7 @@ fn local_from_pattern_site(file: FileId, token: &SyntaxToken) -> Option<Definiti
 /// `scope_bindings_at` (anchored on `anchor_token` — see its doc comment for
 /// why that token-pick is safe for the resolver's own calls even though it
 /// differs from `ident_at_offset` in general).
-fn resolve_local_name(
+pub(crate) fn resolve_local_name(
     file: FileId,
     root: &SyntaxNode,
     offset: TextSize,

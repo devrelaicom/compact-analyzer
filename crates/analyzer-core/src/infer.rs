@@ -70,23 +70,39 @@ pub(crate) fn circuit_node_by_index(
         .find(|c| c.name().map(|n| n.text_range()) == Some(name_range))
 }
 
-/// Inference entry point for one circuit body: `(return-statement range,
-/// TyKind)` for each `return` whose operand is a primitive literal the
-/// foundation can type. Carries the `'static` `TyKind` (not `Ty<'db>`): salsa
-/// forbids a tracked return of `Arc<[(_, Ty<'db>)]>` — see the Salsa lifetime
-/// constraint note in this task. `TyKind` is `PartialEq`, so this query
-/// backdates normally; `Ty` is interned downstream, at the display boundary.
-#[salsa::tracked(returns(clone))]
-pub fn infer_circuit_returns(
-    db: &dyn Db,
-    src: SourceText,
-    circuit_index: u32,
-) -> Arc<[(text_size::TextRange, TyKind)]> {
-    let Some(circuit) = circuit_node_by_index(db, src, circuit_index) else {
-        return Arc::from(Vec::new());
-    };
+/// `(item-tree index, CircuitDef)` for every circuit in `src`, built with a
+/// single walk of the file's green tree. Replaces per-circuit
+/// `circuit_node_by_index` calls (each of which re-walked the tree) in the hot
+/// diagnostics path. Association is by the symbol's `name_range` matching the
+/// `CircuitDef`'s name-token range — identical to `circuit_node_by_index`, so
+/// nested circuits are covered the same way.
+fn circuit_node_map(db: &dyn Db, src: SourceText) -> Vec<(u32, compactp_ast::CircuitDef)> {
+    let tree = item_tree(db, src);
+    let index_of: std::collections::HashMap<text_size::TextRange, u32> = tree
+        .symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.kind == crate::SymbolKind::Circuit)
+        .map(|(i, s)| (s.name_range, i as u32))
+        .collect();
+    let root = compactp_syntax::SyntaxNode::new_root(parsed(db, src).green);
+    root.descendants()
+        .filter_map(compactp_ast::CircuitDef::cast)
+        .filter_map(|c| {
+            let range = c.name().map(|n| n.text_range())?;
+            index_of.get(&range).map(|&idx| (idx, c))
+        })
+        .collect()
+}
+
+/// Types the primitive-literal operand of each `return` in a circuit body:
+/// `(return-statement range, TyKind)`. The shared core of the inference entry
+/// point and the diagnostics query — both call this on an already-located
+/// `CircuitDef`, so the file's green tree is walked once per consumer, not once
+/// per circuit.
+fn circuit_return_kinds(circuit: &compactp_ast::CircuitDef) -> Vec<(text_size::TextRange, TyKind)> {
     let Some(body) = circuit.body() else {
-        return Arc::from(Vec::new());
+        return Vec::new();
     };
     let mut out = Vec::new();
     for stmt in body.stmts() {
@@ -96,10 +112,26 @@ pub fn infer_circuit_returns(
         let Some(compactp_ast::expr::Expr::Literal(lit)) = ret.value() else {
             continue;
         };
-        let kind = literal_ty_kind(&lit);
-        out.push((ret.syntax().text_range(), kind));
+        out.push((ret.syntax().text_range(), literal_ty_kind(&lit)));
     }
-    Arc::from(out)
+    out
+}
+
+/// Inference entry point for one circuit body: `(return-statement range,
+/// TyKind)` for each `return` whose operand is a primitive literal the checker
+/// can type. Carries the `'static` `TyKind` (not `Ty<'db>`): salsa forbids a
+/// tracked return of `Arc<[(_, Ty<'db>)]>`. `Ty` is interned downstream, at the
+/// display boundary.
+#[salsa::tracked(returns(clone))]
+pub fn infer_circuit_returns(
+    db: &dyn Db,
+    src: SourceText,
+    circuit_index: u32,
+) -> Arc<[(text_size::TextRange, TyKind)]> {
+    let Some(circuit) = circuit_node_by_index(db, src, circuit_index) else {
+        return Arc::from(Vec::new());
+    };
+    Arc::from(circuit_return_kinds(&circuit))
 }
 
 /// Type diagnostics for `src` (foundation rule: primitive-literal return
@@ -115,29 +147,19 @@ pub fn infer_circuit_returns(
 pub fn type_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnostic]> {
     let tree = item_tree(db, src);
     let mut diags = Vec::new();
-    for (idx, sym) in tree
-        .symbols
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.kind == crate::SymbolKind::Circuit)
-    {
-        let idx = idx as u32;
-        let Some(circuit) = circuit_node_by_index(db, src, idx) else {
-            continue;
-        };
+    for (idx, circuit) in circuit_node_map(db, src) {
         let declared = circuit
             .return_type()
             .map(|t| type_node_kind(&t))
             .unwrap_or(TyKind::Unknown);
         if declared == TyKind::Unknown {
-            continue; // only fire on return types the foundation models
+            continue; // only fire on return types the checker models
         }
-        for (range, kind) in infer_circuit_returns(db, src, idx).iter() {
-            let actual = *kind;
+        let name = &tree.symbols[idx as usize].name;
+        for (range, kind) in circuit_return_kinds(&circuit) {
+            let actual = kind;
             if actual != TyKind::Unknown && actual != declared {
-                diags.push(return_mismatch_diag(
-                    db, actual, declared, &sym.name, *range,
-                ));
+                diags.push(return_mismatch_diag(db, actual, declared, name, range));
             }
         }
     }
@@ -278,6 +300,25 @@ mod tests {
             Arc::from("export circuit foo(): Boolean { return 1; }"),
         );
         assert!(type_diagnostics_query(&db, b).is_empty());
+    }
+
+    #[test]
+    fn multi_circuit_reports_only_the_mismatched_one() {
+        let db = CompactDatabase::default();
+        let src = SourceText::new(
+            &db,
+            Arc::from(
+                "export circuit good(): Boolean { return true; }\n\
+                 export circuit bad(): Field { return true; }",
+            ),
+        );
+        let diags = type_diagnostics_query(&db, src);
+        assert_eq!(diags.len(), 1, "only `bad` mismatches");
+        assert!(
+            diags[0].message.contains("bad"),
+            "diagnostic names the right circuit: {:?}",
+            diags[0].message
+        );
     }
 
     #[test]

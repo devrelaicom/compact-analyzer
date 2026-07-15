@@ -460,7 +460,9 @@ The tracked per-body query that types the primitive-literal operand of each `ret
 
 **Interfaces:**
 - Consumes: `crate::db::{Db, SourceText, item_tree, parsed}`, `crate::ty::{Ty, TyKind}`, `crate::{ItemTree, SymbolKind}`, `compactp_ast`, `compactp_syntax::SyntaxKind`.
-- Produces: `infer_circuit_returns(db: &dyn Db, src: SourceText, circuit_index: u32) -> Arc<[(text_size::TextRange, Ty)]>` — for the circuit at item-tree index `circuit_index`, the `(return-statement range, Ty of the returned primitive literal)` for each `return` whose operand the foundation can type. Empty when the index is not a circuit or has no such returns. Also (pub(crate)) `type_node_kind(&compactp_ast::Type) -> TyKind` and `circuit_node_by_index(db, src, u32) -> Option<compactp_ast::CircuitDef>` (reused by Task 5).
+- Produces: `infer_circuit_returns(db: &dyn Db, src: SourceText, circuit_index: u32) -> Arc<[(text_size::TextRange, TyKind)]>` — for the circuit at item-tree index `circuit_index`, the `(return-statement range, TyKind of the returned primitive literal)` for each `return` whose operand the foundation can type. Empty when the index is not a circuit or has no such returns. Also (pub(crate)) `type_node_kind(&compactp_ast::Type) -> TyKind` and `circuit_node_by_index(db, src, u32) -> Option<compactp_ast::CircuitDef>` (reused by Task 5).
+
+> **Salsa lifetime constraint (verified empirically against salsa 0.28.0, 2026-07-15).** `#[salsa::interned] Ty` carries an elided `'db` lifetime (`Ty<'db>` under the macro — confirmed: bare `Ty` in a tracked return errors `missing lifetime specifier`). A `#[salsa::tracked]` query **cannot** return `Arc<[(TextRange, Ty<'db>)]>` — salsa's `SalsaValue` bound rejects a slice of tuples containing a `'db`-bound interned id (verified: it fails to compile). Therefore the inference query carries the **`'static` `TyKind`** payload (which satisfies `SalsaValue` and backdates cleanly), and `Ty` is interned locally at the diagnostic/display boundary (Task 5's `return_mismatch_diag`), where ordinary signature elision applies. `Ty` remains the interned universe; the foundation's flat query payload is simply `TyKind`.
 
 - [ ] **Step 1: Write the failing test** — create `crates/analyzer-core/src/infer.rs` with the code below **including** its test module, but expect it not to compile yet is not the flow here — write the full module, then the test drives it. Add this test module at the bottom:
 
@@ -487,7 +489,7 @@ mod tests {
         let idx = circuit_index(&db, src, "foo");
         let returns = infer_circuit_returns(&db, src, idx);
         assert_eq!(returns.len(), 1);
-        assert_eq!(returns[0].1.kind(&db), TyKind::Boolean);
+        assert_eq!(returns[0].1, TyKind::Boolean);
     }
 
     #[test]
@@ -499,7 +501,7 @@ mod tests {
         let idx = circuit_index(&db, src, "foo");
         let returns = infer_circuit_returns(&db, src, idx);
         assert_eq!(returns.len(), 1);
-        assert_eq!(returns[0].1.kind(&db), TyKind::Unknown);
+        assert_eq!(returns[0].1, TyKind::Unknown);
     }
 
     #[test]
@@ -532,7 +534,7 @@ use std::sync::Arc;
 use compactp_ast::AstNode;
 
 use crate::db::{Db, SourceText, item_tree, parsed};
-use crate::ty::{Ty, TyKind};
+use crate::ty::TyKind;
 
 /// Lower a CST `Type` node to a `TyKind`. Only the primitives the foundation
 /// models map to a concrete kind; everything else is `Unknown`.
@@ -584,15 +586,18 @@ pub(crate) fn circuit_node_by_index(
         .find(|c| c.name().map(|n| n.text_range()) == Some(name_range))
 }
 
-/// Inference entry point for one circuit body: `(return-statement range, Ty)`
-/// for each `return` whose operand is a primitive literal the foundation can
-/// type. `Ty` is interned (`PartialEq`), so this query backdates normally.
+/// Inference entry point for one circuit body: `(return-statement range,
+/// TyKind)` for each `return` whose operand is a primitive literal the
+/// foundation can type. Carries the `'static` `TyKind` (not `Ty<'db>`): salsa
+/// forbids a tracked return of `Arc<[(_, Ty<'db>)]>` — see the Salsa lifetime
+/// constraint note in this task. `TyKind` is `PartialEq`, so this query
+/// backdates normally; `Ty` is interned downstream, at the display boundary.
 #[salsa::tracked(returns(clone))]
 pub fn infer_circuit_returns(
     db: &dyn Db,
     src: SourceText,
     circuit_index: u32,
-) -> Arc<[(text_size::TextRange, Ty)]> {
+) -> Arc<[(text_size::TextRange, TyKind)]> {
     let Some(circuit) = circuit_node_by_index(db, src, circuit_index) else {
         return Arc::from(Vec::new());
     };
@@ -608,7 +613,7 @@ pub fn infer_circuit_returns(
             continue;
         };
         let kind = literal_ty_kind(&lit);
-        out.push((ret.syntax().text_range(), Ty::new(db, kind)));
+        out.push((ret.syntax().text_range(), kind));
     }
     Arc::from(out)
 }
@@ -723,8 +728,8 @@ pub fn type_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnostic]>
         if declared == TyKind::Unknown {
             continue; // only fire on return types the foundation models
         }
-        for (range, ty) in infer_circuit_returns(db, src, idx).iter() {
-            let actual = ty.kind(db);
+        for (range, kind) in infer_circuit_returns(db, src, idx).iter() {
+            let actual = *kind;
             if actual != TyKind::Unknown && actual != declared {
                 diags.push(return_mismatch_diag(
                     db, actual, declared, &sym.name, *range,
@@ -757,7 +762,7 @@ fn return_mismatch_diag(
 }
 ```
 
-Add `use crate::ty::ty_display;` to the module's imports (or fully-qualify).
+Add `use crate::ty::{Ty, ty_display};` to the module's imports (Task 4 imports only `TyKind`; `return_mismatch_diag` above interns `Ty::new(db, ...)` and calls `ty_display`, so both are needed here — or fully-qualify).
 
 - [ ] **Step 4: Add the host bridge** — append an `impl` block to `infer.rs`:
 

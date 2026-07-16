@@ -1037,6 +1037,102 @@ fn ledger_adt_at(
     KNOWN.contains(&head.as_str()).then_some(head)
 }
 
+/// A resolved callee's typed parameter list. Only populated for a same-file,
+/// unique, non-generic user circuit/witness (see `callee_sig`); param types the
+/// universe does not model lower to `TyKind::Unknown`.
+#[allow(dead_code)]
+pub(crate) struct CalleeSig {
+    pub params: Vec<crate::ty::TyKind>,
+}
+
+/// The typed signature of the user circuit/witness the call at `callee_off`
+/// resolves to, or `None` to suppress. `Some` only when the callee resolves to
+/// a **same-file** (`df == file`) `Circuit`/`Witness` that is **non-generic**
+/// and **unique** among the file's callable symbols. This restriction makes the
+/// check overload- and cross-file-safe: with a single same-file candidate there
+/// is no overload set to disambiguate, so native's verdict cannot diverge from
+/// compactc's on any accepted file.
+#[allow(dead_code)]
+fn callee_sig(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    callee_off: text_size::TextSize,
+) -> Option<CalleeSig> {
+    use compactp_ast::AstNode;
+    let def = resolve_query(db, file, src, fd, ws, callee_off)?;
+    let crate::Definition::Item { file: df, index } = def else {
+        return None;
+    };
+    if df != file {
+        return None; // cross-file callee -> suppress (safe false-negative)
+    }
+    let sym = item_symbol(db, file, src, fd, df, index)?;
+    if !matches!(
+        sym.kind,
+        crate::SymbolKind::Circuit | crate::SymbolKind::Witness
+    ) {
+        return None;
+    }
+    if sym.generic_param_count > 0 {
+        return None; // generic callee -> params may be `T` -> suppress
+    }
+    // Uniqueness: exactly one callable symbol of this name in the file. More than
+    // one is an overload set (or an export/redefinition error) -> suppress.
+    let tree = item_tree(db, src);
+    let same_name_callables = tree
+        .symbols
+        .iter()
+        .filter(|s| {
+            s.name == sym.name
+                && matches!(
+                    s.kind,
+                    crate::SymbolKind::Circuit | crate::SymbolKind::Witness
+                )
+        })
+        .count();
+    if same_name_callables != 1 {
+        return None;
+    }
+    // Read the declared parameter types from the decl CST node (same file).
+    let root = compactp_syntax::SyntaxNode::new_root(crate::db::parsed(db, src).green);
+    let params: Vec<crate::ty::TyKind> = match sym.kind {
+        crate::SymbolKind::Circuit => {
+            let cd = root
+                .descendants()
+                .filter_map(compactp_ast::CircuitDef::cast)
+                .find(|c| c.name().map(|n| n.text_range()) == Some(sym.name_range))?;
+            cd.params()
+                .map(|p| {
+                    p.ty()
+                        .map(|t| crate::infer::type_node_kind(&t))
+                        .unwrap_or(crate::ty::TyKind::Unknown)
+                })
+                .collect()
+        }
+        crate::SymbolKind::Witness => {
+            let wd = root
+                .descendants()
+                .filter_map(compactp_ast::WitnessDecl::cast)
+                .find(|w| w.name().map(|n| n.text_range()) == Some(sym.name_range))?;
+            // Witness params are STRUCT_FIELD nodes (no typed `params()` accessor).
+            wd.syntax()
+                .children()
+                .filter_map(compactp_ast::StructField::cast)
+                .map(|sf| {
+                    sf.ty()
+                        .map(|t| crate::infer::type_node_kind(&t))
+                        .unwrap_or(crate::ty::TyKind::Unknown)
+                })
+                .collect()
+        }
+        _ => unreachable!("kind checked above"),
+    };
+    Some(CalleeSig { params })
+}
+
 /// Ledger method-call argument type checks (`E3004`) for `src`. For each method
 /// call `recv.method(args)` whose receiver resolves to a builtin-ADT ledger
 /// field and whose `method` is in that ADT's typed surface, any positional

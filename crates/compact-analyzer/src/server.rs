@@ -784,6 +784,7 @@ impl GlobalState {
         let Some(source) = self.host.vfs_mut().read(file) else {
             return;
         };
+        // First analyze() for this revision; the helper's later call is a cache-hit.
         let Some(analysis) = self.host.analyze(file) else {
             return;
         };
@@ -875,18 +876,22 @@ impl GlobalState {
     }
 
     /// Assembles the full native diagnostic set for `file` — parser, resolution,
-    /// and (when `typeDiagnostics` is enabled) type diagnostics — each converted
-    /// to LSP and tagged `source = "compact-analyzer"`. This is the SINGLE place
-    /// native diagnostics are built, shared by the live publish path
-    /// (`publish_file_diagnostics`) and the on-save path (`did_save`), so the two
-    /// can never drift apart. `type_diagnostics` is already corpus-gate-green and
-    /// is forwarded verbatim (never re-filtered here).
+    /// and (when the `typeDiagnostics` config toggle is on) type diagnostics —
+    /// each converted to LSP and tagged `source = "compact-analyzer"`. This is
+    /// the SINGLE place native diagnostics are built, shared by the live publish
+    /// path (`publish_file_diagnostics`) and the on-save path (`did_save`), so
+    /// the two can never drift apart. Parser and resolution diagnostics are
+    /// always published; only the type contribution is gated. `type_diagnostics`
+    /// is already corpus-gate-green and is forwarded verbatim (never re-filtered
+    /// here) when the gate is open.
     fn build_native_diagnostics(
         &mut self,
         file: FileId,
         uri: &Url,
         line_index: &LineIndex,
     ) -> Vec<lsp_types::Diagnostic> {
+        // Cache-hit: the caller already called `self.host.analyze(file)` for
+        // this same revision, so salsa returns the memoized result here.
         let mut native: Vec<lsp_types::Diagnostic> = match self.host.analyze(file) {
             Some(analysis) => analysis
                 .diagnostics
@@ -898,8 +903,10 @@ impl GlobalState {
         for d in self.host.resolution_diagnostics(file) {
             native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
         }
-        for d in self.host.type_diagnostics(file) {
-            native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+        if self.toolchain_config.type_diagnostics {
+            for d in self.host.type_diagnostics(file) {
+                native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+            }
         }
         native
     }
@@ -913,6 +920,7 @@ impl GlobalState {
         else {
             return; // closed before the debounce fired
         };
+        // First analyze() for this revision; the helper's later call is a cache-hit.
         let Some(analysis) = self.host.analyze(file) else {
             return;
         };
@@ -1408,6 +1416,10 @@ pub(crate) struct ToolchainConfig {
     #[allow(dead_code)]
     pub compile_on_save: bool,
     pub formatting: bool,
+    /// Whether native type diagnostics (E3001–E3006) are published. `true` =
+    /// live native type checking; `false` = suppress them and rely on
+    /// compile-on-save's `compactc` type errors. Read once at startup.
+    pub type_diagnostics: bool,
 }
 
 impl Default for ToolchainConfig {
@@ -1416,6 +1428,7 @@ impl Default for ToolchainConfig {
             toolchain_path: None,
             compile_on_save: true,
             formatting: true,
+            type_diagnostics: true,
         }
     }
 }
@@ -1433,6 +1446,9 @@ fn toolchain_config_from(options: Option<&serde_json::Value>) -> ToolchainConfig
     }
     if let Some(flag) = opts.get("formatting").and_then(|v| v.as_bool()) {
         config.formatting = flag;
+    }
+    if let Some(flag) = opts.get("typeDiagnostics").and_then(|v| v.as_bool()) {
+        config.type_diagnostics = flag;
     }
     config
 }
@@ -1494,6 +1510,19 @@ mod tests {
         assert_eq!(config.toolchain_path, Some(PathBuf::from("/opt/compact")));
         assert!(!config.compile_on_save);
         assert!(config.formatting);
+    }
+
+    #[test]
+    fn toolchain_config_reads_type_diagnostics_flag() {
+        let opts = json!({ "typeDiagnostics": false });
+        let config = toolchain_config_from(Some(&opts));
+        assert!(!config.type_diagnostics);
+    }
+
+    #[test]
+    fn toolchain_config_type_diagnostics_defaults_true() {
+        assert!(toolchain_config_from(Some(&json!({}))).type_diagnostics);
+        assert!(toolchain_config_from(None).type_diagnostics);
     }
 
     #[test]

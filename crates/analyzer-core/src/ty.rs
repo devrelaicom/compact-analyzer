@@ -77,7 +77,11 @@ pub fn ty_display(db: &dyn Db, ty: Ty) -> String {
 }
 
 /// Pure display projection over a `TyKind`; `ty_display` delegates to this.
-pub(crate) fn display_kind(kind: &TyKind) -> String {
+/// Public so IDE-layer consumers with a bare `TyKind` in hand (no `Ty`/`db`
+/// pair to feed `ty_display`) — e.g. v2c struct-field completion, which reads
+/// `TyKind::Struct.fields` directly off `AnalysisHost::type_at` — can render
+/// it without fabricating a `Ty`.
+pub fn display_kind(kind: &TyKind) -> String {
     match kind {
         TyKind::Boolean => "Boolean".to_string(),
         TyKind::Field => "Field".to_string(),

@@ -15,8 +15,17 @@
 ## Goal
 
 Extend v3a's intraprocedural interpreter to full **interprocedural** WPP: propagate taint across
-circuit calls with per-call-site memoization, add the cross-contract-call sink (removing v3a's
-deferral advisory), and reach full-corpus differential parity with `compactc`.
+circuit calls with per-call-site memoization and reach full-corpus differential parity with
+`compactc`.
+
+> ⚠️ **Scope-narrowing from R2 (2026-07-16, compiler-verified):** cross-contract calls are
+> **"not yet supported" in compactc 0.31.1** — every program using one is unconditionally rejected,
+> so the cross-contract-call SINK is NOT differential-testable against 0.31.1 and stays a
+> **version-gated amber advisory** (like `emit`), NOT a confirmed leak, until the analyzer targets a
+> compiler that implements the feature. v3b's real, testable deliverable is the **interprocedural
+> circuit→circuit** memoization (which IS supported). Do not plan the cross-contract-call sink as a
+> v3b confirmed-verdict item under a 0.31.1 target; re-confirm feature availability at v3b planning
+> time (it may have landed in a newer compiler by then, like emit).
 
 ## Why this is its own phase
 
@@ -35,8 +44,12 @@ cannot interpret through; v3b makes those calls analyzed, turning advisories int
   value; records the callee-body leaks into the root-drained table as a side effect of the walk.
 - **The disclosing-context reprocessing gate** — model `return-value-discloses?`: a call reached
   from an exported root reprocesses to (re-)report return-value leaks; an ordinary callee does not.
-- **Cross-contract-call sink** — implement the impure-call sink (contract reference + each arg +
-  control witnesses), replacing v3a's deferred-sink advisory (Task A8) with real verdicts.
+- **Cross-contract-call sink** — ⚠️ **version-gated (R2 finding): only if the target compiler
+  supports cross-contract calls.** Under a 0.31.1 target this stays v3a's amber advisory (the feature
+  is "not yet supported", so no compiling program exercises it and it can't be differentially
+  verified). If/when retargeted to a compiler with the feature: implement the impure-call sink
+  (contract reference + each arg + control witnesses), replacing the deferred-sink advisory (Task
+  A8) with real verdicts, pinned by real fixtures then.
 - **Interprocedural path points** — extend the witness→sink trail across call boundaries ("passed
   as argument to circuit `<f>`").
 - **Salsa invalidation** — confirm cross-file summary invalidation covers source-**identity**

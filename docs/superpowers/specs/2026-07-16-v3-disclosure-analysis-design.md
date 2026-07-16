@@ -145,7 +145,7 @@ reaches one of these. Note there are **two independent leaks at every sink**: on
 | **Public ledger** write/update/op | per-arg `discloses?` on the ledger ADT op (§3.6) | "ledger operation" | "performing this ledger operation" | all 3 sources |
 | **Event `emit`** — ⚠️ **NOT PRESENT in 0.31.1** (Rev-2.1); version-gated future sink | *(n/a in 0.31.1)* | "emit operation" | "performing this emit operation" | all 3 sources |
 | **Exported-circuit return** (`(return …)`, R0 anchor `5561`/`5573`) | only when the enclosing fn is a disclosing root | "the value returned from exported circuit `<f>`" | "returning this value from exported circuit `<f>`" | **witness-returns only** (asymmetry below) |
-| **Cross-contract call** (`(contract-call …)`, R0 anchor `5542`-`5550`) | **unconditional** in 0.31.1 (Rev-2.1: NOT `pure?`-gated); v3a defers this sink → amber advisory | "contract call contract reference" (the callee ref) + "contract call argument `<n>`" (each arg) | "making this contract call" | all 3 sources |
+| **Cross-contract call** (`(contract-call …)`, R0 anchor `5542`-`5550`) — ⚠️ **feature "not yet supported" in 0.31.1** (R2 finding); WPP fires but every such program is also rejected. Version-gated like `emit`; v3a defers → amber advisory | **unconditional** in 0.31.1 (Rev-2.1: NOT `pure?`-gated) | "contract call contract reference" (the callee ref) + "contract call argument `<n>`" (each arg) | "making this contract call" | all 3 sources |
 
 **Corrections history:** Rev-2 vs Rev-1 flagged `emit` as a missing sink and the contract
 reference as a distinct sink separate from each argument. **Rev-2.1 (0.31.1 target)** then

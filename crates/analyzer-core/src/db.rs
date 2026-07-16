@@ -1040,7 +1040,6 @@ fn ledger_adt_at(
 /// A resolved callee's typed parameter list. Only populated for a same-file,
 /// unique, non-generic user circuit/witness (see `callee_sig`); param types the
 /// universe does not model lower to `TyKind::Unknown`.
-#[allow(dead_code)]
 pub(crate) struct CalleeSig {
     pub params: Vec<crate::ty::TyKind>,
 }
@@ -1052,7 +1051,6 @@ pub(crate) struct CalleeSig {
 /// check overload- and cross-file-safe: with a single same-file candidate there
 /// is no overload set to disambiguate, so native's verdict cannot diverge from
 /// compactc's on any accepted file.
-#[allow(dead_code)]
 fn callee_sig(
     db: &dyn Db,
     file: crate::FileId,
@@ -1239,6 +1237,117 @@ pub fn ledger_call_diagnostics_query(
                     &method,
                     &crate::ty::display_kind(param),
                     &crate::ty::display_kind(&actual),
+                    arg.syntax().text_range(),
+                ));
+            }
+        }
+    }
+    Arc::from(diags)
+}
+
+/// The call-argument mismatch diagnostic (`E3006`). Wording tracks compactc's
+/// family ("no compatible function …") loosely; wording is not gated.
+fn call_arg_diag(msg: String, span: text_size::TextRange) -> Diagnostic {
+    Diagnostic::error(DiagnosticCode::new("E", 3006), msg, span)
+}
+
+/// Call-argument type checks (`E3006`) for `src`. For each plain call
+/// `g(args)` (a `CALL_EXPR` with no `DOT`) whose callee resolves to a same-file,
+/// unique, non-generic user circuit/witness (`callee_sig`): an arg-count
+/// mismatch is reported at the call; otherwise each positional argument that is
+/// a typeable literal/cast/array is checked against a concretely-modeled
+/// parameter. Suppresses on every uncertainty. Resolution-fed like
+/// `ledger_call_diagnostics_query`.
+#[salsa::tracked(returns(clone), no_eq)]
+pub fn call_arg_diagnostics_query(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+) -> Arc<[Diagnostic]> {
+    use compactp_ast::AstNode;
+    let root = compactp_syntax::SyntaxNode::new_root(crate::db::parsed(db, src).green);
+    let mut diags = Vec::new();
+
+    for call in root
+        .descendants()
+        .filter_map(compactp_ast::expr::CallExpr::cast)
+    {
+        // A method call has a DOT child (that is E3004's job); a plain call does not.
+        let has_dot = call
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == compactp_syntax::SyntaxKind::DOT);
+        if has_dot {
+            continue;
+        }
+        let Some(name_tok) = call.name() else {
+            continue;
+        };
+        let callee_off = name_tok.text_range().start();
+        let Some(sig) = callee_sig(db, file, src, fd, ws, callee_off) else {
+            continue;
+        };
+
+        // Positional argument Exprs after the L_PAREN.
+        let Some(lparen_start) = call
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| t.kind() == compactp_syntax::SyntaxKind::L_PAREN)
+            .map(|t| t.text_range().start())
+        else {
+            continue;
+        };
+        let args: Vec<compactp_ast::expr::Expr> = call
+            .syntax()
+            .children()
+            .filter_map(compactp_ast::expr::Expr::cast)
+            .filter(|e| e.syntax().text_range().start() >= lparen_start)
+            .collect();
+
+        // A spread argument makes arity indeterminate -> suppress this call.
+        if args
+            .iter()
+            .any(|e| e.syntax().kind() == compactp_syntax::SyntaxKind::SPREAD_EXPR)
+        {
+            continue;
+        }
+
+        // Arg-count mismatch -> one diagnostic at the call; skip per-arg checks.
+        if args.len() != sig.params.len() {
+            diags.push(call_arg_diag(
+                format!(
+                    "call to {} supplies {} argument(s) but its signature declares {}",
+                    name_tok.text(),
+                    args.len(),
+                    sig.params.len()
+                ),
+                call.syntax().text_range(),
+            ));
+            continue;
+        }
+
+        for (i, arg) in args.iter().enumerate() {
+            let param = &sig.params[i];
+            if *param == crate::ty::TyKind::Unknown {
+                continue; // unmodeled param -> suppress
+            }
+            let actual = crate::infer::expr_ty_kind(arg);
+            if actual == crate::ty::TyKind::Unknown {
+                continue; // non-literal/cast/array arg (incl. param-ref) -> suppress
+            }
+            if !crate::ty::is_subtype(&actual, param) {
+                diags.push(call_arg_diag(
+                    format!(
+                        "argument {} of {} has type {} but the parameter type is {}",
+                        i + 1,
+                        name_tok.text(),
+                        crate::ty::display_kind(&actual),
+                        crate::ty::display_kind(param),
+                    ),
                     arg.syntax().text_range(),
                 ));
             }

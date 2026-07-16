@@ -496,21 +496,26 @@ pub fn signature_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnos
 impl crate::AnalysisHost {
     /// Type diagnostics for `file` (foundation: primitive-literal return
     /// mismatch) plus generic-specialization (arity) diagnostics plus
-    /// ledger method-call argument-type diagnostics (`E3004`). Thin bridge
-    /// over the tracked `type_diagnostics_query`, mirroring
-    /// `resolution_diagnostics`, merged with `generic_diagnostics` and
-    /// `ledger_call_diagnostics` so this is the single type-diagnostics
-    /// surface the differential harness (and, later, the editor) consumes.
-    /// Single-file typing: no `FileDeps`/`Workspace` inputs are needed for
-    /// the `type_diagnostics_query` slice. Editor surfacing (Problems panel
-    /// + toggle) is wired in v2b.final, which consumes this method.
+    /// duplicate-param diagnostics (`E3005`) plus ledger method-call
+    /// argument-type diagnostics (`E3004`) plus user circuit/witness
+    /// call-argument diagnostics (`E3006`). Thin bridge over the tracked
+    /// `type_diagnostics_query`, mirroring `resolution_diagnostics`, merged
+    /// with `signature_diagnostics_query`, `generic_diagnostics`,
+    /// `ledger_call_diagnostics`, and `call_arg_diagnostics` so this is the
+    /// single type-diagnostics surface the differential harness (and, later,
+    /// the editor) consumes. Single-file typing: no `FileDeps`/`Workspace`
+    /// inputs are needed for the `type_diagnostics_query` slice. Editor
+    /// surfacing (Problems panel + toggle) is wired in v2b.final, which
+    /// consumes this method.
     pub fn type_diagnostics(&mut self, file: crate::FileId) -> Vec<Diagnostic> {
         let Some(src) = self.src_of(file) else {
             return Vec::new();
         };
         let mut diags = type_diagnostics_query(self.db_ref(), src).to_vec();
+        diags.extend(signature_diagnostics_query(self.db_ref(), src).to_vec());
         diags.extend(self.generic_diagnostics(file));
         diags.extend(self.ledger_call_diagnostics(file));
+        diags.extend(self.call_arg_diagnostics(file));
         diags
     }
 }
@@ -1109,5 +1114,100 @@ mod tests {
         );
         let diags = signature_diagnostics_query(&db, src);
         assert!(diags.is_empty(), "expected no diagnostics, got: {diags:?}");
+    }
+
+    #[test]
+    fn call_arg_type_mismatch_emits_e3006() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/ca.compact"));
+        host.vfs_mut().set_overlay(
+            file,
+            "circuit f(x: Boolean): Boolean { return x; }\n\
+             export circuit c(): Boolean { return f(5); }"
+                .to_string(),
+            1,
+        );
+        let diags = host.type_diagnostics(file);
+        assert!(
+            diags.iter().any(|d| d.code.number == 3006),
+            "expected E3006, got {:?}",
+            diags.iter().map(|d| d.code.number).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn call_arg_count_mismatch_emits_e3006() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/cc.compact"));
+        host.vfs_mut().set_overlay(
+            file,
+            "circuit f(x: Boolean, y: Boolean): Boolean { return x; }\n\
+             export circuit c(): Boolean { return f(true); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            host.type_diagnostics(file)
+                .iter()
+                .any(|d| d.code.number == 3006)
+        );
+    }
+
+    #[test]
+    fn call_arg_good_overloaded_and_generic_suppress() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        // Correct arg -> no E3006.
+        let mut h1 = AnalysisHost::new();
+        let f1 = h1.vfs_mut().file_id(Path::new("/t/ok.compact"));
+        h1.vfs_mut().set_overlay(
+            f1,
+            "circuit f(x: Uint<8>): Boolean { return true; }\n\
+             export circuit c(): Boolean { return f(5); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            h1.type_diagnostics(f1)
+                .iter()
+                .all(|d| d.code.number != 3006)
+        );
+
+        // Overloaded name (two `f`) -> suppress even though f(5) mismatches the Boolean one.
+        let mut h2 = AnalysisHost::new();
+        let f2 = h2.vfs_mut().file_id(Path::new("/t/ovl.compact"));
+        h2.vfs_mut().set_overlay(
+            f2,
+            "circuit f(x: Boolean): Boolean { return x; }\n\
+             circuit f(x: Uint<8>): Boolean { return true; }\n\
+             export circuit c(): Boolean { return f(5); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            h2.type_diagnostics(f2)
+                .iter()
+                .all(|d| d.code.number != 3006)
+        );
+
+        // Generic callee -> param is `T` (Unknown) -> suppress.
+        let mut h3 = AnalysisHost::new();
+        let f3 = h3.vfs_mut().file_id(Path::new("/t/gen.compact"));
+        h3.vfs_mut().set_overlay(
+            f3,
+            "circuit f<T>(x: T): Boolean { return true; }\n\
+             export circuit c(): Boolean { return f<Uint<8>>(5); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            h3.type_diagnostics(f3)
+                .iter()
+                .all(|d| d.code.number != 3006)
+        );
     }
 }

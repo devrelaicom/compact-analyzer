@@ -52,22 +52,67 @@ pub enum Root {
     Constructor { symbol: u32 },
 }
 
-/// Discovers the analysis roots (spec §3): every exported circuit plus the
-/// file's constructor (R0 S2/S3). Non-exported circuits are excluded; they
-/// are analyzed only through call sites (v3b).
-pub fn discover_roots(tree: &ItemTree) -> Vec<Root> {
+/// Discovers the analysis roots (spec §3): every TOP-LEVEL exported circuit
+/// plus the file's constructor (R0 S2/S3). Non-exported circuits are excluded;
+/// they are analyzed only through call sites (v3b).
+///
+/// A circuit defined inside a `module { }` (`is_module_nested`) is ALSO
+/// excluded — and, unlike a non-exported circuit, it records an amber advisory
+/// via `sink` (spec §0, fail-closed). The compiler does NOT treat a
+/// module-nested `export circuit` as a disclosing root (it is reached only
+/// through its import/export chain); whether one is genuinely re-exported to the
+/// top level needs import-chain resolution (v3b). Seeding it as a root here
+/// flags its arg→ledger writes as false-positive `E3100` leaks on
+/// compiler-accepted module programs (corpus FP #2). Excluding it fails CLOSED
+/// to amber — never a false-positive red, and never silent green (the advisory
+/// records the deferral).
+pub fn discover_roots(tree: &ItemTree, sink: &mut DisclosureSink) -> Vec<Root> {
     tree.symbols
         .iter()
         .enumerate()
         .filter_map(|(i, s)| match s.kind {
-            SymbolKind::Circuit if s.exported => Some(Root::Circuit {
-                name: s.name.clone(),
-                symbol: i as u32,
-            }),
+            SymbolKind::Circuit if s.exported => {
+                if is_module_nested(tree, i as u32) {
+                    sink.emit_advisory(
+                        s.name_range,
+                        format!(
+                            "module-nested circuit `{}` not analyzed as a disclosing root in \
+                             v3a; deferred to v3b (import/export-chain resolution)",
+                            s.name
+                        ),
+                    );
+                    None
+                } else {
+                    Some(Root::Circuit {
+                        name: s.name.clone(),
+                        symbol: i as u32,
+                    })
+                }
+            }
             SymbolKind::Constructor => Some(Root::Constructor { symbol: i as u32 }),
             _ => None,
         })
         .collect()
+}
+
+/// Whether symbol `i`'s enclosing-scope chain runs through a `module { }`. A
+/// `Symbol::parent` points at the containing module/struct/enum/contract; a
+/// circuit written inside a module (possibly nested several modules deep) has a
+/// `SymbolKind::Module` somewhere on that chain. Top-level circuits have no
+/// module ancestor (`parent` is `None`, or a non-module container). Used by
+/// `discover_roots` to fail closed on module-nested circuits (v3b).
+fn is_module_nested(tree: &ItemTree, i: u32) -> bool {
+    let mut cur = tree.symbols.get(i as usize).and_then(|s| s.parent);
+    while let Some(p) = cur {
+        let Some(sym) = tree.symbols.get(p as usize) else {
+            break;
+        };
+        if sym.kind == SymbolKind::Module {
+            return true;
+        }
+        cur = sym.parent;
+    }
+    false
 }
 
 /// Declared-type -> seeded `Abs` shape (R0 AB1, spec §3.4 `default-value`).
@@ -1536,9 +1581,12 @@ fn fail_closed_expr(
 }
 
 /// Classifies a call's callee (witness / circuit / native). A method call
-/// (`recv.method(..)`), an unresolved name, or a non-callable resolution all
-/// fail closed to `Native` (A6). Cross-file circuits/witnesses classify by kind
-/// too, but a cross-file witness's return type is read only same-file.
+/// (`recv.method(..)`) fails closed to `Native` (the ledger-op path). A name
+/// that resolves to a same-file symbol classifies by kind. A name that does
+/// NOT resolve (`unresolved_callee_class`) is a KNOWN native (in the N2 conduit
+/// table) or — far more likely on a module program — a circuit reached through
+/// an import chain v3a cannot follow; the latter is deferred (amber), NOT
+/// conduit-tainted. A cross-file witness's return type is read only same-file.
 fn classify_callee(ctx: &InterpCtx, call: &CallExpr) -> CalleeClass {
     if is_method_call(call) {
         return CalleeClass::Native;
@@ -1554,10 +1602,10 @@ fn classify_callee(ctx: &InterpCtx, call: &CallExpr) -> CalleeClass {
         ctx.ws,
         name_tok.text_range().start(),
     ) else {
-        return CalleeClass::Native;
+        return unresolved_callee_class(name_tok.text());
     };
     let Some(sym) = item_symbol(ctx.db, ctx.file, ctx.src, ctx.fd, df, index) else {
-        return CalleeClass::Native;
+        return unresolved_callee_class(name_tok.text());
     };
     match sym.kind {
         SymbolKind::Witness => CalleeClass::Witness {
@@ -1568,6 +1616,29 @@ fn classify_callee(ctx: &InterpCtx, call: &CallExpr) -> CalleeClass {
             CalleeClass::Circuit
         }
         _ => CalleeClass::Native,
+    }
+}
+
+/// Classifies an UNRESOLVED plain-call name (spec §3.6, fail-closed §0):
+/// resolution could not bind it to a same-file symbol. Natives never resolve to
+/// a user symbol either, so a name IN the N2 conduit table
+/// (`tables::native_conduit`) is still a native — keep modeling its conduit
+/// taint (`persistentHash` → "a hash of"). Any OTHER unresolved name (a
+/// module-imported / cross-module circuit v3a cannot follow, an ambiguous
+/// re-export) is treated as a deferred CIRCUIT call — an amber v3b
+/// advisory-clean result, NOT the unknown-native conduit-taint. A red
+/// conduit-taint on such a name is a false positive on compiler-accepted module
+/// programs (corpus FP #2, `top_func` → `mf(x)`); an unresolved user/module
+/// name is far more likely a circuit than an unrecognized native, and amber is
+/// strictly safer than a false-positive red (§0). The unknown-native
+/// conduit-taint default survives only for a name that resolves to a non-
+/// circuit/witness symbol (the `_ => Native` arm above) — the genuine
+/// version-drift case.
+fn unresolved_callee_class(name: &str) -> CalleeClass {
+    if tables::native_conduit(name).is_some() {
+        CalleeClass::Native
+    } else {
+        CalleeClass::Circuit
     }
 }
 
@@ -1933,7 +2004,8 @@ mod tests {
         let file = crate::FileId::from_raw_for_test(0);
         let tree = item_tree(&db, src);
 
-        let roots = discover_roots(&tree);
+        let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&tree, &mut sink);
         let ctor_root = roots
             .iter()
             .find(|r| matches!(r, Root::Constructor { .. }))
@@ -1943,7 +2015,6 @@ mod tests {
             .find(|r| matches!(r, Root::Circuit { name, .. } if name == "f"))
             .expect("circuit root f");
 
-        let mut sink = DisclosureSink::new();
         let ctor_env = seed_sources(&db, file, src, fd, ws, ctor_root, &mut sink);
         let secret_abs = ctor_env.get("secret").expect("secret seeded");
         match secret_abs {
@@ -1986,7 +2057,8 @@ mod tests {
                      circuit priv_c(): [] { }\n";
         let src = SourceText::new(&db, Arc::from(text));
         let tree = item_tree(&db, src);
-        let roots = discover_roots(&tree);
+        let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&tree, &mut sink);
 
         assert!(roots.iter().any(|r| matches!(r, Root::Constructor { .. })));
         assert!(
@@ -2000,6 +2072,92 @@ mod tests {
                 .any(|r| matches!(r, Root::Circuit { name, .. } if name == "priv_c"))
         );
         assert_eq!(roots.len(), 2);
+    }
+
+    #[test]
+    fn module_nested_circuit_not_a_root() {
+        // Fix (a): a module-nested `export circuit` that writes its arg to a
+        // ledger is NOT a disclosing root — compactc reaches it only through its
+        // import/export chain, so it accepts the file. v3a excludes it and
+        // records an amber advisory (§0), emitting NO E-leak. WITHOUT the
+        // exclusion `leak` would be seeded as a root and `c = x` would flag a
+        // false-positive `E3100` (corpus FP #2, the test3a/base_func pattern).
+        let (db, src, fd, ws, file) = walk_setup(
+            "import CompactStandardLibrary;\n\
+             module M {\n\
+             export ledger c: Field;\n\
+             export circuit leak(x: Field): Field { c = x; return x; }\n\
+             }\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&tree, &mut sink);
+        assert!(
+            !roots
+                .iter()
+                .any(|r| matches!(r, Root::Circuit { name, .. } if name == "leak")),
+            "module-nested circuit must be excluded from roots"
+        );
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        assert!(
+            sink.drain_leaks().is_empty(),
+            "module-nested circuit must not emit a confirmed leak"
+        );
+        assert!(
+            sink.advisories()
+                .iter()
+                .any(|a| a.reason.contains("module-nested circuit `leak`")),
+            "excluded module circuit must record an amber advisory (never silent green)"
+        );
+    }
+
+    #[test]
+    fn unresolved_callee_is_amber_not_conduit() {
+        // Fix (b): a call to an UNRESOLVED name (`mf` — not a known native, not
+        // a witness, resolves to no same-file symbol) is a deferred circuit call
+        // (amber v3b advisory-clean), NOT the unknown-native conduit-taint. A
+        // witness value flowed through it must therefore NOT reach the ledger
+        // sink as a confirmed leak — that red is the false positive on the
+        // module-import programs compactc accepts (the `top_func` → `mf(x)`
+        // pattern, corpus FP #2).
+        let (db, src, fd, ws, file) = walk_setup(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Field;\n\
+             witness getW(): Field;\n\
+             export circuit f(): [] { c = mf(getW()); }\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&tree, &mut sink);
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        assert!(
+            sink.drain_leaks().is_empty(),
+            "an unresolved callee must not conduit-taint a witness into a confirmed leak"
+        );
+        assert!(
+            !sink.advisories().is_empty(),
+            "the deferred unresolved call must record an amber advisory (never silent green)"
+        );
     }
 
     // -- A3 interpreter-walk tests --------------------------------------
@@ -2236,11 +2394,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_native_call_conduit_taints_and_advises() {
-        // A6 fail-closed default (R0 N1): an unresolved callee is an UNKNOWN
-        // native ⇒ conduit-taint ALL args into the result + an amber advisory
-        // (§0). This replaces A5's clean-result stopgap. (A KNOWN native like
-        // `persistentCommit` still sanitizes via the N2 table.)
+    fn unresolved_call_is_amber_clean_not_conduit() {
+        // Fix (b) (supersedes A6's unresolved-callee stopgap): a plain call to
+        // an UNRESOLVED name (`blackbox` — not a known native, not a resolvable
+        // witness/circuit) is a deferred CIRCUIT call ⇒ an amber advisory (§0)
+        // and a CLEAN result — NOT the unknown-native conduit-taint. A red
+        // conduit-taint here is the corpus FP #2 (`top_func` → `mf(x)`). A KNOWN
+        // native (in the N2 table) still conduits; that path is unchanged.
         let (db, src, fd, ws, file) =
             walk_setup("export circuit f(): Field { return blackbox(w); }\n");
         let ctx = InterpCtx {
@@ -2259,15 +2419,12 @@ mod tests {
         let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
         assert!(
             !sink.advisories().is_empty(),
-            "unknown native call emits a fail-closed advisory"
+            "an unresolved call emits a fail-closed advisory (never silent green)"
         );
-        let ws_out = witnesses_of(&out);
-        assert_eq!(
-            ws_out.len(),
-            1,
-            "unknown native conduit-taints its arg into the result"
+        assert!(
+            witnesses_of(&out).is_empty(),
+            "an unresolved call must NOT conduit-taint its arg into the result"
         );
-        assert_eq!(ws_out[0].uid, 1);
     }
 
     #[test]
@@ -2446,8 +2603,8 @@ mod tests {
             disclosing_fn: None,
         };
         let tree = item_tree(&db, src);
-        let roots = discover_roots(&tree);
         let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -2480,8 +2637,8 @@ mod tests {
             disclosing_fn: None,
         };
         let tree = item_tree(&db, src);
-        let roots = discover_roots(&tree);
         let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -2513,8 +2670,8 @@ mod tests {
             disclosing_fn: None,
         };
         let tree = item_tree(&db, src);
-        let roots = discover_roots(&tree);
         let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -2556,8 +2713,8 @@ mod tests {
             disclosing_fn: None,
         };
         let tree = item_tree(&db, src);
-        let roots = discover_roots(&tree);
         let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -2603,8 +2760,8 @@ mod tests {
             disclosing_fn: None,
         };
         let tree = item_tree(&db, src);
-        let roots = discover_roots(&tree);
         let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -2635,8 +2792,8 @@ mod tests {
             disclosing_fn: None,
         };
         let tree = item_tree(&db, src);
-        let roots = discover_roots(&tree);
         let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -2676,8 +2833,8 @@ mod tests {
             disclosing_fn: None,
         };
         let tree = item_tree(&db, src);
-        let roots = discover_roots(&tree);
         let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -2883,23 +3040,26 @@ mod tests {
     }
 
     #[test]
-    fn unknown_native_conduit_taints_and_advises() {
-        // Fail-closed default (R0 N1): a plain call to a name that is neither a
-        // known native nor a resolvable witness/circuit is conduit-tainted (all
-        // args flow into the result) AND advised. The tainted result then leaks
-        // at the ledger write.
+    fn unresolved_call_no_leak_but_advises() {
+        // Fix (b): a witness value flowed through an UNRESOLVED callee
+        // (`mysteryNative` — not a known native, not a resolvable symbol) does
+        // NOT reach the ledger sink as a confirmed leak, because the call is a
+        // deferred circuit (amber-clean), not the unknown-native conduit-taint.
+        // The deferral is still recorded as an amber advisory (§0), never silent
+        // green. (This was the corpus FP #2 shape: `top_func` writing `mf(x)`.)
         let (leaks, had_advisory) = walk_leaks(
             "import CompactStandardLibrary;\n\
              export ledger c: Bytes<32>;\n\
              witness getW(): Bytes<32>;\n\
              export circuit f(): [] { c = mysteryNative(getW()); }\n",
         );
-        assert_eq!(leaks.len(), 1, "unknown native conduit-taints its arg");
-        assert_eq!(leaks[0].nature, "ledger operation");
-        assert_eq!(leaks[0].witnesses.len(), 1);
+        assert!(
+            leaks.is_empty(),
+            "an unresolved callee must not conduit-taint a witness into a leak"
+        );
         assert!(
             had_advisory,
-            "unknown native records a fail-closed advisory (§0)"
+            "the deferred unresolved call records a fail-closed advisory (§0)"
         );
     }
 }

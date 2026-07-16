@@ -174,6 +174,12 @@ const FIXTURES: &[Fixture] = &[
         discloses: false,
         native_confirms: false,
     },
+    Fixture {
+        name: "module_reexport_ok.compact",
+        rule: "AMOD module fail-closed (module-nested circuit not a root + unresolved module-imported callee → amber)",
+        discloses: false,
+        native_confirms: false,
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

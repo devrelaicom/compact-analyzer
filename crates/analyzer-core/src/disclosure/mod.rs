@@ -48,8 +48,8 @@ pub fn disclosure_diagnostics_query(
     ws: Workspace,
 ) -> Arc<[Diagnostic]> {
     let tree = item_tree(db, src);
-    let roots = interp::discover_roots(&tree);
     let mut sink = DisclosureSink::new();
+    let roots = interp::discover_roots(&tree, &mut sink);
     let base = InterpCtx {
         db,
         file,

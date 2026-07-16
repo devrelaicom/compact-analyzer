@@ -215,6 +215,46 @@ const FIXTURES: &[Fixture] = &[
         native_rejects: false,
         rule: "ledger-adt-typing",
     },
+    Fixture {
+        name: "sig_dup_param_circuit.compact",
+        native_rejects: true,
+        rule: "witness-circuit-signature",
+    },
+    Fixture {
+        name: "sig_dup_param_witness.compact",
+        native_rejects: true,
+        rule: "witness-circuit-signature",
+    },
+    Fixture {
+        name: "sig_distinct_params_ok.compact",
+        native_rejects: false,
+        rule: "witness-circuit-signature",
+    },
+    Fixture {
+        name: "sig_arg_type_mismatch.compact",
+        native_rejects: true,
+        rule: "witness-circuit-signature",
+    },
+    Fixture {
+        name: "sig_arg_count_mismatch.compact",
+        native_rejects: true,
+        rule: "witness-circuit-signature",
+    },
+    Fixture {
+        name: "sig_arg_ok.compact",
+        native_rejects: false,
+        rule: "witness-circuit-signature",
+    },
+    Fixture {
+        name: "sig_overload_ok.compact",
+        native_rejects: false,
+        rule: "witness-circuit-signature",
+    },
+    Fixture {
+        name: "sig_arg_tuple_ok.compact",
+        native_rejects: false,
+        rule: "witness-circuit-signature",
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

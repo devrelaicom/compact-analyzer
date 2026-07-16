@@ -1,0 +1,2 @@
+pragma language_version >= 0.23;
+export circuit c(a: Uint<8>, a: Boolean): Boolean { return true; }

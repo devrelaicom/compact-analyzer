@@ -1,0 +1,12 @@
+// A module-nested `export circuit` is a fail-closed point (A8): it's
+// excluded from the root set, so the analyzer can't decide it and records an
+// amber U3100 advisory (source "compact-analyzer (unverified)") rather than
+// silently reporting no leak. This needs no Compact toolchain — the smoke
+// test stays hermetic and proves the v3a fail-closed surface reaches the
+// Problems panel as an amber diagnostic.
+import CompactStandardLibrary;
+
+module M {
+  export ledger c: Field;
+  export circuit leak(x: Field): Field { c = x; return x; }
+}

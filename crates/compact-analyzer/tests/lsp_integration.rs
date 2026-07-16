@@ -142,6 +142,81 @@ fn publishes_native_type_diagnostic_on_open() {
 }
 
 #[test]
+fn publishes_disclosure_leak_diagnostic_on_open() {
+    let (_dir, uri) = temp_doc();
+    let mut client = Client::start();
+    client.initialize();
+
+    // Verified leak fixture (A4 K1 ledger sink, mirrored from
+    // analyzer-core's `ledger_cell_write_records_leak`): `c = getW();`
+    // writes a witness value straight to a ledger Cell -> native emits a
+    // confirmed E3100, source "compact-analyzer", with a secondary span at
+    // the witness origin.
+    did_open(
+        &mut client,
+        &uri,
+        1,
+        "import CompactStandardLibrary;\n\
+         export ledger c: Uint<8>;\n\
+         witness getW(): Uint<8>;\n\
+         export circuit f(): [] { c = getW(); }\n",
+    );
+    let params = client.wait_for_notification("textDocument/publishDiagnostics");
+    let diags = params["diagnostics"].as_array().unwrap();
+    let leak = diags
+        .iter()
+        .find(|d| d["code"] == "E3100")
+        .unwrap_or_else(|| panic!("expected an E3100 disclosure leak, got {diags:#?}"));
+    assert_eq!(leak["source"], "compact-analyzer");
+    assert_eq!(leak["severity"], 1); // Error
+    assert!(
+        leak["relatedInformation"]
+            .as_array()
+            .is_some_and(|r| !r.is_empty()),
+        "leak must carry witness-origin related-info spans, got {leak:#?}"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn publishes_disclosure_advisory_diagnostic_on_open() {
+    let (_dir, uri) = temp_doc();
+    let mut client = Client::start();
+    client.initialize();
+
+    // Verified fail-closed fixture (A8, mirrored from analyzer-core's
+    // `module_nested_circuit_renders_amber_advisory_not_a_leak`): a
+    // module-nested `export circuit` is excluded from the root set, so the
+    // analyzer can't decide it and records an amber U3100 advisory rather
+    // than silently reporting no leak.
+    did_open(
+        &mut client,
+        &uri,
+        1,
+        "import CompactStandardLibrary;\n\
+         module M {\n\
+         export ledger c: Field;\n\
+         export circuit leak(x: Field): Field { c = x; return x; }\n\
+         }\n",
+    );
+    let params = client.wait_for_notification("textDocument/publishDiagnostics");
+    let diags = params["diagnostics"].as_array().unwrap();
+    let advisory = diags
+        .iter()
+        .find(|d| d["code"] == "U3100")
+        .unwrap_or_else(|| panic!("expected a U3100 advisory, got {diags:#?}"));
+    assert_eq!(advisory["source"], "compact-analyzer (unverified)");
+    assert_eq!(advisory["severity"], 2); // Warning
+    assert!(
+        diags.iter().all(|d| d["code"] != "E3100"),
+        "an advisory must never manufacture a confirmed E3100 leak, got {diags:#?}"
+    );
+
+    client.shutdown();
+}
+
+#[test]
 fn signature_help_is_advertised_and_reports_active_parameter() {
     let (_dir, uri) = temp_doc();
     let mut client = Client::start();

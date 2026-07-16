@@ -26,16 +26,23 @@
 //! unfulfilled in the very build it's meant to cover — a `cargo build`/
 //! `cargo test` round-trip could not be made to stay green with `expect`
 //! here, only with `allow`. `WitnessInfo::WitnessReturn` and `Abs::Boolean`
-//! (below) don't hit this: they keep a plain, unconditional
-//! `#[expect(dead_code)]`, which round-trips fine because they're genuinely
-//! unconstructed in BOTH build modes until A3.
+//! (below) are now CONSTRUCTED by A3's interpreter walk (S1 seeding and AB2
+//! constant-folding), so their A2-era plain `#[expect(dead_code)]` became
+//! unfulfilled in the test build (which exercises the walk); they now carry
+//! the same `#[cfg_attr(not(test), allow(dead_code))]` — built for real in the
+//! test build, and only from (still-uncalled) walk code in the non-test build
+//! until A4 wires the query.
 
 /// A witness value's origin (spec §3.1). Deduped by `uid` in a set.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WitnessInfo {
     /// S1 (spec §3.1): a witness function's return value. Constructed at
     /// witness *call sites* during the interpreter walk — A3, not A2/A1.
-    #[expect(dead_code)] // used by A3's interpreter walk (S1 seeding)
+    // Constructed by A3's interpreter walk (S1 witness-return seeding). The
+    // walk still has no live (non-test) caller until A4 wires the query, so in
+    // the non-test build this variant is only built from dead code -> keep a
+    // `not(test)` dead-code suppression; the test build constructs it for real.
+    #[cfg_attr(not(test), allow(dead_code))]
     WitnessReturn {
         function: String,
     },
@@ -73,7 +80,10 @@ pub enum Abs {
     /// AB2 (spec §3.4): only a compile-time `true`/`false` literal produces
     /// this. Constructed by the interpreter's literal-evaluation arm — A3,
     /// not A2/A1.
-    #[expect(dead_code)] // used by A3's interpreter walk (AB2 constant-folding)
+    // Constructed by A3's interpreter walk (AB2 constant-fold of `if`). Same
+    // reasoning as `WitnessInfo::WitnessReturn` above: dead only in the
+    // (query-unwired) non-test build until A4.
+    #[cfg_attr(not(test), allow(dead_code))]
     Boolean {
         value: bool,
         witnesses: Vec<Witness>,

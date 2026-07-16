@@ -845,7 +845,7 @@ pub fn resolution_diagnostics_query(
 /// matching its `FileId` against a materialized `fd` dep's target (includes and
 /// imports alike). A target neither in the current file nor in `fd` yields
 /// `None` (suppresses).
-fn item_symbol(
+pub(crate) fn item_symbol(
     db: &dyn Db,
     file: crate::FileId,
     src: SourceText,

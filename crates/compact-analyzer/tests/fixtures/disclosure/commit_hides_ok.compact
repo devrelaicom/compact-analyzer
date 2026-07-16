@@ -1,0 +1,11 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+export ledger c: Bytes<32>;
+
+witness getW(): Bytes<32>;
+witness getR(): Bytes<32>;
+
+export circuit f(): [] {
+  c = persistentCommit<Bytes<32>>(getW(), getR());
+}

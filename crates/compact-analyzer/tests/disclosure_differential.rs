@@ -122,9 +122,21 @@ const FIXTURES: &[Fixture] = &[
     },
     Fixture {
         name: "hash_then_leak.compact",
-        rule: "D2 hashing is not a sanitizer",
+        rule: "N2 persistentHash conduit → K1 ledger sink (A6)",
         discloses: true,
+        native_confirms: true,
+    },
+    Fixture {
+        name: "commit_hides_ok.compact",
+        rule: "N2 persistentCommit sanitizer (both args hidden) (A6)",
+        discloses: false,
         native_confirms: false,
+    },
+    Fixture {
+        name: "container_op_leak.compact",
+        rule: "L2 container-op witness arg leaks (Set.insert) (A6)",
+        discloses: true,
+        native_confirms: true,
     },
     Fixture {
         name: "constructor_arg_leak.compact",

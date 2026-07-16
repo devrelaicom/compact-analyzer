@@ -27,6 +27,7 @@ use super::abs::{
     Abs, PathPoint, Witness, WitnessInfo, combine_abs, disclose, merge_witnesses, witnesses_of,
 };
 use super::leaks::DisclosureSink;
+use super::tables;
 
 /// A root's seeded parameter environment: variable name -> its `Abs`.
 /// A3's interpreter looks up identifiers here when walking a root's body.
@@ -627,24 +628,203 @@ fn interp_call(
             Abs::Atomic(Vec::new())
         }
         CalleeClass::Native => {
-            interp_args_for_effect(ctx, sink, env, control, call);
-            // A5 (K2): a ledger-field METHOD call (`c.method(args)`, receiver a
-            // ledger field) is a ledger OPERATION. When gated, emit the
-            // control-flow leak on the ambient `control` set (`record_leak`
-            // no-ops when `control` is empty ⇒ a top-level container op records
-            // no control leak). KEEP the amber advisory below for the still-
-            // unmodeled per-arg DATA flags (the `discloses?` table is A6): a
-            // top-level container op stays amber, never silent green (§0). No
-            // container-op DATA leak is recorded here — A6 owns that table.
-            if is_method_call(call)
-                && let Some(recv) = method_receiver(call)
-                && is_ledger_field(ctx, &recv)
-            {
-                sink.record_leak(src, "performing this ledger operation", control.to_vec());
+            // Interpret args KEEPING their taint (the conduit folds flagged
+            // args' witnesses into the result; the ledger op leaks flagged
+            // args) — unlike the Circuit arm, which discards it.
+            let args: Vec<Abs> = arg_exprs(call)
+                .iter()
+                .map(|a| interp_expr(ctx, sink, env, control, a))
+                .collect();
+            let name = call
+                .name()
+                .map(|t| t.text().to_string())
+                .unwrap_or_default();
+
+            if is_method_call(call) {
+                interp_ledger_op(ctx, sink, call, control, &name, &args, src)
+            } else {
+                // A plain call classified Native is a stdlib/builtin primitive
+                // (natives don't resolve to a user symbol) — the N2 conduit
+                // table, or the fail-closed unknown-native default.
+                match tables::native_conduit(&name) {
+                    Some(flags) => native_conduit_result(&name, flags, &args, src),
+                    None => unknown_native_result(sink, &name, &args, src),
+                }
             }
-            sink.emit_advisory(src, "native call not yet modeled (A6)".to_string());
-            Abs::Atomic(Vec::new())
         }
+    }
+}
+
+/// A method call reached as `CalleeClass::Native`: a ledger ADT operation
+/// (L2/L3). It's a ledger op when its receiver is a ledger field (A5) OR its op
+/// name is a known ledger op (so a Kernel op whose receiver doesn't resolve as a
+/// ledger symbol is still modeled). Records the K1 per-arg DATA leaks (each arg
+/// whose `discloses?` flag is truthy AND carries witnesses) and the K2
+/// control-flow leak; returns the op's `default-value` (clean). A method call
+/// that is NOT a recognizable ledger op fails closed to an amber advisory +
+/// clean result (defensive — Compact has no user-defined methods).
+fn interp_ledger_op(
+    ctx: &InterpCtx,
+    sink: &mut DisclosureSink,
+    call: &CallExpr,
+    control: &[Witness],
+    name: &str,
+    args: &[Abs],
+    src: TextRange,
+) -> Abs {
+    let recv_is_ledger = method_receiver(call)
+        .map(|r| is_ledger_field(ctx, &r))
+        .unwrap_or(false);
+    let known = tables::ledger_op(name);
+
+    if !recv_is_ledger && known.is_none() {
+        // Not a recognizable ledger op: fail closed (never silent green, §0),
+        // record no leak (no ledger field / op to key on).
+        sink.emit_advisory(
+            src,
+            "method call on a non-ledger receiver not modeled".to_string(),
+        );
+        return Abs::Atomic(Vec::new());
+    }
+
+    // K2 (A5): performing a ledger op under witness control leaks the gating
+    // witnesses (no-op when `control` is empty ⇒ a top-level op records none).
+    sink.record_leak(src, "performing this ledger operation", control.to_vec());
+
+    match known {
+        // L2 container op: every argument leaks with exposure "" (L1 default).
+        Some(tables::LedgerOp::AllArgsLeak) => {
+            leak_all_ledger_args(sink, name, args, src);
+        }
+        // L3 Kernel op: per-arg `discloses?` flags (Some ⇒ leak; None ⇒ hidden).
+        Some(tables::LedgerOp::PerArg(flags)) => {
+            for (i, (flag, arg_abs)) in flags.iter().zip(args).enumerate() {
+                if let Some(exposure) = flag {
+                    leak_ledger_arg(sink, name, i, flags.len(), exposure, arg_abs, src);
+                }
+            }
+        }
+        // Unknown ledger op on a ledger field: fail-closed leak of every
+        // witness arg (matches the L1 default: no clause ⇒ leaks) + advisory.
+        None => {
+            leak_all_ledger_args(sink, name, args, src);
+            sink.emit_advisory(
+                src,
+                format!("unknown ledger op `{name}`; leaking all witness args (fail-closed, may be stale)"),
+            );
+        }
+    }
+    Abs::Atomic(Vec::new())
+}
+
+/// Records a K1 DATA leak for every argument of a container op (L2): each arg
+/// carries the default `discloses? = ""` (exposure ""), so every witness-bearing
+/// arg leaks. `record_leak` no-ops on a clean (witness-free) arg.
+fn leak_all_ledger_args(sink: &mut DisclosureSink, op: &str, args: &[Abs], src: TextRange) {
+    for (i, arg_abs) in args.iter().enumerate() {
+        leak_ledger_arg(sink, op, i, args.len(), "", arg_abs, src);
+    }
+}
+
+/// Records one K1 ledger-op DATA leak: tags the arg's witnesses with the
+/// `discloses?` exposure path point (`the [Nth] argument to <op>`) and records
+/// them under nature `"ledger operation"` (no-op when the arg is witness-free).
+fn leak_ledger_arg(
+    sink: &mut DisclosureSink,
+    op: &str,
+    i: usize,
+    arg_count: usize,
+    exposure: &str,
+    arg_abs: &Abs,
+    src: TextRange,
+) {
+    let pp = PathPoint {
+        src,
+        description: arg_description(op, i, arg_count),
+        exposure: exposure.to_string(),
+    };
+    let witnesses = witnesses_of(&add_path_point(arg_abs.clone(), &pp));
+    sink.record_leak(src, "ledger operation", witnesses);
+}
+
+/// N2 native conduit result: a native records NO leak — it folds each flagged
+/// arg's witnesses into its result with that arg's exposure. Args flagged
+/// `nothing` (`None`) are hidden. The result is modeled as a flat `Atomic` of
+/// the folded witnesses (all native result types are scalars or
+/// structs-of-scalars derived from these same args, so a flat carrier never
+/// under-taints — see `tables::native_conduit`).
+fn native_conduit_result(name: &str, flags: tables::ArgFlags, args: &[Abs], src: TextRange) -> Abs {
+    let mut folded: Vec<Witness> = Vec::new();
+    for (i, (flag, arg_abs)) in flags.iter().zip(args).enumerate() {
+        if let Some(exposure) = flag {
+            let pp = PathPoint {
+                src,
+                description: arg_description(name, i, flags.len()),
+                exposure: (*exposure).to_string(),
+            };
+            let tagged = witnesses_of(&add_path_point(arg_abs.clone(), &pp));
+            folded = merge_witnesses(&folded, &tagged);
+        }
+    }
+    Abs::Atomic(folded)
+}
+
+/// Fail-closed unknown-native default (R0 N1, spec §0): a plain call that is
+/// neither a known native nor a resolvable witness/circuit is conduit-tainted
+/// (ALL args fold into the result, exposure "") AND advised. The N2 table is
+/// complete for compactc-v0.31.1, so this fires only on version drift / an
+/// unresolvable callee — never silent green.
+fn unknown_native_result(
+    sink: &mut DisclosureSink,
+    name: &str,
+    args: &[Abs],
+    src: TextRange,
+) -> Abs {
+    let mut folded: Vec<Witness> = Vec::new();
+    for (i, arg_abs) in args.iter().enumerate() {
+        let pp = PathPoint {
+            src,
+            description: arg_description(name, i, args.len()),
+            exposure: String::new(),
+        };
+        folded = merge_witnesses(
+            &folded,
+            &witnesses_of(&add_path_point(arg_abs.clone(), &pp)),
+        );
+    }
+    sink.emit_advisory(
+        src,
+        format!("unknown native `{name}` not in the conduit table; conduit-tainting all args (fail-closed, may be stale)"),
+    );
+    Abs::Atomic(folded)
+}
+
+/// A call-argument path-point description, mirroring the compiler's
+/// `"the ~@[~:r ~]argument to ~a"` (`analysis-passes.ss`): the ordinal is
+/// included only when the callee takes more than one argument (a single-arg
+/// native/op reads "the argument to persistentHash", matching compactc).
+fn arg_description(callee: &str, i: usize, arg_count: usize) -> String {
+    if arg_count > 1 {
+        format!("the {} argument to {}", ordinal(i + 1), callee)
+    } else {
+        format!("the argument to {callee}")
+    }
+}
+
+/// The English ordinal word for `n` (1 -> "first"), mirroring the compiler's
+/// `~:r` directive. Falls back to a numeric ordinal beyond the small set that
+/// any native/ledger-op arity actually needs.
+fn ordinal(n: usize) -> String {
+    match n {
+        1 => "first".into(),
+        2 => "second".into(),
+        3 => "third".into(),
+        4 => "fourth".into(),
+        5 => "fifth".into(),
+        6 => "sixth".into(),
+        7 => "seventh".into(),
+        8 => "eighth".into(),
+        _ => format!("{n}th"),
     }
 }
 
@@ -1361,6 +1541,7 @@ fn add_path_point(abs: Abs, pp: &PathPoint) -> Abs {
 mod tests {
     use std::sync::Arc;
 
+    use super::super::leaks::DisclosureLeak;
     use super::*;
     use crate::db::CompactDatabase;
 
@@ -1759,13 +1940,11 @@ mod tests {
     }
 
     #[test]
-    fn native_call_fails_closed_to_amber_clean() {
-        // Unresolved callee -> native/unknown path (A6 deferral): fail closed to
-        // an AMBER advisory with a CLEAN result. The arg taint does NOT propagate
-        // through the unmodeled callee (a tainted result would become a
-        // false-positive RED leak at a downstream sink for a native that is
-        // actually a sanitizer, e.g. `persistentCommit`). A6's conduit table
-        // promotes the real conduits (e.g. `persistentHash`) back to tainted.
+    fn unknown_native_call_conduit_taints_and_advises() {
+        // A6 fail-closed default (R0 N1): an unresolved callee is an UNKNOWN
+        // native ⇒ conduit-taint ALL args into the result + an amber advisory
+        // (§0). This replaces A5's clean-result stopgap. (A KNOWN native like
+        // `persistentCommit` still sanitizes via the N2 table.)
         let (db, src, fd, ws, file) =
             walk_setup("export circuit f(): Field { return blackbox(w); }\n");
         let ctx = InterpCtx {
@@ -1784,12 +1963,15 @@ mod tests {
         let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
         assert!(
             !sink.advisories().is_empty(),
-            "native/unknown call emits advisory"
+            "unknown native call emits a fail-closed advisory"
         );
-        assert!(
-            witnesses_of(&out).is_empty(),
-            "native call result is clean (amber, not red) — taint deferred to A6"
+        let ws_out = witnesses_of(&out);
+        assert_eq!(
+            ws_out.len(),
+            1,
+            "unknown native conduit-taints its arg into the result"
         );
+        assert_eq!(ws_out[0].uid, 1);
     }
 
     #[test]
@@ -2137,11 +2319,11 @@ mod tests {
     }
 
     #[test]
-    fn ledger_method_call_control_leaks_and_keeps_advisory() {
-        // A5/A6 boundary: a ledger-field METHOD call (`c.increment(1)`,
-        // c: Counter) gated on a witness records the control leak, while KEEPING
-        // the amber advisory for the still-unmodeled per-arg DATA flags (A6). No
-        // container-op DATA leak is recorded here.
+    fn ledger_method_call_control_leaks_no_data_and_no_advisory() {
+        // A6: a ledger-field METHOD call (`c.increment(1)`, c: Counter) gated on
+        // a witness records the K2 control leak. The `increment` op IS now
+        // modeled (L2), so its clean constant arg `1` records NO data leak and
+        // the op emits NO fail-closed advisory (it replaced A5's stopgap).
         let (db, src, fd, ws, file) = walk_setup(
             "import CompactStandardLibrary;\n\
              export ledger c: Counter;\n\
@@ -2162,12 +2344,12 @@ mod tests {
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
-        let advisory_kept = !sink.advisories().is_empty();
+        let had_advisory = !sink.advisories().is_empty();
         let leaks = sink.drain_leaks();
         assert_eq!(
             leaks.len(),
             1,
-            "only the control leak (no container-op data)"
+            "only the control leak (clean constant arg ⇒ no data leak)"
         );
         assert_eq!(leaks[0].nature, "performing this ledger operation");
         assert_eq!(leaks[0].witnesses.len(), 1);
@@ -2178,8 +2360,122 @@ mod tests {
             }
         );
         assert!(
-            advisory_kept,
-            "amber advisory kept for the unmodeled container-op data flags (A6)"
+            !had_advisory,
+            "a modeled (known) ledger op emits no fail-closed advisory"
+        );
+    }
+
+    // -- A6 native conduit + ledger-op flag tables ----------------------
+
+    /// Drives every root and returns the drained leak table plus whether any
+    /// advisory was recorded — the shared shape of the A6 call-handling tests.
+    fn walk_leaks(text: &str) -> (Vec<DisclosureLeak>, bool) {
+        let (db, src, fd, ws, file) = walk_setup(text);
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let roots = discover_roots(&tree);
+        let mut sink = DisclosureSink::new();
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        let had_advisory = !sink.advisories().is_empty();
+        (sink.drain_leaks(), had_advisory)
+    }
+
+    #[test]
+    fn native_hash_is_conduit_then_ledger_write_leaks() {
+        // N2 conduit + K1 sink (the `hash_then_leak` flip): `persistentHash`
+        // records NO leak itself, but folds getW into its Bytes<32> result with
+        // exposure "a hash of" — so the enclosing ledger Cell-write leaks it.
+        let (leaks, had_advisory) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Bytes<32>;\n\
+             witness getW(): Bytes<32>;\n\
+             export circuit f(): [] { c = persistentHash<Bytes<32>>(getW()); }\n",
+        );
+        assert_eq!(leaks.len(), 1, "the ledger write leaks the hashed witness");
+        assert_eq!(leaks[0].nature, "ledger operation");
+        assert_eq!(leaks[0].witnesses.len(), 1);
+        assert_eq!(
+            leaks[0].witnesses[0].info,
+            WitnessInfo::WitnessReturn {
+                function: "getW".into()
+            }
+        );
+        // The conduit exposure rides on the witness's path trail.
+        assert!(
+            leaks[0].witnesses[0]
+                .path
+                .iter()
+                .any(|pp| pp.exposure == "a hash of"),
+            "the conduit's 'a hash of' exposure is on the disclosure path"
+        );
+        // A known native + a modeled ledger write ⇒ no fail-closed advisory.
+        assert!(!had_advisory, "known native conduit emits no advisory");
+    }
+
+    #[test]
+    fn native_commit_hides_witness_no_leak() {
+        // N2: `persistentCommit` flags BOTH args `nothing` — the native
+        // sanitizer. Committing witnesses then writing the result leaks nothing.
+        let (leaks, had_advisory) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Bytes<32>;\n\
+             witness getW(): Bytes<32>;\n\
+             witness getR(): Bytes<32>;\n\
+             export circuit f(): [] { c = persistentCommit<Bytes<32>>(getW(), getR()); }\n",
+        );
+        assert!(leaks.is_empty(), "commit hides both args ⇒ no leak");
+        assert!(!had_advisory, "known native sanitizer emits no advisory");
+    }
+
+    #[test]
+    fn container_op_witness_arg_leaks() {
+        // L2: `Set.insert` carries the default `discloses? = ""` (truthy) ⇒ its
+        // witness argument is an immediate "ledger operation" leak.
+        let (leaks, had_advisory) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger s: Set<Uint<8>>;\n\
+             witness getW(): Uint<8>;\n\
+             export circuit f(): [] { s.insert(getW()); }\n",
+        );
+        assert_eq!(leaks.len(), 1, "the container op leaks its witness arg");
+        assert_eq!(leaks[0].nature, "ledger operation");
+        assert_eq!(leaks[0].witnesses.len(), 1);
+        assert_eq!(
+            leaks[0].witnesses[0].info,
+            WitnessInfo::WitnessReturn {
+                function: "getW".into()
+            }
+        );
+        assert!(!had_advisory, "known ledger op emits no advisory");
+    }
+
+    #[test]
+    fn unknown_native_conduit_taints_and_advises() {
+        // Fail-closed default (R0 N1): a plain call to a name that is neither a
+        // known native nor a resolvable witness/circuit is conduit-tainted (all
+        // args flow into the result) AND advised. The tainted result then leaks
+        // at the ledger write.
+        let (leaks, had_advisory) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Bytes<32>;\n\
+             witness getW(): Bytes<32>;\n\
+             export circuit f(): [] { c = mysteryNative(getW()); }\n",
+        );
+        assert_eq!(leaks.len(), 1, "unknown native conduit-taints its arg");
+        assert_eq!(leaks[0].nature, "ledger operation");
+        assert_eq!(leaks[0].witnesses.len(), 1);
+        assert!(
+            had_advisory,
+            "unknown native records a fail-closed advisory (§0)"
         );
     }
 }

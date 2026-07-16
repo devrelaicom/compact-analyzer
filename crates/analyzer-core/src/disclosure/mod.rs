@@ -24,6 +24,7 @@
 mod abs;
 mod interp;
 mod leaks;
+mod tables;
 
 use std::sync::Arc;
 

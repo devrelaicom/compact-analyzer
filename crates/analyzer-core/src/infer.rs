@@ -64,7 +64,9 @@ pub(crate) fn type_node_kind(ty: &compactp_ast::Type) -> TyKind {
 ///
 /// A `Type::Ref` with no name token, or one that does not resolve to a
 /// struct/enum decl, lowers to `Unknown` (suppress, never guess).
-#[allow(dead_code)] // consumed by the expr/param-typing task (v2b.9 Task 3).
+///
+/// First consumed by v2b.9 Task 3's `expr_ty` (param / const-annotation /
+/// callee-return typing).
 pub(crate) fn type_kind_resolved(
     db: &dyn Db,
     file: crate::FileId,
@@ -572,6 +574,26 @@ impl crate::AnalysisHost {
             diags.retain(|d| !ranges.iter().any(|r| r.contains_range(d.primary_span)));
         }
         diags
+    }
+
+    /// The `TyKind` of the expression at `offset` in `file`, or `None` when the
+    /// position is unmodeled/`Unknown`. IDE-facing entry consumed by v2c (typed
+    /// member completion, inlay hints, signature-help detail): the IDE renders
+    /// it via `display_kind`/`ty_display` and enumerates `Struct.fields`.
+    /// Resolution-fed, so — like the other resolution bridges — it indexes the
+    /// file to materialize its dependency edges, provisions the salsa inputs,
+    /// and hands off to the tracked `crate::db::expr_ty`. `Unknown` is projected
+    /// to `None` so callers get a value only when the checker actually modeled
+    /// the expression.
+    pub fn type_at(&mut self, file: crate::FileId, offset: text_size::TextSize) -> Option<TyKind> {
+        let src = self.src_of(file)?;
+        self.ensure_indexed(file);
+        let fd = self.file_deps(file);
+        let ws = self.workspace();
+        match crate::db::expr_ty(self.db_ref(), file, src, fd, ws, offset) {
+            TyKind::Unknown => None,
+            kind => Some(kind),
+        }
     }
 }
 

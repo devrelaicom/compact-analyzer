@@ -92,6 +92,11 @@
           "default": true,
           "markdownDescription": "Enable server-provided formatting for Compact files, sent to the server as `initializationOptions.formatting`."
         },
+        "compact-analyzer.typeDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Publish native type diagnostics (as-you-type type checking) in the Problems panel, sent to the server as `initializationOptions.typeDiagnostics`. When disabled, only parse and name-resolution diagnostics are shown live and type errors are surfaced by the compiler on save (via `compileOnSave`). Changing this setting requires restarting the language server."
+        },
         "compact-analyzer.trace.server": {
           "type": "string",
           "enum": [

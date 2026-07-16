@@ -12,11 +12,11 @@ function fakeReader(settings: Record<string, unknown>): ConfigReader {
 }
 
 describe("buildInitOptions", () => {
-  it("(a) at defaults sends EXACTLY compileOnSave + formatting", () => {
+  it("(a) at defaults sends EXACTLY compileOnSave + formatting + typeDiagnostics", () => {
     const result = buildInitOptions(fakeReader({}));
     // importSearchPath/toolchainPath must be ABSENT, not present-with-empty.
-    expect(Object.keys(result).sort()).toEqual(["compileOnSave", "formatting"]);
-    expect(result).toEqual({ compileOnSave: true, formatting: true });
+    expect(Object.keys(result).sort()).toEqual(["compileOnSave", "formatting", "typeDiagnostics"]);
+    expect(result).toEqual({ compileOnSave: true, formatting: true, typeDiagnostics: true });
   });
 
   it("(b) passes a populated importSearchPath and toolchainPath through", () => {
@@ -28,6 +28,7 @@ describe("buildInitOptions", () => {
       toolchainPath: "/x",
       compileOnSave: true,
       formatting: true,
+      typeDiagnostics: true,
     });
   });
 
@@ -35,7 +36,7 @@ describe("buildInitOptions", () => {
     const result = buildInitOptions(fakeReader({ importSearchPath: [], toolchainPath: "" }));
     // G2: an explicit `importSearchPath: []` would suppress the server's
     // COMPACT_PATH fallback, so an empty array must NOT be sent at all.
-    expect(Object.keys(result).sort()).toEqual(["compileOnSave", "formatting"]);
+    expect(Object.keys(result).sort()).toEqual(["compileOnSave", "formatting", "typeDiagnostics"]);
     expect(result.importSearchPath).toBeUndefined();
     expect(result.toolchainPath).toBeUndefined();
   });
@@ -50,7 +51,7 @@ describe("buildInitOptions", () => {
   // must never forward a wrong-typed value to the server.
   it("omits importSearchPath when it reads back as null (no throw)", () => {
     const result = buildInitOptions(fakeReader({ importSearchPath: null }));
-    expect(Object.keys(result).sort()).toEqual(["compileOnSave", "formatting"]);
+    expect(Object.keys(result).sort()).toEqual(["compileOnSave", "formatting", "typeDiagnostics"]);
     expect(result.importSearchPath).toBeUndefined();
   });
 
@@ -72,6 +73,16 @@ describe("buildInitOptions", () => {
   it("defaults a non-boolean compileOnSave to true", () => {
     const result = buildInitOptions(fakeReader({ compileOnSave: "yes" }));
     expect(result.compileOnSave).toBe(true);
+  });
+
+  it("preserves a configured typeDiagnostics=false", () => {
+    const result = buildInitOptions(fakeReader({ typeDiagnostics: false }));
+    expect(result.typeDiagnostics).toBe(false);
+  });
+
+  it("defaults a non-boolean typeDiagnostics to true", () => {
+    const result = buildInitOptions(fakeReader({ typeDiagnostics: "yes" }));
+    expect(result.typeDiagnostics).toBe(true);
   });
 });
 

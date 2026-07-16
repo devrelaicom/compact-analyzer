@@ -788,18 +788,11 @@ impl GlobalState {
             return;
         };
         let line_index = analysis.line_index.clone();
-        // Native diagnostics, computed on the main thread (the worker can't read
-        // `host`): both the parser set and the import/include resolution set,
-        // exactly as `publish_file_diagnostics` builds them.
-        let mut native: Vec<lsp_types::Diagnostic> = analysis
-            .diagnostics
-            .iter()
-            .map(|d| lsp_utils::diagnostic_to_lsp(d, &line_index, &uri))
-            .collect();
         drop(analysis);
-        for d in self.host.resolution_diagnostics(file) {
-            native.push(lsp_utils::diagnostic_to_lsp(&d, &line_index, &uri));
-        }
+        // Native diagnostics (parser + resolution + type), computed on the main
+        // thread because the compile worker cannot read `host`. Built through
+        // the shared helper so the live and on-save paths never diverge.
+        let native = self.build_native_diagnostics(file, &uri, &line_index);
         let search_path = self.host.import_search_path();
         // Bump this file's save generation under lock; the worker re-checks it
         // (under the same lock) before storing/publishing, so a stale worker
@@ -881,6 +874,36 @@ impl GlobalState {
         }
     }
 
+    /// Assembles the full native diagnostic set for `file` — parser, resolution,
+    /// and (when `typeDiagnostics` is enabled) type diagnostics — each converted
+    /// to LSP and tagged `source = "compact-analyzer"`. This is the SINGLE place
+    /// native diagnostics are built, shared by the live publish path
+    /// (`publish_file_diagnostics`) and the on-save path (`did_save`), so the two
+    /// can never drift apart. `type_diagnostics` is already corpus-gate-green and
+    /// is forwarded verbatim (never re-filtered here).
+    fn build_native_diagnostics(
+        &mut self,
+        file: FileId,
+        uri: &Url,
+        line_index: &LineIndex,
+    ) -> Vec<lsp_types::Diagnostic> {
+        let mut native: Vec<lsp_types::Diagnostic> = match self.host.analyze(file) {
+            Some(analysis) => analysis
+                .diagnostics
+                .iter()
+                .map(|d| lsp_utils::diagnostic_to_lsp(d, line_index, uri))
+                .collect(),
+            None => Vec::new(),
+        };
+        for d in self.host.resolution_diagnostics(file) {
+            native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+        }
+        for d in self.host.type_diagnostics(file) {
+            native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+        }
+        native
+    }
+
     fn publish_file_diagnostics(&mut self, file: FileId) {
         let Some(uri) = self
             .open_files
@@ -893,15 +916,10 @@ impl GlobalState {
         let Some(analysis) = self.host.analyze(file) else {
             return;
         };
+        let line_index = analysis.line_index.clone();
+        drop(analysis);
         let version = self.host.vfs().overlay_version(file);
-        let mut native: Vec<lsp_types::Diagnostic> = analysis
-            .diagnostics
-            .iter()
-            .map(|d| lsp_utils::diagnostic_to_lsp(d, &analysis.line_index, &uri))
-            .collect();
-        for d in self.host.resolution_diagnostics(file) {
-            native.push(lsp_utils::diagnostic_to_lsp(&d, &analysis.line_index, &uri));
-        }
+        let native = self.build_native_diagnostics(file, &uri, &line_index);
         // Re-merge the file's stored compiler diagnostics (from the last save)
         // so this debounced NATIVE republish doesn't wipe them.
         let compiler = lock(&self.compiler_diagnostics)

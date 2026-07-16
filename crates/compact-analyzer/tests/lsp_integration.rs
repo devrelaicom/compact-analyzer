@@ -115,3 +115,28 @@ fn unknown_requests_get_an_error_not_a_crash() {
 
     client.shutdown();
 }
+
+#[test]
+fn publishes_native_type_diagnostic_on_open() {
+    let (_dir, uri) = temp_doc();
+    let mut client = Client::start();
+    client.initialize();
+
+    // Verified type error: `true` is Boolean, not a subtype of the declared
+    // Field return -> native emits E3001, source "compact-analyzer".
+    did_open(
+        &mut client,
+        &uri,
+        1,
+        "export circuit foo(): Field { return true; }",
+    );
+    let params = client.wait_for_notification("textDocument/publishDiagnostics");
+    let diags = params["diagnostics"].as_array().unwrap();
+    assert!(
+        diags
+            .iter()
+            .any(|d| d["code"] == "E3001" && d["source"] == "compact-analyzer"),
+        "expected an E3001 type diagnostic from compact-analyzer, got {diags:#?}"
+    );
+    client.shutdown();
+}

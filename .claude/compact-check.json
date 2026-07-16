@@ -1,0 +1,5 @@
+{
+  "exclude": [
+    "crates/compact-analyzer/tests/fixtures/type/"
+  ]
+}

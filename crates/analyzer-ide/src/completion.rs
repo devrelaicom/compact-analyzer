@@ -742,6 +742,22 @@ fn push_member(
             }
         }
     }
+    // Struct-typed receiver (v2b.9 type_at): offer the struct's fields. This is
+    // the typed-member-access case the resolve-based branches above cannot cover
+    // (a param/local/const of a nominal struct type). `type_at` returns None for
+    // anything unmodeled/unresolved/cross-file-local/generic, so a non-struct or
+    // unknown receiver correctly offers nothing.
+    let offset = non_trivia_start(receiver);
+    if let Some(analyzer_core::TyKind::Struct { fields, .. }) = host.type_at(pos.file, offset) {
+        for (name, ty) in fields.iter() {
+            items.push(CompletionItem {
+                label: name.to_string(),
+                kind: CompletionKind::StructField,
+                detail: Some(analyzer_core::display_kind(ty)),
+                documentation: None,
+            });
+        }
+    }
 }
 
 fn push_struct_fields(
@@ -993,6 +1009,23 @@ mod tests {
                 "chained receiver leaked Map method `{m}`: {ls:?}"
             );
         }
+    }
+
+    #[test]
+    fn member_on_struct_typed_param_offers_fields() {
+        let ls = labels(
+            "struct S { a: Field; b: Boolean; }\n\
+             circuit c(s: S): Field { return s.$0a; }",
+        );
+        assert!(ls.contains(&"a".to_string()), "{ls:?}");
+        assert!(ls.contains(&"b".to_string()), "{ls:?}");
+    }
+
+    #[test]
+    fn member_on_non_struct_local_offers_no_fields() {
+        // A Field-typed local has no members -> offer nothing (never a wrong member).
+        let ls = labels("circuit c(x: Field): Field { return x.$0y; }");
+        assert!(ls.is_empty(), "{ls:?}");
     }
 
     // ---- C1: prefix / selective-list / alias import semantics ----

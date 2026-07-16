@@ -67,6 +67,14 @@ async function waitForCompactDiagnostic(uri: vscode.Uri, timeoutMs: number): Pro
   }
 }
 
+/**
+ * An `InlayHint.label` is either a plain string or `InlayHintLabelPart[]`;
+ * normalize to a string so callers can do a simple substring match.
+ */
+function normalizeInlayHintLabel(label: string | vscode.InlayHintLabelPart[]): string {
+  return typeof label === "string" ? label : label.map((part) => part.value).join("");
+}
+
 suite("Compact Analyzer activation smoke", () => {
   let api: ExtensionApi;
   const rejections: unknown[] = [];
@@ -140,6 +148,129 @@ suite("Compact Analyzer activation smoke", () => {
       typeDiags.length >= 1,
       `expected an E3001 native type diagnostic within ${DIAGNOSTIC_TIMEOUT_MS}ms, ` +
         `got ${JSON.stringify(vscode.languages.getDiagnostics(uri).map((d) => ({ source: d.source, code: d.code, message: d.message })))}`,
+    );
+  });
+
+  // Task 4 (v2c §8 done-bar): the three type-aware editor features are LSP
+  // capabilities the thin `vscode-languageclient` inherits once the server
+  // advertises them (Tasks 1-3) — no client code drives them. These tests
+  // prove they work in a REAL extension host via `vscode.commands.execute*`,
+  // not merely over an LSP integration harness. All three share one fixture,
+  // `uxfeatures.compact`:
+  //
+  //   struct S { a: Field; b: Boolean; }
+  //   circuit add(x: Field, y: Field): Field { return x + y; }
+  //   export circuit c(s: S): Field { const n = add(1, 2); return s.a + n; }
+  //
+  // which is verified to compile-accept live via `compact compile --skip-zk
+  // --vscode`. Positions below are 0-indexed line/character offsets into line
+  // 8 (the `export circuit c(...)` line), computed from the fixture text.
+
+  test("scenario 1c: inlay hints render the const binding's inferred Field type", async function () {
+    this.timeout(DIAGNOSTIC_TIMEOUT_MS + 15_000);
+    assert.strictEqual(api.serverStatus(), "running", "server should be running for the inlay-hint check");
+
+    const uri = fixtureUri("uxfeatures.compact");
+    const document = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(document);
+
+    const fullRange = new vscode.Range(new vscode.Position(0, 0), document.lineAt(document.lineCount - 1).range.end);
+
+    const deadline = Date.now() + DIAGNOSTIC_TIMEOUT_MS;
+    let hints: vscode.InlayHint[] = [];
+    let hasFieldHint = false;
+    for (;;) {
+      hints =
+        (await vscode.commands.executeCommand<vscode.InlayHint[]>(
+          "vscode.executeInlayHintProvider",
+          uri,
+          fullRange,
+        )) ?? [];
+      hasFieldHint = hints.some((hint) => normalizeInlayHintLabel(hint.label).includes("Field"));
+      if (hasFieldHint || Date.now() >= deadline) {
+        break;
+      }
+      await delay(200);
+    }
+
+    assert.ok(
+      hasFieldHint,
+      `expected an inlay hint whose label contains "Field" (the const n = add(1, 2) binding) within ` +
+        `${DIAGNOSTIC_TIMEOUT_MS}ms, got ${JSON.stringify(
+          hints.map((hint) => ({ label: normalizeInlayHintLabel(hint.label), position: hint.position })),
+        )}`,
+    );
+  });
+
+  test("scenario 1d: signature help reports the active parameter inside add(1, 2)", async function () {
+    this.timeout(DIAGNOSTIC_TIMEOUT_MS + 15_000);
+    assert.strictEqual(api.serverStatus(), "running", "server should be running for the signature-help check");
+
+    const uri = fixtureUri("uxfeatures.compact");
+    const document = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(document);
+
+    // Line 8: `export circuit c(s: S): Field { const n = add(1, 2); return s.a + n; }`
+    // Character 46 is the gap between `add(` and the `1` argument — inside the call.
+    const positionInsideAddCall = new vscode.Position(8, 46);
+
+    const deadline = Date.now() + DIAGNOSTIC_TIMEOUT_MS;
+    let help: vscode.SignatureHelp | undefined;
+    for (;;) {
+      help = await vscode.commands.executeCommand<vscode.SignatureHelp>(
+        "vscode.executeSignatureHelpProvider",
+        uri,
+        positionInsideAddCall,
+        "(",
+      );
+      if ((help?.signatures.length ?? 0) >= 1 || Date.now() >= deadline) {
+        break;
+      }
+      await delay(200);
+    }
+
+    assert.ok(
+      help && help.signatures.length >= 1,
+      `expected >=1 signature within ${DIAGNOSTIC_TIMEOUT_MS}ms, got ${JSON.stringify(help)}`,
+    );
+    assert.strictEqual(
+      typeof help?.activeParameter,
+      "number",
+      `expected activeParameter to be a number, got ${JSON.stringify(help?.activeParameter)}`,
+    );
+  });
+
+  test("scenario 1e: typed member completion on `s.` offers the struct's fields", async function () {
+    this.timeout(DIAGNOSTIC_TIMEOUT_MS + 15_000);
+    assert.strictEqual(api.serverStatus(), "running", "server should be running for the member-completion check");
+
+    const uri = fixtureUri("uxfeatures.compact");
+    const document = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(document);
+
+    // Line 8: `export circuit c(s: S): Field { const n = add(1, 2); return s.a + n; }`
+    // Character 62 sits immediately after the `.` in `s.a`.
+    const positionAfterDot = new vscode.Position(8, 62);
+
+    const deadline = Date.now() + DIAGNOSTIC_TIMEOUT_MS;
+    let labels: string[] = [];
+    for (;;) {
+      const list = await vscode.commands.executeCommand<vscode.CompletionList>(
+        "vscode.executeCompletionItemProvider",
+        uri,
+        positionAfterDot,
+      );
+      labels = (list?.items ?? []).map((item) => (typeof item.label === "string" ? item.label : item.label.label));
+      if ((labels.includes("a") && labels.includes("b")) || Date.now() >= deadline) {
+        break;
+      }
+      await delay(200);
+    }
+
+    assert.ok(
+      labels.includes("a") && labels.includes("b"),
+      `expected completion items "a" and "b" (struct S's fields) within ${DIAGNOSTIC_TIMEOUT_MS}ms, ` +
+        `got ${JSON.stringify(labels)}`,
     );
   });
 

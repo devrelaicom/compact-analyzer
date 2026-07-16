@@ -2339,6 +2339,65 @@ mod tests {
         }
     }
 
+    /// CARRIED-FORWARD (Task 3 review): pins the `MAX_NOMINAL_DEPTH` guard in
+    /// [`type_expr`]'s local-const recursion (`depth >= MAX_NOMINAL_DEPTH ->
+    /// Unknown`), which was traced-correct but had no direct test.
+    ///
+    /// Two constructions, both asserted never to panic/hang and to yield
+    /// `Unknown`.
+    ///
+    /// Construction 1 is the literal textual "mutual cycle" `const a = b;
+    /// const b = a;`. Verified (by inspection of
+    /// `resolve::collect_scope_bindings`'s `BLOCK` arm) that block-local
+    /// `const` visibility is *sequential*: a binding is only in scope at a
+    /// *later* offset than its own statement's end. So `b`'s reference inside
+    /// `a`'s initializer sits textually BEFORE `const b`'s own declaration
+    /// and is never visible there — this construction actually bottoms out
+    /// via ordinary unresolved-name suppression (depth 1), not the depth
+    /// counter. Kept as a regression fixture anyway (a mutual-looking cycle
+    /// must never panic/hang), but it does NOT alone exercise the cap.
+    ///
+    /// Construction 2 is a genuine 39-hop acyclic chain (`const a0 = 0; const
+    /// a1 = a0; ... const a39 = a38;`), which — since each hop resolves
+    /// successfully (every reference is to a *prior*, in-scope binding) —
+    /// actually drives `depth` past `MAX_NOMINAL_DEPTH` (32) and hits the cap
+    /// directly. This is the real regression for the guard: sequential local
+    /// scoping alone cannot produce a resolvable local cycle, so a long chain
+    /// is the only way to reach the cap through this path (mirrors how
+    /// self-referential *struct* cycles — reachable, since named-type lookup
+    /// is order-independent — are covered separately by `named_type_ty`'s own
+    /// `visited` guard).
+    #[test]
+    fn expr_ty_local_chain_and_pseudo_cycle_terminate_via_depth_cap() {
+        let db = CompactDatabase::default();
+        let (fd, ws) = empty_ctx(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+
+        // 1. Textual "mutual cycle" — never visible both ways, but must not
+        // panic/hang, and must suppress to Unknown.
+        let text = "export circuit c(): Field { const a = b; const b = a; return a; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let off = text.find("return a").unwrap() + "return ".len();
+        assert_eq!(
+            expr_ty(&db, file, src, fd, ws, (off as u32).into()),
+            crate::ty::TyKind::Unknown
+        );
+
+        // 2. Genuine 39-hop chain (> MAX_NOMINAL_DEPTH = 32): every hop
+        // resolves, so this actually drives `depth` into the cap.
+        let mut chain = String::from("export circuit c2(): Field { const a0 = 0; ");
+        for i in 1..40 {
+            chain.push_str(&format!("const a{i} = a{}; ", i - 1));
+        }
+        chain.push_str("return a39; }");
+        let src2 = SourceText::new(&db, Arc::from(chain.clone()));
+        let off2 = chain.find("return a39").unwrap() + "return ".len();
+        assert_eq!(
+            expr_ty(&db, file, src2, fd, ws, (off2 as u32).into()),
+            crate::ty::TyKind::Unknown
+        );
+    }
+
     #[test]
     fn expr_ty_identifier_param_types_to_struct() {
         let db = CompactDatabase::default();
@@ -2469,6 +2528,77 @@ mod tests {
             host.type_at(file, (off as u32).into()),
             Some(TyKind::Field),
             "cross-file struct member `s.a` must type to Field"
+        );
+    }
+
+    /// CARRIED-FORWARD (Task 3 review): the `include`-based cross-file arm,
+    /// with a *nested* named field — a struct field whose own type is itself
+    /// a struct reached across the include boundary. The prior cross-file
+    /// test above (Task 3) used `import` and an all-primitive struct, so its
+    /// `dfd = deps_for(...)` in `named_type_ty` (db.rs) was computed but
+    /// never actually dereferenced (`lower_type_in`'s `Type::Ref` arm, the
+    /// only consumer, is never reached by a primitive field). `include` is
+    /// required here, not `import`: `AnalysisHost::ensure_indexed` only
+    /// walks `is_include` edges to index a target file (publishing its own
+    /// `FileDeps` into the workspace map), so only an `include`d target gets
+    /// an entry `deps_for`'s cross-file branch (`ws.file_deps(db).get(&target)`)
+    /// can find; a plain `import` target is never indexed this way and
+    /// `deps_for` would return `None` there, suppressing the nested field to
+    /// `Unknown` instead.
+    ///
+    /// `T` (struct, in `Lib.compact`, `include`d from `main.compact`) has a
+    /// field `s: S` where `S` is itself a struct (also in `Lib.compact`).
+    /// Building `T`'s fields recurses into `lower_named_at` for `S`, which
+    /// calls `deps_for` a SECOND time (this time with `target == this_file`,
+    /// the same-file `Some` arm) — so this test exercises `deps_for`'s
+    /// cross-file `Some` branch at the *outer* hop (resolving `T` itself from
+    /// `main.compact`) in a way that is actually load-bearing for the result,
+    /// unlike Task 3's primitive-only fixture.
+    #[test]
+    fn expr_ty_cross_file_include_nested_struct_member_types_to_field() {
+        use crate::ty::TyKind;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Lib.compact"),
+            "struct S { a: Field; }\nstruct T { s: S; }",
+        )
+        .unwrap();
+        let main_src = "include \"Lib\";\nexport circuit c(t: T): Field { return t.s.a; }";
+        let main_path = dir.path().join("main.compact");
+        std::fs::write(&main_path, main_src).unwrap();
+
+        let mut host = crate::AnalysisHost::new();
+        let file = host.vfs_mut().file_id(&main_path);
+        host.vfs_mut().set_overlay(file, main_src.to_string(), 1);
+
+        // Sanity: the cross-file (include) type reference resolves at all.
+        let t_off = main_src.find("t: T").unwrap() + 3;
+        assert!(
+            host.resolve(crate::FilePosition {
+                file,
+                offset: (t_off as u32).into(),
+            })
+            .is_some(),
+            "include-based cross-file struct reference `T` must resolve"
+        );
+
+        // `t.s` -> the nested cross-file struct field -> Struct S.
+        let s_off = main_src.find("return t.s.a").unwrap() + "return t.".len();
+        assert_eq!(
+            host.type_at(file, (s_off as u32).into()),
+            Some(TyKind::Struct {
+                name: Arc::from("S"),
+                fields: Arc::from(vec![(Arc::<str>::from("a"), TyKind::Field)]),
+            }),
+            "include-based nested field `t.s` must type to Struct S"
+        );
+
+        // `t.s.a` -> field `a` of the nested cross-file struct S -> Field.
+        let a_off = main_src.find("return t.s.a").unwrap() + "return t.s.".len();
+        assert_eq!(
+            host.type_at(file, (a_off as u32).into()),
+            Some(TyKind::Field),
+            "include-based nested cross-file struct member `t.s.a` must type to Field"
         );
     }
 }

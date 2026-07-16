@@ -1,0 +1,2 @@
+enum E { A, B }
+export circuit c(): E { return E.A; }

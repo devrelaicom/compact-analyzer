@@ -864,6 +864,205 @@ fn item_symbol(
     item_tree(db, tsrc).symbols.get(index as usize).cloned()
 }
 
+/// Maximum nominal-lowering recursion depth. A struct-field chain deeper than
+/// this lowers the over-deep reference to `TyKind::Unknown` (suppress, never a
+/// false positive). Belt-and-suspenders alongside the `visited`-set cycle
+/// guard: `visited` already bounds recursion to the number of *distinct* struct
+/// names on the active path, but a pathological deep-but-acyclic chain is capped
+/// here too.
+const MAX_NOMINAL_DEPTH: usize = 32;
+
+/// Lowers the struct/enum type-name token at `name_offset` in `file` to its
+/// nominal `TyKind`, by resolving the name to a `Struct`/`Enum` decl and reading
+/// its child fields/variants from the target file's item tree. Returns
+/// `TyKind::Unknown` when the name does not resolve to a struct/enum decl
+/// (suppress, never guess) — this preserves never-a-false-positive. This query
+/// can only *widen* what the typing layer can attribute (an `Unknown` result
+/// suppresses downstream rules). Resolution-fed, mirroring `callee_sig`'s
+/// `(file, src, fd, ws, offset)` parameter shape.
+///
+/// Recursion/cycle safety is load-bearing: a struct whose field (transitively)
+/// references its own type must not loop. The recursion runs in the plain,
+/// non-tracked helper [`lower_named_at`] carrying an explicit `visited` set of
+/// struct names (the `&mut Vec` cannot be a salsa key), exactly as
+/// `resolve_includes` carries its `active` guard. A back-edge to a name already
+/// on the active path — and any reference past [`MAX_NOMINAL_DEPTH`] — lowers to
+/// `TyKind::Unknown`.
+#[salsa::tracked(returns(clone))]
+pub(crate) fn named_type_ty(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    name_offset: text_size::TextSize,
+) -> crate::ty::TyKind {
+    let mut visited: Vec<Arc<str>> = Vec::new();
+    lower_named_at(db, file, src, fd, ws, name_offset, &mut visited)
+}
+
+/// Recursive nominal lowering carrying an explicit `visited` set of struct names
+/// so a self- or mutually-recursive struct can't loop. Plain `db`-taking helper
+/// (NOT a tracked query) — the `&mut Vec` guard can't be a salsa key — mirroring
+/// `resolve_includes`. `(file, src, fd)` are the resolution context in which
+/// `name_offset` lives; after resolving to a decl in `def_file`, the struct's
+/// *own* field-type names are resolved in `def_file`'s context.
+fn lower_named_at(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    name_offset: text_size::TextSize,
+    visited: &mut Vec<Arc<str>>,
+) -> crate::ty::TyKind {
+    use crate::ty::TyKind;
+    // Over-deep chain -> suppress (belt-and-suspenders with the `visited` guard).
+    if visited.len() >= MAX_NOMINAL_DEPTH {
+        return TyKind::Unknown;
+    }
+    // 1. Resolve the type-name token to its decl.
+    let Some(crate::Definition::Item {
+        file: def_file,
+        index,
+    }) = resolve_query(db, file, src, fd, ws, name_offset)
+    else {
+        return TyKind::Unknown; // unresolved, or a local/generic-param -> suppress
+    };
+    // 2. Read the decl's Symbol from the *target* file's item tree.
+    let Some(dsrc) = source_text_for(db, def_file, file, src, ws) else {
+        return TyKind::Unknown;
+    };
+    let dtree = item_tree(db, dsrc);
+    let Some(sym) = dtree.symbols.get(index as usize).cloned() else {
+        return TyKind::Unknown;
+    };
+    match sym.kind {
+        // 3a. Struct: lower each `StructField` child's declared type.
+        crate::SymbolKind::Struct => {
+            let name: Arc<str> = Arc::from(sym.name.as_str());
+            // Back-edge: this struct is already being lowered on the active
+            // path -> break the cycle by suppressing this reference.
+            if visited.iter().any(|n| **n == *name) {
+                return TyKind::Unknown;
+            }
+            let dfd = deps_for(db, def_file, file, fd, ws);
+            visited.push(name.clone());
+            let fields = build_struct_fields(db, def_file, dsrc, dfd, ws, sym.name_range, visited);
+            visited.pop();
+            TyKind::Struct { name, fields }
+        }
+        // 3b. Enum: collect `EnumVariant` child names.
+        crate::SymbolKind::Enum => {
+            let name: Arc<str> = Arc::from(sym.name.as_str());
+            let variants: Vec<Arc<str>> = dtree
+                .children_of(index)
+                .filter(|(_, s)| s.kind == crate::SymbolKind::EnumVariant)
+                .map(|(_, s)| Arc::<str>::from(s.name.as_str()))
+                .collect();
+            TyKind::Enum {
+                name,
+                variants: Arc::from(variants),
+            }
+        }
+        // Any other decl (type alias, ledger, circuit, …) -> not nominal here.
+        _ => TyKind::Unknown,
+    }
+}
+
+/// The `(field-name, field-TyKind)` list of the struct whose name token spans
+/// `struct_name_range` in `dsrc`. Field types are lowered in `def_file`'s
+/// resolution context ([`lower_type_in`]); a struct-typed field recurses through
+/// [`lower_named_at`] under the shared `visited` guard.
+#[allow(clippy::too_many_arguments)]
+fn build_struct_fields(
+    db: &dyn Db,
+    def_file: crate::FileId,
+    dsrc: SourceText,
+    dfd: Option<FileDeps>,
+    ws: Workspace,
+    struct_name_range: text_size::TextRange,
+    visited: &mut Vec<Arc<str>>,
+) -> Arc<[(Arc<str>, crate::ty::TyKind)]> {
+    use compactp_ast::AstNode;
+    let root = compactp_syntax::SyntaxNode::new_root(crate::db::parsed(db, dsrc).green);
+    let Some(sdef) = root
+        .descendants()
+        .filter_map(compactp_ast::StructDef::cast)
+        .find(|s| s.name().map(|n| n.text_range()) == Some(struct_name_range))
+    else {
+        return Arc::from(Vec::new());
+    };
+    let fields: Vec<(Arc<str>, crate::ty::TyKind)> = sdef
+        .fields()
+        .filter_map(|f| {
+            let fname = f.name()?;
+            let fkind = f
+                .ty()
+                .map(|t| lower_type_in(db, def_file, dsrc, dfd, ws, &t, visited))
+                .unwrap_or(crate::ty::TyKind::Unknown);
+            Some((Arc::<str>::from(fname.text()), fkind))
+        })
+        .collect();
+    Arc::from(fields)
+}
+
+/// Lowers a CST `Type` in `def_file`'s context. Primitives/sequences go through
+/// the pure `type_node_kind`; a named `Type::Ref` recurses through
+/// [`lower_named_at`] so a struct/enum-typed field becomes nominal. A named
+/// field type with no available resolution context (`dfd == None`: a cross-file
+/// target whose deps were not published) suppresses to `Unknown` (never guess).
+fn lower_type_in(
+    db: &dyn Db,
+    def_file: crate::FileId,
+    dsrc: SourceText,
+    dfd: Option<FileDeps>,
+    ws: Workspace,
+    ty: &compactp_ast::Type,
+    visited: &mut Vec<Arc<str>>,
+) -> crate::ty::TyKind {
+    match ty {
+        compactp_ast::Type::Ref(r) => {
+            let (Some(name_tok), Some(dfd)) = (r.name(), dfd) else {
+                return crate::ty::TyKind::Unknown;
+            };
+            lower_named_at(
+                db,
+                def_file,
+                dsrc,
+                dfd,
+                ws,
+                name_tok.text_range().start(),
+                visited,
+            )
+        }
+        // Primitives, Uint/Bytes, and tuple/vector sequences: pure lowering.
+        // (Named types nested inside a tuple/vector element lower to `Unknown`
+        // via `type_node_kind` — a safe widening limitation, not this task's
+        // scope.)
+        _ => crate::infer::type_node_kind(ty),
+    }
+}
+
+/// The `FileDeps` for `target` in the current resolution context: the caller's
+/// own `fd` when `target` is the current file, else the workspace-published
+/// per-file deps (needed to resolve a *cross-file* struct's own field-type
+/// names). `None` when `target` has no published deps — callers suppress named
+/// field lowering in that case.
+fn deps_for(
+    db: &dyn Db,
+    target: crate::FileId,
+    this_file: crate::FileId,
+    this_fd: FileDeps,
+    ws: Workspace,
+) -> Option<FileDeps> {
+    if target == this_file {
+        Some(this_fd)
+    } else {
+        ws.file_deps(db).get(&target).copied()
+    }
+}
+
 /// The generic-arity mismatch diagnostic (`E3003`). Wording tracks compactc's
 /// ("mismatch between actual number A and declared number D of generic
 /// parameters for Name"); wording is not gated by the harness.
@@ -1644,6 +1843,116 @@ mod tests {
         assert_eq!(
             source_text_for(&db, crate::FileId::from_raw_for_test(9), this, this_src, ws),
             None
+        );
+    }
+
+    #[test]
+    fn named_type_lowers_struct_to_nominal() {
+        use crate::ty::TyKind;
+        let db = CompactDatabase::default();
+        let text =
+            "struct S { a: Field; b: Boolean; }\nexport circuit c(s: S): Boolean { return s.b; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = Workspace::new(
+            &db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        let file = crate::FileId::from_raw_for_test(0);
+        // Offset of the `S` type-name token in `s: S` (unique `": S"` slice).
+        let off = text.find(": S").expect("`: S` present") + 2;
+        let kind = named_type_ty(&db, file, src, fd, ws, (off as u32).into());
+        assert_eq!(
+            kind,
+            TyKind::Struct {
+                name: Arc::from("S"),
+                fields: Arc::from(vec![
+                    (Arc::<str>::from("a"), TyKind::Field),
+                    (Arc::<str>::from("b"), TyKind::Boolean),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn named_type_lowers_enum_to_nominal() {
+        use crate::ty::TyKind;
+        let db = CompactDatabase::default();
+        let text = "enum E { A, B }\nexport circuit c(e: E): E { return e; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = Workspace::new(
+            &db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        let file = crate::FileId::from_raw_for_test(0);
+        let off = text.find(": E").expect("`: E` present") + 2;
+        let kind = named_type_ty(&db, file, src, fd, ws, (off as u32).into());
+        assert_eq!(
+            kind,
+            TyKind::Enum {
+                name: Arc::from("E"),
+                variants: Arc::from(vec![Arc::<str>::from("A"), Arc::<str>::from("B")]),
+            }
+        );
+    }
+
+    #[test]
+    fn named_type_self_referential_struct_terminates() {
+        // A struct whose field references its own type must not infinitely
+        // recurse: the back-edge lowers to `Unknown`. `Node` here holds a
+        // `next: Node` — the outer type is `Struct{name:"Node", ...}` with the
+        // self-field's kind suppressed to `Unknown`.
+        use crate::ty::TyKind;
+        let db = CompactDatabase::default();
+        let text = "struct Node { v: Field; next: Node; }\nexport circuit c(n: Node): Field { return n.v; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = Workspace::new(
+            &db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        let file = crate::FileId::from_raw_for_test(0);
+        let off = text.find(": Node").expect("`: Node` present") + 2;
+        let kind = named_type_ty(&db, file, src, fd, ws, (off as u32).into());
+        assert_eq!(
+            kind,
+            TyKind::Struct {
+                name: Arc::from("Node"),
+                fields: Arc::from(vec![
+                    (Arc::<str>::from("v"), TyKind::Field),
+                    (Arc::<str>::from("next"), TyKind::Unknown),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn named_type_unresolved_is_unknown() {
+        // A name that does not resolve to a struct/enum decl -> Unknown (never
+        // guess). Here `Nope` has no declaration.
+        use crate::ty::TyKind;
+        let db = CompactDatabase::default();
+        let text = "export circuit c(x: Nope): Field { return 0; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = Workspace::new(
+            &db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        let file = crate::FileId::from_raw_for_test(0);
+        let off = text.find(": Nope").expect("`: Nope` present") + 2;
+        assert_eq!(
+            named_type_ty(&db, file, src, fd, ws, (off as u32).into()),
+            TyKind::Unknown
         );
     }
 

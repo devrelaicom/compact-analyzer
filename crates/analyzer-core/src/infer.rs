@@ -53,6 +53,37 @@ pub(crate) fn type_node_kind(ty: &compactp_ast::Type) -> TyKind {
     }
 }
 
+/// Resolution-aware type lowering: primitives/sequences via the pure
+/// [`type_node_kind`], a named (struct/enum) `Type::Ref` via the resolution-fed
+/// [`crate::db::named_type_ty`] so it becomes nominal (`TyKind::Struct`/`Enum`).
+/// Callers that only need primitive/sequence lowering keep calling
+/// `type_node_kind` directly; this is the entry a caller uses where a named type
+/// must become nominal (param typing for `expr_ty`, wired in a later task).
+/// Mirrors the resolution-fed `(db, file, src, fd, ws, …)` parameter shape (the
+/// brief's sketch omitted `fd`, but `named_type_ty`/`resolve_query` require it).
+///
+/// A `Type::Ref` with no name token, or one that does not resolve to a
+/// struct/enum decl, lowers to `Unknown` (suppress, never guess).
+#[allow(dead_code)] // consumed by the expr/param-typing task (v2b.9 Task 3).
+pub(crate) fn type_kind_resolved(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: crate::db::FileDeps,
+    ws: crate::db::Workspace,
+    ty: &compactp_ast::Type,
+) -> TyKind {
+    match ty {
+        compactp_ast::Type::Ref(r) => match r.name() {
+            Some(name_tok) => {
+                crate::db::named_type_ty(db, file, src, fd, ws, name_tok.text_range().start())
+            }
+            None => TyKind::Unknown,
+        },
+        _ => type_node_kind(ty),
+    }
+}
+
 /// Parse a `Uint` size or an integer-literal token's text to a `u128`.
 /// Accepts decimal, `0x`/`0X` hex, `0o`/`0O` octal, and `0b`/`0B` binary.
 /// `None` if the text is not a plain integer literal (e.g. a generic numeric

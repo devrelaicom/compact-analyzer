@@ -6,6 +6,7 @@
 
 mod analysis;
 mod db;
+mod disclosure;
 pub mod fixture;
 mod infer;
 mod item_tree;

@@ -402,6 +402,12 @@ impl AnalysisHost {
             self.index_file(file);
         }
     }
+
+    /// Disclosure (WPP) diagnostics for `file`. v3a stub: empty until the
+    /// interpreter lands (Task A1 replaces the body). Never panics.
+    pub fn disclosure_diagnostics(&mut self, _file: FileId) -> Vec<Diagnostic> {
+        Vec::new()
+    }
 }
 
 impl Default for AnalysisHost {

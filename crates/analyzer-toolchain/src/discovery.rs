@@ -95,8 +95,17 @@ fn probe(candidate: &Path) -> Option<Toolchain> {
 
 /// Runs `<candidate> compile <flag>`, returning trimmed stdout on success.
 ///
-/// Any spawn error, non-zero exit, non-UTF-8 output, or empty output yields
-/// `None` — a discovered-but-unrunnable binary is treated as absent.
+/// Any spawn error, non-zero exit, non-UTF-8 output, or output that does not
+/// [look like a version][looks_like_version] yields `None` — a
+/// discovered-but-unrunnable binary, or one that answers with something other
+/// than a version, is treated as absent.
+///
+/// The version-shape check is load-bearing on Windows: `C:\Windows\System32`
+/// is always on `PATH` and holds `compact.exe` — the NTFS file-compression
+/// utility, entirely unrelated to the Compact compiler. It exits `0` and
+/// prints prose for `compile --version`, so accepting any non-empty stdout as
+/// a version would mistake it for the toolchain and make every toolchain-gated
+/// test run against the wrong binary instead of self-skipping.
 fn query_version(candidate: &Path, flag: &str) -> Option<String> {
     let output = run(candidate, &["compile", flag])?;
     if !output.status.success() {
@@ -104,11 +113,35 @@ fn query_version(candidate: &Path, flag: &str) -> Option<String> {
     }
     let stdout = String::from_utf8(output.stdout).ok()?;
     let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
+    if looks_like_version(trimmed) {
         Some(trimmed.to_string())
+    } else {
+        None
     }
+}
+
+/// True if `s` looks like a `compact` version answer — a bare dotted-numeric
+/// version such as `0.31.1` or `0.23.0` (at least `MAJOR.MINOR`), optionally
+/// with a `-`/`+` pre-release or build suffix (`0.31.1-beta.2`).
+///
+/// Deliberately strict: it exists solely to tell the real Compact compiler
+/// apart from an unrelated binary that merely happens to be named `compact` on
+/// `PATH` and to exit `0` with some non-version stdout — most concretely
+/// Windows' own `C:\Windows\System32\compact.exe` (the NTFS compression tool),
+/// whose prose answers must be rejected so discovery reports absence there.
+fn looks_like_version(s: &str) -> bool {
+    if s.is_empty() || s.chars().any(char::is_whitespace) {
+        return false;
+    }
+    // Drop any pre-release/build tail; the numeric core carries the shape we
+    // validate. `split` always yields at least one element, so `next().unwrap()`
+    // is infallible.
+    let core = s.split(['-', '+']).next().unwrap();
+    let components: Vec<&str> = core.split('.').collect();
+    components.len() >= 2
+        && components
+            .iter()
+            .all(|comp| !comp.is_empty() && comp.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Spawns `candidate` with `args`, capturing stdout/stderr and never
@@ -183,6 +216,67 @@ exit 1\n"
         assert_eq!(toolchain.tool_version, "4.5.6");
         assert_eq!(toolchain.language_version, "7.8.9");
         assert_eq!(toolchain.compact_bin, shim);
+    }
+
+    /// Mimics an unrelated binary that merely happens to be named `compact` on
+    /// PATH: it exits `0` for the version queries but answers with multi-line
+    /// prose instead of a version. This is the cross-platform stand-in for
+    /// Windows' own `C:\Windows\System32\compact.exe` (the NTFS file-compression
+    /// utility), which is what actually poisoned discovery on the Windows CI
+    /// runner — there `C:\Windows\System32` is always on PATH.
+    #[cfg(unix)]
+    fn write_impostor_shim(dir: &Path) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("compact");
+        let script = "#!/bin/sh\n\
+             echo 'Compresses and uncompresses files on NTFS partitions.'\n\
+             echo ''\n\
+             echo '0 files within 1 directories were compressed.'\n\
+             exit 0\n";
+        let mut file = std::fs::File::create(&path).expect("create impostor shim");
+        file.write_all(script.as_bytes())
+            .expect("write impostor shim");
+        let mut perms = std::fs::metadata(&path).expect("stat shim").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod shim");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_rejects_a_compact_named_binary_that_answers_with_non_version_prose() {
+        // Regression (Windows CI): PATH there contains
+        // `C:\Windows\System32\compact.exe`, the NTFS file-compression utility,
+        // which is unrelated to the Compact compiler. It exits `0` and prints
+        // prose for `compile --version`, so discovery used to accept it and the
+        // toolchain-gated tests ran against it (and failed) instead of
+        // self-skipping. A non-version answer must be treated as "not the
+        // compiler" and reported as absence.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_impostor_shim(dir.path());
+
+        assert!(Toolchain::discover(Some(dir.path())).is_none());
+    }
+
+    #[test]
+    fn looks_like_version_accepts_real_answers_and_rejects_prose() {
+        // Real `compact compile --version` / `--language-version` answers.
+        assert!(looks_like_version("0.31.1"));
+        assert!(looks_like_version("0.23.0"));
+        // A pre-release/build suffix is tolerated.
+        assert!(looks_like_version("0.31.1-beta.2"));
+        // Impostor / prose answers.
+        assert!(!looks_like_version(""));
+        assert!(!looks_like_version("42")); // no dotted component
+        assert!(!looks_like_version(
+            "0 files within 1 directories were compressed."
+        ));
+        assert!(!looks_like_version(
+            "Compresses and uncompresses files on NTFS partitions."
+        ));
+        assert!(!looks_like_version("v0.31.1")); // leading non-digit
     }
 
     #[cfg(unix)]

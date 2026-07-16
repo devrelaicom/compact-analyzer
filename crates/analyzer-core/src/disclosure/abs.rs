@@ -7,20 +7,45 @@
 //!
 //! Pure lattice logic only — no salsa, no interpretation. A2/A3 build the
 //! interpreter that produces and consumes these values.
-
-// A1 lands the lattice with no production caller yet — it's exercised only
-// by the unit tests below until A2 (source seeding) and A3 (the interpreter)
-// consume it. `expect`, not `allow`, so the lint stays honest: once a real
-// caller lands, the expectation goes unfulfilled and this attribute must be
-// deleted.
-#![expect(dead_code)]
+//!
+//! `Abs`/`Witness`/`WitnessInfo`/`PathPoint` get their first production
+//! caller in `interp.rs` (A2: `abs_of_type` builds `Abs` shapes, `seed_sources`
+//! constructs `Witness`es) — the file-level `#[expect(dead_code)]` A1 left
+//! here as a scaffold marker is gone.
+//!
+//! `interp.rs` isn't wired into a live query yet either (that's A3), so this
+//! module's own lattice OPERATIONS (`disclose`/`combine_abs`/`abs_equal`/
+//! `merge_witnesses`/`witnesses_of` — as opposed to the `Abs`/`Witness`
+//! *constructors* `interp.rs` already exercises) are still only reachable
+//! from this file's own tests. Each gets a targeted
+//! `#[cfg_attr(not(test), allow(dead_code))]` below — `allow`, not `expect`,
+//! specifically for these: empirically, `expect(dead_code)` on a function
+//! that pattern-matches/constructs `Abs`/`WitnessInfo` variants (whether
+//! applied per-function or file-wide) makes rustc treat the surrounding
+//! scope as an intentional dead-code root, so the *expectation itself* goes
+//! unfulfilled in the very build it's meant to cover — a `cargo build`/
+//! `cargo test` round-trip could not be made to stay green with `expect`
+//! here, only with `allow`. `WitnessInfo::WitnessReturn` and `Abs::Boolean`
+//! (below) don't hit this: they keep a plain, unconditional
+//! `#[expect(dead_code)]`, which round-trips fine because they're genuinely
+//! unconstructed in BOTH build modes until A3.
 
 /// A witness value's origin (spec §3.1). Deduped by `uid` in a set.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WitnessInfo {
-    WitnessReturn { function: String },
-    ConstructorArg { arg: String },
-    CircuitArg { function: String, arg: String },
+    /// S1 (spec §3.1): a witness function's return value. Constructed at
+    /// witness *call sites* during the interpreter walk — A3, not A2/A1.
+    #[expect(dead_code)] // used by A3's interpreter walk (S1 seeding)
+    WitnessReturn {
+        function: String,
+    },
+    ConstructorArg {
+        arg: String,
+    },
+    CircuitArg {
+        function: String,
+        arg: String,
+    },
 }
 
 /// One tracked witness value: where it entered + the path it has taken.
@@ -45,6 +70,10 @@ pub struct PathPoint {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Abs {
     Atomic(Vec<Witness>),
+    /// AB2 (spec §3.4): only a compile-time `true`/`false` literal produces
+    /// this. Constructed by the interpreter's literal-evaluation arm — A3,
+    /// not A2/A1.
+    #[expect(dead_code)] // used by A3's interpreter walk (AB2 constant-folding)
     Boolean {
         value: bool,
         witnesses: Vec<Witness>,
@@ -57,6 +86,7 @@ pub enum Abs {
 /// `Boolean`, and recursively through `Multiple`/`Single`). The shape is
 /// preserved; only the taint is removed. This is the analyzer's ONLY
 /// sanitizer.
+#[cfg_attr(not(test), allow(dead_code))] // used by A3's interpreter walk (D1 disclose sanitizer)
 pub fn disclose(abs: &Abs) -> Abs {
     match abs {
         Abs::Atomic(_) => Abs::Atomic(Vec::new()),
@@ -82,6 +112,7 @@ pub fn disclose(abs: &Abs) -> Abs {
 /// same shape, up to the `Single`-distributes-over-`Multiple` case above) —
 /// defensive-only, fail-closed by unioning every reachable witness into a
 /// single `Atomic` rather than silently dropping taint.
+#[cfg_attr(not(test), allow(dead_code))] // used by A3's interpreter walk (F2 join)
 pub fn combine_abs(a: &Abs, b: &Abs) -> Abs {
     match (a, b) {
         (Abs::Atomic(w1), Abs::Atomic(w2)) => Abs::Atomic(merge_witnesses(w1, w2)),
@@ -133,6 +164,7 @@ pub fn combine_abs(a: &Abs, b: &Abs) -> Abs {
 /// `abs-equal?` (R0 FX3): structural equality used by the fold/map fixpoint
 /// (FX1) to detect convergence. Same `Abs` shape and the same witness set at
 /// every level (uid + path, order-independent).
+#[cfg_attr(not(test), allow(dead_code))] // used by A3's interpreter walk (FX3 fixpoint)
 pub fn abs_equal(a: &Abs, b: &Abs) -> bool {
     match (a, b) {
         (Abs::Atomic(w1), Abs::Atomic(w2)) => witness_sets_equal(w1, w2),
@@ -155,6 +187,7 @@ pub fn abs_equal(a: &Abs, b: &Abs) -> bool {
 }
 
 /// Order-independent witness-set equality (uid + path), used by `abs_equal`.
+#[cfg_attr(not(test), allow(dead_code))] // used by abs_equal above
 fn witness_sets_equal(w1: &[Witness], w2: &[Witness]) -> bool {
     let mut s1 = w1.to_vec();
     let mut s2 = w2.to_vec();
@@ -168,6 +201,7 @@ fn witness_sets_equal(w1: &[Witness], w2: &[Witness]) -> bool {
 /// `merge_witnesses` (R0 `abs->witnesses`: dedup by uid, union paths) so the
 /// same witness reachable from two `Multiple` children is reported once, not
 /// once per occurrence. Used by sinks (A4) and as a test helper here.
+#[cfg_attr(not(test), allow(dead_code))] // used by A4's sinks
 pub fn witnesses_of(abs: &Abs) -> Vec<Witness> {
     match abs {
         Abs::Atomic(witnesses) | Abs::Boolean { witnesses, .. } => witnesses.clone(),
@@ -184,6 +218,7 @@ pub fn witnesses_of(abs: &Abs) -> Vec<Witness> {
 /// two entries are merged into one by unioning their `path`s (mirrors the
 /// source's `(append path1* path2*)`) rather than discarding either side —
 /// dropping a path would lose part of the witness->sink trail (spec §3.7).
+#[cfg_attr(not(test), allow(dead_code))] // used by A3's interpreter walk
 pub fn merge_witnesses(w1: &[Witness], w2: &[Witness]) -> Vec<Witness> {
     let mut out: Vec<Witness> = w1.to_vec();
     for w in w2 {

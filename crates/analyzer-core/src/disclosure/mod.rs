@@ -9,14 +9,18 @@
 //! ledger op) must emit an amber advisory (`U3100`+) rather than silently
 //! reporting no leak. Confirmed leaks are `E3100`+.
 //!
-//! - `abs` — the `Abs` abstract-value lattice (this task, A1).
-//! - `interp` — the abstract interpreter (A2/A3; not yet created).
-//! - `leaks` — the leak table + advisory emitter (A4; stub for now).
+//! - `abs` — the `Abs` abstract-value lattice (A1).
+//! - `interp` — root discovery + type-driven source seeding (A2); the
+//!   interpreter walk itself is A3.
+//! - `leaks` — the `Advisory`/`DisclosureSink` fail-closed primitive (A2);
+//!   the leak table is A4.
 //!
-//! This task (A1) wires the module and an EMPTY tracked query — no
-//! disclosure detection yet.
+//! The tracked query (`disclosure_diagnostics_query` below) stays EMPTY
+//! through A2 — `interp`/`leaks` are library functions A3/A4 will call from
+//! it; no disclosure detection surfaces through the query yet.
 
 mod abs;
+mod interp;
 mod leaks;
 
 use std::sync::Arc;

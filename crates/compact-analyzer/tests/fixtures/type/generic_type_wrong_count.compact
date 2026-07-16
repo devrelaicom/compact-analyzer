@@ -1,0 +1,4 @@
+struct Pair<A, B> { a: A; b: B; }
+export circuit f(): Pair<Field> {
+  return default<Pair<Field>>;
+}

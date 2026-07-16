@@ -15,7 +15,7 @@
 /**
  * The EXACT set of keys the server reads from `initializationOptions` (G1).
  *
- * The server reads ONLY these four keys, so the client sends nothing else. The
+ * The server reads ONLY these five keys, so the client sends nothing else. The
  * client-only settings (`serverPath`, `trace.server`) are deliberately absent.
  */
 export interface InitOptions {
@@ -23,6 +23,7 @@ export interface InitOptions {
   toolchainPath?: string;
   compileOnSave?: boolean;
   formatting?: boolean;
+  typeDiagnostics?: boolean;
 }
 
 /**
@@ -76,6 +77,8 @@ export function buildInitOptions(read: ConfigReader): InitOptions {
   options.compileOnSave = typeof compileOnSave === "boolean" ? compileOnSave : true;
   const formatting: unknown = read("formatting");
   options.formatting = typeof formatting === "boolean" ? formatting : true;
+  const typeDiagnostics: unknown = read("typeDiagnostics");
+  options.typeDiagnostics = typeof typeDiagnostics === "boolean" ? typeDiagnostics : true;
 
   return options;
 }

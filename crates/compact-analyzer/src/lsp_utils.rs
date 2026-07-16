@@ -166,6 +166,61 @@ pub(crate) fn completion_item_to_lsp(c: analyzer_ide::CompletionItem) -> lsp_typ
     }
 }
 
+/// `analyzer_ide::InlayHint` -> LSP `InlayHint`: `position` is the byte
+/// offset converted through the line index (mirrors `range_to_lsp`'s
+/// offset->`Position` conversion). `kind: TYPE` and zero padding on both
+/// sides match the brief's rendering (`": Field"` immediately after the
+/// binding name, no extra whitespace inserted by the client).
+pub(crate) fn inlay_hint_to_lsp(
+    hint: &analyzer_ide::InlayHint,
+    li: &LineIndex,
+) -> lsp_types::InlayHint {
+    let pos = li.line_col(TextSize::new(hint.offset));
+    lsp_types::InlayHint {
+        position: Position::new(pos.line, pos.col),
+        label: lsp_types::InlayHintLabel::String(hint.label.clone()),
+        kind: Some(lsp_types::InlayHintKind::TYPE),
+        text_edits: None,
+        tooltip: None,
+        padding_left: Some(false),
+        padding_right: Some(false),
+        data: None,
+    }
+}
+
+/// One `SignatureInformation` (v2c never proposes overload alternatives —
+/// `signature_help` already resolved to exactly one circuit/witness item),
+/// `active_signature: Some(0)`. Each `ParamLabel`'s byte offsets are rendered
+/// as `ParameterLabel::Simple(substring)` rather than
+/// `ParameterLabel::LabelOffsets` — LSP label offsets are UTF-16 into the
+/// label string, and `Simple` sidesteps that conversion entirely since the
+/// substring IS the label text the client displays.
+pub(crate) fn signature_help_to_lsp(
+    d: analyzer_ide::SignatureHelpData,
+) -> lsp_types::SignatureHelp {
+    let label = d.label;
+    let parameters = d
+        .params
+        .iter()
+        .map(|p| lsp_types::ParameterInformation {
+            label: lsp_types::ParameterLabel::Simple(
+                label[p.start as usize..p.end as usize].to_string(),
+            ),
+            documentation: None,
+        })
+        .collect();
+    lsp_types::SignatureHelp {
+        signatures: vec![lsp_types::SignatureInformation {
+            label,
+            documentation: None,
+            parameters: Some(parameters),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter: d.active_param,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

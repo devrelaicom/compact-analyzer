@@ -6,10 +6,12 @@ mod document_symbols;
 mod folding_ranges;
 mod goto_definition;
 mod hover;
+mod inlay_hints;
 mod references;
 mod rename;
 mod selection_ranges;
 mod semantic_tokens;
+mod signature_help;
 mod workspace_symbols;
 
 pub use completion::{CompletionItem, CompletionKind, completion};
@@ -17,10 +19,12 @@ pub use document_symbols::{DocSymbol, document_symbols};
 pub use folding_ranges::{FoldKind, FoldRange, folding_ranges};
 pub use goto_definition::goto_definition;
 pub use hover::{HoverResult, hover};
+pub use inlay_hints::{InlayHint, inlay_hints};
 pub use references::{find_references, find_references_cancellable};
 pub use rename::{RenameError, SourceEdit, rename, rename_cancellable};
 pub use selection_ranges::selection_ranges;
 pub use semantic_tokens::{SemToken, TokenMods, TokenType, semantic_tokens};
+pub use signature_help::{ParamLabel, SignatureHelpData, signature_help};
 pub use workspace_symbols::{WorkspaceSymbolItem, workspace_symbols};
 
 use analyzer_core::{FileId, TextRange};

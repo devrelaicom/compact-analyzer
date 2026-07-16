@@ -95,6 +95,12 @@ pub(crate) fn run() -> anyhow::Result<()> {
             resolve_provider: Some(false),
             ..Default::default()
         }),
+        signature_help_provider: Some(lsp_types::SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: None,
+            work_done_progress_options: Default::default(),
+        }),
+        inlay_hint_provider: Some(lsp_types::OneOf::Left(true)),
         semantic_tokens_provider: Some(
             lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
                 lsp_types::SemanticTokensOptions {
@@ -478,6 +484,47 @@ impl GlobalState {
                     .map(lsp_types::CompletionResponse::Array);
                 self.respond_ok(req.id, result);
             }
+            "textDocument/signatureHelp" => {
+                let result = serde_json::from_value::<lsp_types::SignatureHelpParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let doc = params.text_document_position_params;
+                        let pos =
+                            self.position_to_file_position(&doc.text_document.uri, doc.position)?;
+                        let data = analyzer_ide::signature_help(&mut self.host, pos)?;
+                        Some(lsp_utils::signature_help_to_lsp(data))
+                    });
+                self.respond_ok(req.id, result);
+            }
+            "textDocument/inlayHint" => {
+                let result = serde_json::from_value::<lsp_types::InlayHintParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let file = *self.open_files.get(&params.text_document.uri)?;
+                        let li = self.host.analyze(file)?.line_index.clone();
+                        // Byte-offset window for `params.range`: an endpoint
+                        // that doesn't resolve (e.g. a stale range past the
+                        // document's current end) falls back to the
+                        // document boundary on that side, rather than
+                        // dropping every hint.
+                        let range_start = lsp_utils::offset_from_position(&li, params.range.start)
+                            .unwrap_or(TextSize::new(0));
+                        let range_end = lsp_utils::offset_from_position(&li, params.range.end)
+                            .unwrap_or(TextSize::new(u32::MAX));
+                        let hints = analyzer_ide::inlay_hints(&mut self.host, file);
+                        Some(
+                            hints
+                                .iter()
+                                .filter(|h| {
+                                    let offset = TextSize::new(h.offset);
+                                    range_start <= offset && offset <= range_end
+                                })
+                                .map(|h| lsp_utils::inlay_hint_to_lsp(h, &li))
+                                .collect::<Vec<_>>(),
+                        )
+                    });
+                self.respond_ok(req.id, result);
+            }
             "textDocument/semanticTokens/full" => {
                 let result = serde_json::from_value::<lsp_types::SemanticTokensParams>(req.params)
                     .ok()
@@ -784,22 +831,16 @@ impl GlobalState {
         let Some(source) = self.host.vfs_mut().read(file) else {
             return;
         };
+        // First analyze() for this revision; the helper's later call is a cache-hit.
         let Some(analysis) = self.host.analyze(file) else {
             return;
         };
         let line_index = analysis.line_index.clone();
-        // Native diagnostics, computed on the main thread (the worker can't read
-        // `host`): both the parser set and the import/include resolution set,
-        // exactly as `publish_file_diagnostics` builds them.
-        let mut native: Vec<lsp_types::Diagnostic> = analysis
-            .diagnostics
-            .iter()
-            .map(|d| lsp_utils::diagnostic_to_lsp(d, &line_index, &uri))
-            .collect();
         drop(analysis);
-        for d in self.host.resolution_diagnostics(file) {
-            native.push(lsp_utils::diagnostic_to_lsp(&d, &line_index, &uri));
-        }
+        // Native diagnostics (parser + resolution + type), computed on the main
+        // thread because the compile worker cannot read `host`. Built through
+        // the shared helper so the live and on-save paths never diverge.
+        let native = self.build_native_diagnostics(file, &uri, &line_index);
         let search_path = self.host.import_search_path();
         // Bump this file's save generation under lock; the worker re-checks it
         // (under the same lock) before storing/publishing, so a stale worker
@@ -881,6 +922,42 @@ impl GlobalState {
         }
     }
 
+    /// Assembles the full native diagnostic set for `file` — parser, resolution,
+    /// and (when the `typeDiagnostics` config toggle is on) type diagnostics —
+    /// each converted to LSP and tagged `source = "compact-analyzer"`. This is
+    /// the SINGLE place native diagnostics are built, shared by the live publish
+    /// path (`publish_file_diagnostics`) and the on-save path (`did_save`), so
+    /// the two can never drift apart. Parser and resolution diagnostics are
+    /// always published; only the type contribution is gated. `type_diagnostics`
+    /// is already corpus-gate-green and is forwarded verbatim (never re-filtered
+    /// here) when the gate is open.
+    fn build_native_diagnostics(
+        &mut self,
+        file: FileId,
+        uri: &Url,
+        line_index: &LineIndex,
+    ) -> Vec<lsp_types::Diagnostic> {
+        // Cache-hit: the caller already called `self.host.analyze(file)` for
+        // this same revision, so salsa returns the memoized result here.
+        let mut native: Vec<lsp_types::Diagnostic> = match self.host.analyze(file) {
+            Some(analysis) => analysis
+                .diagnostics
+                .iter()
+                .map(|d| lsp_utils::diagnostic_to_lsp(d, line_index, uri))
+                .collect(),
+            None => Vec::new(),
+        };
+        for d in self.host.resolution_diagnostics(file) {
+            native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+        }
+        if self.toolchain_config.type_diagnostics {
+            for d in self.host.type_diagnostics(file) {
+                native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+            }
+        }
+        native
+    }
+
     fn publish_file_diagnostics(&mut self, file: FileId) {
         let Some(uri) = self
             .open_files
@@ -890,18 +967,14 @@ impl GlobalState {
         else {
             return; // closed before the debounce fired
         };
+        // First analyze() for this revision; the helper's later call is a cache-hit.
         let Some(analysis) = self.host.analyze(file) else {
             return;
         };
+        let line_index = analysis.line_index.clone();
+        drop(analysis);
         let version = self.host.vfs().overlay_version(file);
-        let mut native: Vec<lsp_types::Diagnostic> = analysis
-            .diagnostics
-            .iter()
-            .map(|d| lsp_utils::diagnostic_to_lsp(d, &analysis.line_index, &uri))
-            .collect();
-        for d in self.host.resolution_diagnostics(file) {
-            native.push(lsp_utils::diagnostic_to_lsp(&d, &analysis.line_index, &uri));
-        }
+        let native = self.build_native_diagnostics(file, &uri, &line_index);
         // Re-merge the file's stored compiler diagnostics (from the last save)
         // so this debounced NATIVE republish doesn't wipe them.
         let compiler = lock(&self.compiler_diagnostics)
@@ -1390,6 +1463,10 @@ pub(crate) struct ToolchainConfig {
     #[allow(dead_code)]
     pub compile_on_save: bool,
     pub formatting: bool,
+    /// Whether native type diagnostics (E3001–E3006) are published. `true` =
+    /// live native type checking; `false` = suppress them and rely on
+    /// compile-on-save's `compactc` type errors. Read once at startup.
+    pub type_diagnostics: bool,
 }
 
 impl Default for ToolchainConfig {
@@ -1398,6 +1475,7 @@ impl Default for ToolchainConfig {
             toolchain_path: None,
             compile_on_save: true,
             formatting: true,
+            type_diagnostics: true,
         }
     }
 }
@@ -1415,6 +1493,9 @@ fn toolchain_config_from(options: Option<&serde_json::Value>) -> ToolchainConfig
     }
     if let Some(flag) = opts.get("formatting").and_then(|v| v.as_bool()) {
         config.formatting = flag;
+    }
+    if let Some(flag) = opts.get("typeDiagnostics").and_then(|v| v.as_bool()) {
+        config.type_diagnostics = flag;
     }
     config
 }
@@ -1476,6 +1557,19 @@ mod tests {
         assert_eq!(config.toolchain_path, Some(PathBuf::from("/opt/compact")));
         assert!(!config.compile_on_save);
         assert!(config.formatting);
+    }
+
+    #[test]
+    fn toolchain_config_reads_type_diagnostics_flag() {
+        let opts = json!({ "typeDiagnostics": false });
+        let config = toolchain_config_from(Some(&opts));
+        assert!(!config.type_diagnostics);
+    }
+
+    #[test]
+    fn toolchain_config_type_diagnostics_defaults_true() {
+        assert!(toolchain_config_from(Some(&json!({}))).type_diagnostics);
+        assert!(toolchain_config_from(None).type_diagnostics);
     }
 
     #[test]

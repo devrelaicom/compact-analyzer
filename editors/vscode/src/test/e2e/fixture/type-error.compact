@@ -1,0 +1,5 @@
+// `true` is Boolean, not a subtype of the declared Field return, so the native
+// analyser reports E3001 ("return type mismatch") with source "compact-analyzer".
+// This is a pure type error that needs no Compact toolchain — the smoke test
+// stays hermetic and proves the v2b type checker reaches the Problems panel.
+export circuit foo(): Field { return true; }

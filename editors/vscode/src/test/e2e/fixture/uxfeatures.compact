@@ -1,0 +1,9 @@
+// Exercises all three type-aware editor features added in v2c: typed member
+// completion (`s.` on the struct-typed `s: S` parameter offers `a`/`b`),
+// signature help (inside the `add(1, 2)` call), and inlay hints (the
+// `const n = add(1, 2)` binding's inferred `: Field` type). Compiles cleanly
+// (`compact compile --skip-zk --vscode` exits 0), so it needs no
+// compile-check exclusion.
+struct S { a: Field; b: Boolean; }
+circuit add(x: Field, y: Field): Field { return x + y; }
+export circuit c(s: S): Field { const n = add(1, 2); return s.a + n; }

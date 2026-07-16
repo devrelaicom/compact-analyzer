@@ -3,10 +3,10 @@
 //! verified against compactp), then resolved through lexical scopes
 //! (this task) and file scope / imports (Task 4).
 
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use compactp_ast::{AstNode, Pat};
-use compactp_diagnostics::{Diagnostic, DiagnosticCode};
+use compactp_diagnostics::Diagnostic;
 use compactp_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::TokenAtOffset;
 use text_size::{TextRange, TextSize};
@@ -284,398 +284,53 @@ fn collect_generic_bindings(
 }
 
 impl crate::AnalysisHost {
-    /// Resolves the identifier at `pos` to its definition.
+    /// Resolves the identifier at `pos` to its definition. Thin bridge over the
+    /// tracked dispatcher `crate::db::resolve_query`: ensure the file and its
+    /// transitive includes are indexed (so the query's cross-file inputs are
+    /// materialized), provision the salsa inputs, and hand off. All resolution
+    /// logic lives in `db.rs` now.
     pub fn resolve(&mut self, pos: FilePosition) -> Option<Definition> {
-        let analysis = self.analyze(pos.file)?;
-        let root = SyntaxNode::new_root(analysis.green.clone());
-        let token = ident_at_offset(&root, pos.offset)?;
-        let name = token.text().to_string();
-        let parent = token.parent()?;
-
-        match parent.kind() {
-            // Definition sites resolve to themselves.
-            SyntaxKind::IDENT_PAT => {
-                return local_from_pattern_site(pos.file, &token);
-            }
-            SyntaxKind::STRUCT_PAT_FIELD => {
-                // Shorthand `{a}` binds `a`; `name: pat` labels a field.
-                return local_from_pattern_site(pos.file, &token);
-            }
-            SyntaxKind::FOR_STMT => {
-                return Some(Definition::Local {
-                    file: pos.file,
-                    name: name.clone(),
-                    name_range: token.text_range(),
-                    detail: format!("for {name}"),
-                });
-            }
-            SyntaxKind::GENERIC_PARAM => {
-                return Some(generic_definition(pos.file, &parent, &token));
-            }
-            _ => {}
-        }
-
-        // Names of item declarations resolve to the item itself.
-        if let Some(def) = self.item_declaration_at(pos.file, &parent, &token) {
-            return Some(def);
-        }
-
-        match parent.kind() {
-            SyntaxKind::NAME_EXPR
-            | SyntaxKind::CALL_EXPR
-            | SyntaxKind::TYPE_REF
-            | SyntaxKind::STRUCT_EXPR
-            | SyntaxKind::TYPE_SIZE => self.resolve_name_at(pos, &name),
-            SyntaxKind::STRUCT_FIELD_INIT => self.resolve_struct_literal_field(pos, &parent, &name),
-            SyntaxKind::MEMBER_EXPR => self.resolve_member(pos, &parent, &name),
-            SyntaxKind::IMPORT_SPECIFIER => self.resolve_import_specifier(pos, &parent, &name),
-            _ => None,
-        }
+        self.ensure_indexed(pos.file);
+        let src = self.src_of(pos.file)?;
+        let fd = self.file_deps(pos.file);
+        let ws = self.workspace();
+        crate::db::resolve_query(self.db_ref(), pos.file, src, fd, ws, pos.offset)
     }
 
-    /// Resolves `name` as if referenced at `pos`: locals first (nearest
-    /// scope wins), then file scope + imports (Task 4).
+    /// Resolves `name` as if referenced at `pos`: locals first (nearest scope
+    /// wins), then file scope + imports. Public bridge over the tracked
+    /// `crate::db::resolve_name_query`, used by rename's per-use-site conflict
+    /// check (which asks whether some *other* name already resolves at a use
+    /// site).
     pub fn resolve_name_at(&mut self, pos: FilePosition, name: &str) -> Option<Definition> {
-        let analysis = self.analyze(pos.file)?;
-        let root = SyntaxNode::new_root(analysis.green.clone());
-        if let Some(local) = resolve_local_name(pos.file, &root, pos.offset, name) {
-            return Some(local);
-        }
-        self.resolve_in_file_scope(pos, name)
-    }
-
-    /// File scope: enclosing-module members, then top-level items, then
-    /// imports in declaration order (stdlib and in-file modules only —
-    /// filesystem imports are M2b).
-    fn resolve_in_file_scope(&mut self, pos: FilePosition, name: &str) -> Option<Definition> {
-        let analysis = self.analyze(pos.file)?;
-        let tree = analysis.item_tree.clone();
-        let root = SyntaxNode::new_root(analysis.green.clone());
-
-        // Inside a module, siblings are visible first.
-        if let Some(module_idx) = enclosing_module(&tree, pos.offset)
-            && let Some((idx, _)) = tree.children_of(module_idx).find(|(_, s)| s.name == name)
-        {
-            return Some(Definition::Item {
-                file: pos.file,
-                index: idx,
-            });
-        }
-
-        // Top-level items.
-        if let Some((idx, _)) = tree.top_level().find(|(_, s)| s.name == name) {
-            return Some(Definition::Item {
-                file: pos.file,
-                index: idx,
-            });
-        }
-
-        // Included files' top-level declarations are spliced into this scope.
-        if let Some(def) = self.resolve_through_includes(pos.file, &root, name, &mut vec![pos.file])
-        {
-            return Some(def);
-        }
-
-        // Imports, in order.
-        let source_file = compactp_ast::SourceFile::cast(root)?;
-        for import in source_file.imports() {
-            if let Some(def) = self.resolve_through_import(pos.file, &tree, &import, name) {
-                return Some(def);
-            }
-        }
-        None
-    }
-
-    /// Resolves `name` against the top-level declarations of files reachable by
-    /// `include` from `root` (the syntax tree of `file`), depth-first. `active`
-    /// is the include path currently being expanded, for cycle detection.
-    fn resolve_through_includes(
-        &mut self,
-        file: FileId,
-        root: &SyntaxNode,
-        name: &str,
-        active: &mut Vec<FileId>,
-    ) -> Option<Definition> {
-        let source_file = compactp_ast::SourceFile::cast(root.clone())?;
-        let from_dir = self.vfs().path(file).parent()?.to_path_buf();
-        // Collect target FileIds first (avoids a borrow across the loop body).
-        let mut targets = Vec::new();
-        for inc in source_file.includes() {
-            if let Some(tok) = inc.path() {
-                let raw = crate::string_lit_text(tok.text());
-                if let Some(path) = self.cached_source_pathname(&from_dir, &raw) {
-                    targets.push(self.vfs_mut().file_id(&path));
-                }
-            }
-        }
-        for target in targets {
-            if active.contains(&target) {
-                continue; // cycle along the active include path
-            }
-            let Some(analysis) = self.analyze(target) else {
-                continue; // unreadable include: skip, never die
-            };
-            if let Some((idx, _)) = analysis.item_tree.top_level().find(|(_, s)| s.name == name) {
-                return Some(Definition::Item {
-                    file: target,
-                    index: idx,
-                });
-            }
-            let target_root = SyntaxNode::new_root(analysis.green.clone());
-            active.push(target);
-            let found = self.resolve_through_includes(target, &target_root, name, active);
-            active.pop();
-            if found.is_some() {
-                return found;
-            }
-        }
-        None
-    }
-
-    /// One import's contribution to the namespace, honoring prefix and
-    /// selective specifier lists (with aliases).
-    fn resolve_through_import(
-        &mut self,
-        file: FileId,
-        tree: &crate::ItemTree,
-        import: &compactp_ast::Import,
-        name: &str,
-    ) -> Option<Definition> {
-        // Determine the effective name to look up in the import's exports.
-        let mut lookup: &str = name;
-        let stripped;
-        if let Some(prefix) = import.prefix().and_then(|p| p.name()) {
-            // Prefix applies to every name from this import: unprefixed
-            // names never resolve through it.
-            stripped = name.strip_prefix(prefix.text())?.to_string();
-            lookup = &stripped;
-        }
-
-        // Selective list: only listed names are visible; `as` aliases
-        // rename them. (No typed accessor: walk descendants — verified
-        // compactp pattern.)
-        let specifiers: Vec<(String, String)> = import
-            .syntax()
-            .descendants()
-            .filter_map(compactp_ast::ImportSpecifier::cast)
-            .filter_map(|spec| {
-                let original = spec.name()?.text().to_string();
-                let alias = import_specifier_alias(&spec).unwrap_or_else(|| original.clone());
-                Some((alias, original))
-            })
-            .collect();
-        let target_name: String = if specifiers.is_empty() {
-            lookup.to_string()
-        } else {
-            specifiers
-                .iter()
-                .find(|(alias, _)| alias == lookup)?
-                .1
-                .clone()
-        };
-
-        // Where do this import's exports live?
-        match import.name() {
-            Some(module_token) if module_token.text() == "CompactStandardLibrary" => {
-                let std_file = self.stdlib_file()?;
-                let std_tree = self.analyze(std_file)?.item_tree.clone();
-                let (idx, _) = std_tree
-                    .top_level()
-                    .find(|(_, s)| s.exported && s.name == target_name)?;
-                Some(Definition::Item {
-                    file: std_file,
-                    index: idx,
-                })
-            }
-            Some(module_token) => {
-                let module_name = module_token.text().to_string();
-                // In-scope module first (verified: in-scope FIRST, filesystem
-                // second). An in-scope module wins even if the member is absent.
-                if let Some((module_idx, _)) = tree
-                    .top_level()
-                    .find(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == module_name)
-                {
-                    return tree
-                        .children_of(module_idx)
-                        .find(|(_, s)| s.exported && s.name == target_name)
-                        .map(|(idx, _)| Definition::Item { file, index: idx });
-                }
-                // No in-scope module → filesystem: `<module_name>.compact`
-                // containing exactly `module <module_name>`.
-                let from_dir = self.vfs().path(file).parent()?.to_path_buf();
-                self.resolve_external_module_member(
-                    &from_dir,
-                    &module_name,
-                    &module_name,
-                    &target_name,
-                )
-            }
-            // String-path import: never consults in-scope modules; expected
-            // module name is the last path component.
-            None => {
-                let raw = crate::string_lit_text(import.path()?.text());
-                let expected = crate::path_module_name(&raw)?;
-                let from_dir = self.vfs().path(file).parent()?.to_path_buf();
-                self.resolve_external_module_member(&from_dir, &raw, &expected, &target_name)
-            }
-        }
-    }
-
-    /// Resolves `target_name` as an exported member of the single module in the
-    /// file that `raw` resolves to, requiring that module's name to equal
-    /// `expected_module` (compiler rule). Used by both the identifier and
-    /// string-path import arms.
-    fn resolve_external_module_member(
-        &mut self,
-        from_dir: &std::path::Path,
-        raw: &str,
-        expected_module: &str,
-        target_name: &str,
-    ) -> Option<Definition> {
-        let path = self.cached_source_pathname(from_dir, raw)?;
-        let file = self.vfs_mut().file_id(&path);
-        let tree = self.analyze(file)?.item_tree.clone();
-        let (module_idx, module_sym) = single_top_level_module(&tree)?;
-        if module_sym.name != expected_module {
-            return None;
-        }
-        let (idx, _) = tree
-            .children_of(module_idx)
-            .find(|(_, s)| s.exported && s.name == target_name)?;
-        Some(Definition::Item { file, index: idx })
-    }
-
-    fn resolve_struct_literal_field(
-        &mut self,
-        pos: FilePosition,
-        field_init: &SyntaxNode,
-        name: &str,
-    ) -> Option<Definition> {
-        let struct_expr = field_init
-            .ancestors()
-            .find(|n| n.kind() == SyntaxKind::STRUCT_EXPR)
-            .and_then(compactp_ast::expr::StructExpr::cast)?;
-        let struct_name = struct_expr.name()?.text().to_string();
-        let struct_def = self.resolve_name_at(
-            FilePosition {
-                file: pos.file,
-                offset: struct_expr.syntax().text_range().start(),
-            },
-            &struct_name,
-        )?;
-        self.field_of(&struct_def, crate::SymbolKind::StructField, name)
-    }
-
-    fn resolve_member(
-        &mut self,
-        pos: FilePosition,
-        member: &SyntaxNode,
-        name: &str,
-    ) -> Option<Definition> {
-        // Only the syntactically decidable case: receiver is a NAME_EXPR
-        // resolving to an enum → the member is a variant. Everything else
-        // (ledger ADT methods, struct field access) needs types → None.
-        let receiver = member
-            .children()
-            .find(|n| n.kind() == SyntaxKind::NAME_EXPR)
-            .and_then(compactp_ast::expr::NameExpr::cast)?;
-        let receiver_name = receiver.ident()?.text().to_string();
-        let receiver_def = self.resolve_name_at(
-            FilePosition {
-                file: pos.file,
-                offset: receiver.syntax().text_range().start(),
-            },
-            &receiver_name,
-        )?;
-        let Definition::Item { file, index } = &receiver_def else {
-            return None;
-        };
-        let tree = self.analyze(*file)?.item_tree.clone();
-        if tree.symbols[*index as usize].kind != crate::SymbolKind::Enum {
-            return None;
-        }
-        self.field_of(&receiver_def, crate::SymbolKind::EnumVariant, name)
-    }
-
-    fn resolve_import_specifier(
-        &mut self,
-        pos: FilePosition,
-        specifier: &SyntaxNode,
-        name: &str,
-    ) -> Option<Definition> {
-        // Only the ORIGINAL name in `import { orig as alias }` is a
-        // reference into the imported module; the alias is a binding.
-        let spec = compactp_ast::ImportSpecifier::cast(specifier.clone())?;
-        let original = spec.name()?;
-        if original.text() != name {
-            return None;
-        }
-        let import = specifier
-            .ancestors()
-            .find(|n| n.kind() == SyntaxKind::IMPORT)
-            .and_then(compactp_ast::Import::cast)?;
-        let tree = self.analyze(pos.file)?.item_tree.clone();
-        // Resolve the original name through this import, bypassing the
-        // specifier's own alias filtering by looking up directly.
-        match import.name() {
-            Some(t) if t.text() == "CompactStandardLibrary" => {
-                let std_file = self.stdlib_file()?;
-                let std_tree = self.analyze(std_file)?.item_tree.clone();
-                let (idx, _) = std_tree
-                    .top_level()
-                    .find(|(_, s)| s.exported && s.name == name)?;
-                Some(Definition::Item {
-                    file: std_file,
-                    index: idx,
-                })
-            }
-            Some(t) => {
-                let (module_idx, _) = tree
-                    .top_level()
-                    .find(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == t.text())?;
-                let (idx, _) = tree
-                    .children_of(module_idx)
-                    .find(|(_, s)| s.exported && s.name == name)?;
-                Some(Definition::Item {
-                    file: pos.file,
-                    index: idx,
-                })
-            }
-            None => None,
-        }
-    }
-
-    /// Child symbol of `parent_def` with the given kind and name.
-    fn field_of(
-        &mut self,
-        parent_def: &Definition,
-        kind: crate::SymbolKind,
-        name: &str,
-    ) -> Option<Definition> {
-        let Definition::Item { file, index } = parent_def else {
-            return None;
-        };
-        let tree = self.analyze(*file)?.item_tree.clone();
-        let (idx, _) = tree
-            .children_of(*index)
-            .find(|(_, s)| s.kind == kind && s.name == name)?;
-        Some(Definition::Item {
-            file: *file,
-            index: idx,
-        })
+        self.ensure_indexed(pos.file);
+        let src = self.src_of(pos.file)?;
+        let fd = self.file_deps(pos.file);
+        let ws = self.workspace();
+        crate::db::resolve_name_query(
+            self.db_ref(),
+            pos.file,
+            src,
+            fd,
+            ws,
+            pos.offset,
+            name.to_string(),
+        )
     }
 
     /// The definition's name (for reference search and rename).
     pub fn def_name(&mut self, def: &Definition) -> Option<String> {
         match def {
-            Definition::Item { file, index } => Some(
-                self.analyze(*file)?
-                    .item_tree
-                    .symbols
-                    .get(*index as usize)?
-                    .name
-                    .clone(),
-            ),
+            Definition::Item { file, index } => {
+                let src = self.src_of(*file)?;
+                Some(
+                    crate::db::item_tree(self.db_ref(), src)
+                        .symbols
+                        .get(*index as usize)?
+                        .name
+                        .clone(),
+                )
+            }
             Definition::Local { name, .. } => Some(name.clone()),
         }
     }
@@ -684,9 +339,8 @@ impl crate::AnalysisHost {
     pub fn nav_info(&mut self, def: &Definition) -> Option<(FileId, TextRange, TextRange)> {
         match def {
             Definition::Item { file, index } => {
-                let sym = self
-                    .analyze(*file)?
-                    .item_tree
+                let src = self.src_of(*file)?;
+                let sym = crate::db::item_tree(self.db_ref(), src)
                     .symbols
                     .get(*index as usize)?
                     .clone();
@@ -698,144 +352,83 @@ impl crate::AnalysisHost {
         }
     }
 
-    /// If `token` is the name of an item declaration, return that item.
-    fn item_declaration_at(
-        &mut self,
-        file: FileId,
-        parent: &SyntaxNode,
-        token: &SyntaxToken,
-    ) -> Option<Definition> {
-        let analysis = self.analyze(file)?;
-        let range = token.text_range();
-        let is_decl_kind = matches!(
-            parent.kind(),
-            SyntaxKind::CIRCUIT_DEF
-                | SyntaxKind::CIRCUIT_DECL
-                | SyntaxKind::WITNESS_DECL
-                | SyntaxKind::LEDGER_DECL
-                | SyntaxKind::STRUCT_DEF
-                | SyntaxKind::STRUCT_FIELD
-                | SyntaxKind::ENUM_DEF
-                | SyntaxKind::ENUM_VARIANT
-                | SyntaxKind::MODULE_DEF
-                | SyntaxKind::TYPE_DECL
-                | SyntaxKind::CONTRACT_DECL
-                | SyntaxKind::CONTRACT_CIRCUIT
-        );
-        if !is_decl_kind {
-            return None;
-        }
-        let index = analysis
-            .item_tree
-            .symbols
-            .iter()
-            .position(|s| s.name_range == range)?;
-        Some(Definition::Item {
-            file,
-            index: index as u32,
-        })
-    }
-
     /// Error diagnostics for imports/includes in `file` that fail resolution.
     /// A cross-file derived fact — recomputed on demand, not cached with the
-    /// per-file parse.
+    /// per-file parse. Thin bridge over the tracked
+    /// `crate::db::resolution_diagnostics_query`, mirroring `resolve()`'s
+    /// bridge (Task 7): index this file on demand so its dependency edges are
+    /// materialized, read the persisted `FileDeps` input (memoized — no
+    /// per-call salsa input), precompute the impure "searched:" display
+    /// strings, and hand off. All diagnostic logic lives in `db.rs` now.
     pub fn resolution_diagnostics(&mut self, file: FileId) -> Vec<Diagnostic> {
-        let Some(analysis) = self.analyze(file) else {
+        let Some(src) = self.src_of(file) else {
             return Vec::new();
         };
-        let tree = analysis.item_tree.clone();
-        let root = SyntaxNode::new_root(analysis.green.clone());
-        let Some(sf) = compactp_ast::SourceFile::cast(root) else {
-            return Vec::new();
-        };
-        let Some(from_dir) = self.vfs().path(file).parent().map(Path::to_path_buf) else {
-            return Vec::new();
-        };
-        let search = self.import_search_path();
-        let mut diags = Vec::new();
-        for import in sf.imports() {
-            if let Some(name) = import.name() {
-                let nm = name.text().to_string();
-                if nm == "CompactStandardLibrary" {
-                    continue;
-                }
-                if tree
-                    .top_level()
-                    .any(|(_, s)| s.kind == crate::SymbolKind::Module && s.name == nm)
-                {
-                    continue; // satisfied by an in-scope module
-                }
-                match self.cached_source_pathname(&from_dir, &nm) {
-                    None => diags.push(unresolved_import_diag(
-                        &nm,
-                        &from_dir,
-                        &search,
-                        name.text_range(),
-                    )),
-                    Some(path) => {
-                        let target = self.vfs_mut().file_id(&path);
-                        if let Some(d) = self.module_mismatch_diag(target, &nm, name.text_range()) {
-                            diags.push(d);
-                        }
-                    }
-                }
-            } else if let Some(ptok) = import.path() {
-                let raw = crate::string_lit_text(ptok.text());
-                let span = ptok.text_range();
-                let Some(expected) = crate::path_module_name(&raw) else {
-                    continue;
-                };
-                match self.cached_source_pathname(&from_dir, &raw) {
-                    None => diags.push(unresolved_import_diag(&raw, &from_dir, &search, span)),
-                    Some(path) => {
-                        let target = self.vfs_mut().file_id(&path);
-                        if let Some(d) = self.module_mismatch_diag(target, &expected, span) {
-                            diags.push(d);
-                        }
-                    }
-                }
-            }
-        }
-        for inc in sf.includes() {
-            if let Some(tok) = inc.path() {
-                let raw = crate::string_lit_text(tok.text());
-                if self.cached_source_pathname(&from_dir, &raw).is_none() {
-                    diags.push(unresolved_include_diag(
-                        &raw,
-                        &from_dir,
-                        &search,
-                        tok.text_range(),
-                    ));
-                }
-            }
-        }
-        diags
+        self.ensure_indexed(file);
+        let fd = self.file_deps(file);
+        let from_dir = self
+            .vfs()
+            .path(file)
+            .parent()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        let search = self
+            .import_search_path()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        crate::db::resolution_diagnostics_query(
+            self.db_ref(),
+            src,
+            fd,
+            Arc::from(from_dir.as_str()),
+            Arc::from(search.as_str()),
+        )
+        .to_vec()
     }
 
-    /// Error iff `target`'s single module does not match `expected`.
-    fn module_mismatch_diag(
-        &mut self,
-        target: FileId,
-        expected: &str,
-        span: TextRange,
-    ) -> Option<Diagnostic> {
-        let tree = self.analyze(target)?.item_tree.clone();
-        match single_top_level_module(&tree) {
-            None => Some(Diagnostic::error(
-                DiagnosticCode::new("E", 9003),
-                format!("imported file does not contain a single `module {expected}`"),
-                span,
-            )),
-            Some((_, sym)) if sym.name != expected => Some(Diagnostic::error(
-                DiagnosticCode::new("E", 9002),
-                format!(
-                    "imported file defines module `{}` rather than expected `{expected}`",
-                    sym.name
-                ),
-                span,
-            )),
-            Some(_) => None,
-        }
+    /// Generic-specialization diagnostics for `file` (type-reference arity).
+    /// Resolution-fed (arity lives on the referenced definition), so this
+    /// indexes the file to materialize its dependency edges, then calls the
+    /// tracked `generic_diagnostics_query`. Merged into `type_diagnostics`
+    /// (v2b.5); editor surfacing is v2b.final.
+    pub fn generic_diagnostics(&mut self, file: FileId) -> Vec<Diagnostic> {
+        let Some(src) = self.src_of(file) else {
+            return Vec::new();
+        };
+        self.ensure_indexed(file);
+        let fd = self.file_deps(file);
+        let ws = self.workspace();
+        crate::db::generic_diagnostics_query(self.db_ref(), file, src, fd, ws).to_vec()
+    }
+
+    /// Ledger method-call argument type diagnostics for `file` (`E3004`).
+    /// Resolution-fed (receiver + type head resolution), so it indexes the file
+    /// to materialize dependency edges, then calls the tracked
+    /// `ledger_call_diagnostics_query`. Merged into `type_diagnostics` (v2b.6).
+    pub fn ledger_call_diagnostics(&mut self, file: FileId) -> Vec<Diagnostic> {
+        let Some(src) = self.src_of(file) else {
+            return Vec::new();
+        };
+        self.ensure_indexed(file);
+        let fd = self.file_deps(file);
+        let ws = self.workspace();
+        crate::db::ledger_call_diagnostics_query(self.db_ref(), file, src, fd, ws).to_vec()
+    }
+
+    /// Call-argument mismatch diagnostics (`E3006`) for `file`. Resolution-fed
+    /// (callee resolution), so it indexes the file to materialize dependency
+    /// edges, then calls the tracked `call_arg_diagnostics_query`. Merged into
+    /// `type_diagnostics` (v2b.8); editor surfacing is v2b.final.
+    pub fn call_arg_diagnostics(&mut self, file: FileId) -> Vec<Diagnostic> {
+        let Some(src) = self.src_of(file) else {
+            return Vec::new();
+        };
+        self.ensure_indexed(file);
+        let fd = self.file_deps(file);
+        let ws = self.workspace();
+        crate::db::call_arg_diagnostics_query(self.db_ref(), file, src, fd, ws).to_vec()
     }
 }
 
@@ -850,46 +443,8 @@ pub(crate) fn single_top_level_module(tree: &crate::ItemTree) -> Option<(u32, &c
     (first.1.kind == crate::SymbolKind::Module).then_some(first)
 }
 
-fn searched_list(from_dir: &Path, search: &[PathBuf]) -> String {
-    let mut parts = vec![from_dir.display().to_string()];
-    parts.extend(search.iter().map(|p| p.display().to_string()));
-    parts.join(", ")
-}
-
-fn unresolved_import_diag(
-    raw: &str,
-    from_dir: &Path,
-    search: &[PathBuf],
-    span: TextRange,
-) -> Diagnostic {
-    Diagnostic::error(
-        DiagnosticCode::new("E", 9001),
-        format!(
-            "cannot resolve import `{raw}` (searched: {})",
-            searched_list(from_dir, search)
-        ),
-        span,
-    )
-}
-
-fn unresolved_include_diag(
-    raw: &str,
-    from_dir: &Path,
-    search: &[PathBuf],
-    span: TextRange,
-) -> Diagnostic {
-    Diagnostic::error(
-        DiagnosticCode::new("E", 9004),
-        format!(
-            "cannot resolve include `{raw}` (searched: {})",
-            searched_list(from_dir, search)
-        ),
-        span,
-    )
-}
-
 /// Index of the module symbol whose range contains `offset`, if any.
-fn enclosing_module(tree: &crate::ItemTree, offset: TextSize) -> Option<u32> {
+pub(crate) fn enclosing_module(tree: &crate::ItemTree, offset: TextSize) -> Option<u32> {
     tree.symbols
         .iter()
         .enumerate()
@@ -900,7 +455,7 @@ fn enclosing_module(tree: &crate::ItemTree, offset: TextSize) -> Option<u32> {
 
 /// The `as` alias of an import specifier (no typed accessor: read the IDENT
 /// following AS_KW — verified compactp pattern).
-fn import_specifier_alias(spec: &compactp_ast::ImportSpecifier) -> Option<String> {
+pub(crate) fn import_specifier_alias(spec: &compactp_ast::ImportSpecifier) -> Option<String> {
     let mut saw_as = false;
     for element in spec.syntax().children_with_tokens() {
         if let Some(token) = element.into_token() {
@@ -916,7 +471,7 @@ fn import_specifier_alias(spec: &compactp_ast::ImportSpecifier) -> Option<String
 
 /// Finds the IDENT token at/beside `offset`. Between two tokens, prefers
 /// the identifier.
-fn ident_at_offset(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
+pub(crate) fn ident_at_offset(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
     // Same B1-core guard as `anchor_token`: this is `resolve()`'s own
     // `token_at_offset` call, reached directly from `hover`/`goto_definition`
     // /`rename`/`references` with a caller-supplied offset that may be past
@@ -930,7 +485,11 @@ fn ident_at_offset(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
     }
 }
 
-fn generic_definition(file: FileId, param_node: &SyntaxNode, token: &SyntaxToken) -> Definition {
+pub(crate) fn generic_definition(
+    file: FileId,
+    param_node: &SyntaxNode,
+    token: &SyntaxToken,
+) -> Definition {
     let numeric = param_node
         .children_with_tokens()
         .filter_map(|e| e.into_token())
@@ -947,7 +506,7 @@ fn generic_definition(file: FileId, param_node: &SyntaxNode, token: &SyntaxToken
     }
 }
 
-fn local_from_pattern_site(file: FileId, token: &SyntaxToken) -> Option<Definition> {
+pub(crate) fn local_from_pattern_site(file: FileId, token: &SyntaxToken) -> Option<Definition> {
     Some(Definition::Local {
         file,
         name: token.text().to_string(),
@@ -960,7 +519,7 @@ fn local_from_pattern_site(file: FileId, token: &SyntaxToken) -> Option<Definiti
 /// `scope_bindings_at` (anchored on `anchor_token` — see its doc comment for
 /// why that token-pick is safe for the resolver's own calls even though it
 /// differs from `ident_at_offset` in general).
-fn resolve_local_name(
+pub(crate) fn resolve_local_name(
     file: FileId,
     root: &SyntaxNode,
     offset: TextSize,
@@ -1246,6 +805,17 @@ mod tests {
             .collect();
         // Inner-block const `z` first, then params `x`, `y`.
         assert_eq!(names, vec!["z", "x", "y"]);
+    }
+
+    #[test]
+    fn host_resolve_bridges_to_tracked_query() {
+        // Smoke test: the host `resolve()` bridge provisions inputs and reaches
+        // the tracked `crate::db::resolve_query`, resolving a top-level call to
+        // its circuit item (no stdlib needed).
+        let (mut host, pos) =
+            position_of("circuit helper(): [] {}\ncircuit main(): [] { hel$0per(); }");
+        let def = host.resolve(pos).unwrap();
+        assert!(matches!(def, Definition::Item { .. }));
     }
 
     // ---- Task 4: file scope + imports ----
@@ -1659,167 +1229,47 @@ mod tests {
         assert!(diags[0].message.contains("cannot resolve include"));
     }
 
-    // ---- CR-3: cached source-path resolution ----
-    //
-    // These four tests exercise the memo behind `cached_source_pathname`
-    // through the observable `resolution_diagnostics` surface (an import
-    // resolves ⇒ 0 diagnostics; it does not ⇒ 1 "cannot resolve import"). The
-    // first proves the probe is memoized; the other three prove each of the
-    // three invalidation hooks. Every invalidation test is written to go RED if
-    // its specific hook is deleted (see report for the confirmation runs).
+    // ---- Task 9: tracked resolution_diagnostics ----
 
-    const FOO_MODULE: &str = "module Foo { export circuit f(): Field { return 0; } }";
-
-    /// Memoization: after the target is deleted from disk WITHOUT notifying the
-    /// host (no generation bump, no `forget_file`), resolution still serves the
-    /// cached `Some(...)`, proving the second probe did not re-hit disk. A raw,
-    /// uncached probe (asserted alongside) sees the file is gone. Goes RED with
-    /// no memo at all: the second call would re-probe and report the import
-    /// unresolved.
     #[test]
-    fn source_path_probe_is_memoized_within_an_epoch() {
-        let (mut host, dir, file) = diag_host(
-            &[
-                ("Foo.compact", FOO_MODULE),
-                (
-                    "main.compact",
-                    "import Foo;\ncircuit m(): Field { return 0; }",
-                ),
-            ],
-            "main.compact",
-        );
-        // First probe resolves and caches Some(Foo.compact).
-        assert!(host.resolution_diagnostics(file).is_empty());
-
-        // Delete the target out-of-band: nothing tells the host, so from the
-        // host's disk model nothing that could change the result has happened.
-        let foo = dir.path().join("Foo.compact");
-        std::fs::remove_file(&foo).unwrap();
-        // A fresh, uncached probe would now say None...
-        assert!(!foo.exists());
-        assert!(crate::find_source_pathname(dir.path(), &[], "Foo").is_none());
-        // ...but the memoized probe still serves the old Some ⇒ still no diag.
-        assert!(
-            host.resolution_diagnostics(file).is_empty(),
-            "memoized probe must not re-hit disk within an epoch"
-        );
+    fn resolution_diagnostics_report_unresolved_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.compact");
+        std::fs::write(&main, "import \"DoesNotExist\";").unwrap();
+        let mut host = crate::AnalysisHost::new();
+        let id = host.vfs_mut().file_id(&main);
+        host.index_file(id);
+        let diags = host.resolution_diagnostics(id);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code.prefix, "E");
+        assert_eq!(diags[0].code.number, 9001);
     }
 
-    /// Generation hook: a watched-file CREATE is signalled via `invalidate_disk`
-    /// (which bumps the generation). That must invalidate a cached `None` so the
-    /// now-present import resolves. Goes RED if the generation-change clear is
-    /// removed: the stale `None` survives and the import still reports
-    /// unresolved.
+    /// Byte-identical "searched: {list}" wording: the original imperative
+    /// formatting rendered `from_dir` followed by every extra search-path
+    /// entry, joined with `", "`. The tracked query
+    /// only ever sees the host-precomputed `from_dir_display`/`search_display`
+    /// strings, so this locks in that the two combine back into exactly that
+    /// format (not, say, a trailing separator when the search path is
+    /// non-empty, or a stray one when it's empty).
     #[test]
-    fn create_invalidates_cached_none_via_generation() {
+    fn unresolved_import_searched_list_matches_original_format() {
         let (mut host, dir, file) = diag_host(
             &[(
                 "main.compact",
-                "import Foo;\ncircuit m(): Field { return 0; }",
+                "import Missing;\ncircuit m(): Field { return 0; }",
             )],
             "main.compact",
         );
-        // Foo.compact does not exist yet ⇒ unresolved, caches None.
-        assert_eq!(host.resolution_diagnostics(file).len(), 1);
-
-        // Create the file and signal it the way the watcher does: CREATE →
-        // invalidate_disk → generation bump.
-        let foo = dir.path().join("Foo.compact");
-        std::fs::write(&foo, FOO_MODULE).unwrap();
-        let foo_id = host.vfs_mut().file_id(&foo);
-        let gen_before = host.generation();
-        host.vfs_mut().invalidate_disk(foo_id);
-        assert!(
-            host.generation() > gen_before,
-            "invalidate_disk must bump the generation"
-        );
-
-        // The generation changed ⇒ cache cleared ⇒ the import now resolves.
-        assert!(
-            host.resolution_diagnostics(file).is_empty(),
-            "a generation bump must invalidate the cached None"
-        );
-    }
-
-    /// `forget_file` hook: a watched-file DELETE routes through
-    /// `remove_workspace_file` → `forget_file` and does NOT bump the
-    /// generation — the exact case that makes a generation-keyed-ALONE cache
-    /// incorrect. The cached `Some` must be dropped so the import goes
-    /// unresolved. Goes RED if the `forget_file` clear is removed: the stale
-    /// `Some` survives the deletion.
-    #[test]
-    fn delete_invalidates_cached_some_via_forget_file() {
-        let (mut host, dir, file) = diag_host(
-            &[
-                ("Foo.compact", FOO_MODULE),
-                (
-                    "main.compact",
-                    "import Foo;\ncircuit m(): Field { return 0; }",
-                ),
-            ],
-            "main.compact",
-        );
-        // Resolves and caches Some(Foo.compact).
-        assert!(host.resolution_diagnostics(file).is_empty());
-
-        // Delete the file and signal it the way the watcher does: DELETE →
-        // remove_workspace_file → forget_file. This does NOT bump generation.
-        let foo = dir.path().join("Foo.compact");
-        let foo_id = host.vfs_mut().file_id(&foo);
-        std::fs::remove_file(&foo).unwrap();
-        let gen_before = host.generation();
-        host.remove_workspace_file(foo_id);
-        assert_eq!(
-            host.generation(),
-            gen_before,
-            "a DELETE must not bump the generation (this is why forget_file must clear)"
-        );
-
-        // The cached Some must have been invalidated ⇒ import now unresolved.
+        let extra = dir.path().join("libs");
+        host.set_import_search_path(vec![extra.clone()]);
         let diags = host.resolution_diagnostics(file);
-        assert_eq!(
-            diags.len(),
-            1,
-            "forget_file must invalidate the cached Some"
+        assert_eq!(diags.len(), 1);
+        let expected = format!(
+            "cannot resolve import `Missing` (searched: {}, {})",
+            dir.path().display(),
+            extra.display()
         );
-        assert!(diags[0].message.contains("cannot resolve import"));
-    }
-
-    /// `set_import_search_path` hook: the search path is an implicit part of
-    /// every probe key and changing it does NOT bump the generation. The cached
-    /// `None` (computed under the empty search path) must be dropped so the
-    /// now-reachable import resolves. Goes RED if that clear is removed.
-    #[test]
-    fn search_path_change_invalidates_cache() {
-        let (mut host, dir, file) = diag_host(
-            &[
-                (
-                    "libs/Bar.compact",
-                    "module Bar { export circuit g(): Field { return 0; } }",
-                ),
-                (
-                    "main.compact",
-                    "import Bar;\ncircuit m(): Field { return 0; }",
-                ),
-            ],
-            "main.compact",
-        );
-        // Bar lives only under libs/, which is not searched yet ⇒ unresolved,
-        // caches None.
-        assert_eq!(host.resolution_diagnostics(file).len(), 1);
-
-        let gen_before = host.generation();
-        host.set_import_search_path(vec![dir.path().join("libs")]);
-        assert_eq!(
-            host.generation(),
-            gen_before,
-            "changing the search path must not bump the generation"
-        );
-
-        // The memo cleared on the config change ⇒ Bar now resolves.
-        assert!(
-            host.resolution_diagnostics(file).is_empty(),
-            "set_import_search_path must invalidate the cache"
-        );
+        assert_eq!(diags[0].message, expected);
     }
 }

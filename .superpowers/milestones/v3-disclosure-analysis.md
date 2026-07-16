@@ -50,5 +50,8 @@ best-supported one.
   dictates which expression is the disclosure point) — derive placement rules from
   compiler-accepted fixes, not intuition.
 - Interprocedural analysis is the first feature whose cost may genuinely exceed
-  memoized-recompute comfort; expected to lean on v2's re-examination of the
-  incrementality engine.
+  memoized-recompute comfort. **As of 2026-07-14 this is settled in v2's favor:** v2a
+  swaps the engine to salsa up front (v2 program design
+  `docs/superpowers/specs/2026-07-14-v2-native-type-checking-design.md` §4), so v3
+  **inherits** the salsa engine and needs v2b's types for field/element-level taint
+  precision — the engine question is no longer v3's to answer.

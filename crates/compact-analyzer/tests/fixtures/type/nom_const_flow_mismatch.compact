@@ -1,0 +1,2 @@
+struct S { a: Field; }
+export circuit c(s: S): Boolean { const x = s.a; return x; }

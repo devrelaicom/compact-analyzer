@@ -1,0 +1,2 @@
+pragma language_version >= 0.23;
+export circuit f(): Vector<2, Vector<2, Uint<8>>> { return [[1, 2], [3, 4]]; }

@@ -18,9 +18,9 @@ that plan supersedes the file here; update the status line and treat the plan as
 | M3 — completion + CST-derived features | **Done** (merged to main 2026-07-10) | plan + errata: `docs/superpowers/plans/2026-07-08-m3-completion-and-cst-features.md`; spec: `docs/superpowers/specs/2026-07-08-m3-completion-and-cst-features-design.md` |
 | M4 — toolchain integration | **Done** (merged to main 2026-07-10) | plan: `docs/superpowers/plans/2026-07-10-m4-toolchain-integration.md` |
 | M5 — VS Code extension + distribution | **Done** (code merged to main 2026-07-13; publish legs H-gated + dormant, first `v0.1.0` tag + dogfood human-owned) | plan + errata: `docs/superpowers/plans/2026-07-13-m5-vscode-extension-and-distribution.md` |
-| M6 — upstream automation (version watch, drift detection, agent-driven updates) | Future (version-watch CI can land any time) | [m6-upstream-automation.md](m6-upstream-automation.md) |
-| v2 — native type checking | Post-v1 direction | [v2-native-type-checking.md](v2-native-type-checking.md) |
-| v3 — native disclosure analysis | Post-v1 direction (flagship) | [v3-disclosure-analysis.md](v3-disclosure-analysis.md) |
+| M6 — upstream automation (version watch, drift detection, agent-driven updates) | **Split** (2026-07-14): detection half → `M6-detect`, early/independent; heavy half → resequenced as `v2-M6`, the tail of the v2 program | [m6-upstream-automation.md](m6-upstream-automation.md); v2 design `docs/superpowers/specs/2026-07-14-v2-native-type-checking-design.md` §7 |
+| v2 — native type checking | **Committed + decomposed** (2026-07-14): v2a salsa swap → v2b type system → v2c type-aware UX → v2-M6 automation tail | plan-level program design: `docs/superpowers/specs/2026-07-14-v2-native-type-checking-design.md`; context: [v2-native-type-checking.md](v2-native-type-checking.md) |
+| v3 — native disclosure analysis | Post-v1 direction (flagship); inherits salsa from v2a | [v3-disclosure-analysis.md](v3-disclosure-analysis.md) |
 
 M1–M5 together constitute **v1**, whose release bar is: a real multi-file Compact
 project is comfortably developed in VS Code with compact-analyzer every day

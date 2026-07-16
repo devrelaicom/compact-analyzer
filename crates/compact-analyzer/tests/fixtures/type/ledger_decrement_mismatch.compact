@@ -1,0 +1,4 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+export ledger c: Counter;
+export circuit f(): [] { c.decrement(true); }

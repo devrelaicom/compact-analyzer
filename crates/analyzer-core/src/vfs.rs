@@ -14,6 +14,13 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileId(u32);
 
+impl FileId {
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(n: u32) -> FileId {
+        FileId(n)
+    }
+}
+
 #[derive(Debug)]
 enum Content {
     Overlay { text: Arc<str>, version: i32 },

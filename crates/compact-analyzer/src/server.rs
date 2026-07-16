@@ -1654,7 +1654,13 @@ mod tests {
         let (_keep_tx, rx) = crossbeam_channel::unbounded::<Message>();
         let mut state = GlobalState::new(tx, rx);
 
-        let uri = Url::parse("file:///tmp/z.compact").unwrap();
+        // Build the URI from a platform-appropriate absolute path so it
+        // round-trips through `abs_path_from_uri` on Windows too: a bare Unix
+        // path like `/tmp/z.compact` carries no drive letter, and
+        // `Url::to_file_path` rejects such a URI on Windows (returning `None`,
+        // which the `.unwrap()` below would then panic on). Mirrors the
+        // `temp_dir()`-based idiom used elsewhere in these tests.
+        let uri = Url::from_file_path(std::env::temp_dir().join("z.compact")).unwrap();
         let path = lsp_utils::abs_path_from_uri(&uri).unwrap();
         let file = state.host.vfs_mut().file_id(&path);
         state.open_files.insert(uri.clone(), file);

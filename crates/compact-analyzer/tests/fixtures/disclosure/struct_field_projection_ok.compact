@@ -1,0 +1,10 @@
+pragma language_version >= 0.23;
+
+witness getW(): Uint<8>;
+
+struct S { secret: Uint<8>, clean: Uint<8> }
+
+export circuit f(): Uint<8> {
+  const s = S { secret: getW(), clean: 0 };
+  return s.clean;
+}

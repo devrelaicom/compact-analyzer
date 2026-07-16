@@ -2,18 +2,14 @@
 //! AB1, S2, S3). Turns a circuit/constructor declaration into a seeded `Env`
 //! (param name -> tainted `Abs`) the interpreter (A3) starts walking from.
 //!
-//! NO interpreter walk here (`interp_expr`/`interp_stmt` are A3) — this
-//! module is the seeding layer A3 consumes: `discover_roots` finds the
-//! entry points, `seed_sources` seeds each one's parameter environment via
-//! `abs_of_type`.
-//!
-//! Nothing in this module is called from `disclosure_diagnostics_query` yet
-//! (scope: the query stays empty until A3 wires the interpreter walk in), so
-//! every item here is unreachable from a live root outside its own unit
-//! tests — hence the file-level `#![cfg_attr(not(test), expect(dead_code))]`
-//! below, mirroring A1's reasoning for `abs.rs`. It goes unfulfilled the
-//! moment A3 wires this module into a live caller, forcing its removal.
-#![cfg_attr(not(test), expect(dead_code))]
+//! This module carries the seeding layer (`discover_roots`, `seed_sources`,
+//! `abs_of_type`) and the intraprocedural interpreter walk (`interp_expr`/
+//! `interp_stmt`) plus the A4 sinks (the ledger Cell-write sink and the
+//! `return` sink with its `filter_witnesses` asymmetry). A4 wired
+//! `disclosure_diagnostics_query` (`mod.rs`) to run the walk from every root
+//! and drain the leak table, so every item here has a live non-test caller —
+//! the A1/A2-era file-level `#![cfg_attr(not(test), expect(dead_code))]`
+//! scaffold marker is gone.
 
 use std::collections::HashMap;
 
@@ -241,6 +237,60 @@ pub struct InterpCtx<'a> {
     pub src: SourceText,
     pub fd: FileDeps,
     pub ws: Workspace,
+    /// The exported circuit currently being walked (R0 `disclosing-function-name?`,
+    /// spec §3.2). `Some(name)` inside an exported-circuit root arms the `return`
+    /// sink (K7) and names it; `None` (a constructor root, whose body has no
+    /// value-returning `return`) disarms it.
+    pub disclosing_fn: Option<&'a str>,
+}
+
+/// Seeds and walks one analysis root (spec §3.1): `seed_sources` builds the
+/// parameter environment, then `interp_stmt` walks the root's body block with
+/// an empty control set (control-witness threading is A5). The root's identity
+/// arms the `return` sink — an exported circuit sets `disclosing_fn` to its
+/// name (K7 fires and is named after it); a constructor leaves it `None` (K7
+/// disarmed). Sinks record into `sink`'s leak table; the caller drains it.
+pub fn interp_root(ctx: &InterpCtx, sink: &mut DisclosureSink, root: &Root) {
+    let disclosing_fn = match root {
+        Root::Circuit { name, .. } => Some(name.as_str()),
+        Root::Constructor { .. } => None,
+    };
+    let ctx = InterpCtx {
+        disclosing_fn,
+        ..*ctx
+    };
+    let mut env = seed_sources(ctx.db, ctx.file, ctx.src, ctx.fd, ctx.ws, root, sink);
+    let Some(body) = root_body(&ctx, root) else {
+        return;
+    };
+    interp_stmt(&ctx, sink, &mut env, &[], &compactp_ast::Stmt::Block(body));
+}
+
+/// The body `Block` of a root's circuit/constructor declaration, located the
+/// same way `seed_sources` finds its parameters. `None` when the symbol index
+/// doesn't resolve or the declaration has no body (both defensive — a `Root`
+/// `discover_roots` produced from the same `src` always resolves).
+fn root_body(ctx: &InterpCtx, root: &Root) -> Option<compactp_ast::Block> {
+    let tree = item_tree(ctx.db, ctx.src);
+    let ast_root = SyntaxNode::new_root(crate::db::parsed(ctx.db, ctx.src).green);
+    match root {
+        Root::Circuit { symbol, .. } => {
+            let sym = tree.symbols.get(*symbol as usize)?;
+            ast_root
+                .descendants()
+                .filter_map(compactp_ast::CircuitDef::cast)
+                .find(|c| c.name().map(|n| n.text_range()) == Some(sym.name_range))?
+                .body()
+        }
+        Root::Constructor { symbol } => {
+            let sym = tree.symbols.get(*symbol as usize)?;
+            ast_root
+                .descendants()
+                .filter_map(compactp_ast::ConstructorDef::cast)
+                .find(|c| c.syntax().text_range() == sym.full_range)?
+                .body()
+        }
+    }
 }
 
 /// How a call's callee resolves (spec §3.1/§3.6). Drives the `Call` arm.
@@ -547,15 +597,26 @@ fn interp_call(
             };
             abs_of_type(sink, &ret, std::slice::from_ref(&w))
         }
+        // A cross-circuit call (v3b) or a native/stdlib/ledger-op/unresolved
+        // callee (A6): the taint semantics of the RESULT are not yet modeled, so
+        // fail closed to an AMBER advisory (spec §0) and return a CLEAN result —
+        // NOT a conservatively-tainted one. A tainted result would flow to a sink
+        // as a confirmed RED leak (§0 says fail-closed is *amber*, not red), and
+        // for a native that is actually a sanitizer (`persistentCommit`/
+        // `transientCommit`, `discloses: nothing`) that RED would be a false
+        // positive on compiler-accepted code — breaking the corpus gate. A6's
+        // conduit table promotes the real conduits (`persistentHash` → "a hash
+        // of") back to tainted; until then the uncertainty lives in the advisory.
+        // Arguments are still interpreted (for their own nested sinks/advisories).
         CalleeClass::Circuit => {
-            let ws = union_of_args(ctx, sink, env, control, call);
+            interp_args_for_effect(ctx, sink, env, control, call);
             sink.emit_advisory(src, "cross-circuit call not interpreted (v3b)".to_string());
-            Abs::Atomic(ws)
+            Abs::Atomic(Vec::new())
         }
         CalleeClass::Native => {
-            let ws = union_of_args(ctx, sink, env, control, call);
+            interp_args_for_effect(ctx, sink, env, control, call);
             sink.emit_advisory(src, "native call not yet modeled (A6)".to_string());
-            Abs::Atomic(ws)
+            Abs::Atomic(Vec::new())
         }
     }
 }
@@ -578,7 +639,7 @@ fn interp_member(
     let base_abs = interp_expr(ctx, sink, env, control, &base);
     let field = m.field().map(|t| t.text().to_string());
     if let Abs::Multiple(children) = &base_abs
-        && let Some(idx) = field_index(&base, field.as_deref())
+        && let Some(idx) = field_index(ctx, &base, field.as_deref())
         && let Some(child) = children.get(idx)
     {
         return child.clone();
@@ -660,11 +721,52 @@ pub fn interp_stmt(
                 .unwrap_or_else(|| Abs::Atomic(Vec::new()));
             bind_pattern(sink, env, c.pattern().as_ref(), val);
         }
-        // Expression statement / return / assignment: interpret operands so
-        // their `Abs` is realized (A4 records the return/ledger SINK on top).
-        Stmt::Expr(_) | Stmt::Assign(_) | Stmt::Return(_) | Stmt::Assert(_) => {
+        // Expression statement / assert: interpret operands so their `Abs`
+        // (and any advisory) is realized. Neither is a sink.
+        Stmt::Expr(_) | Stmt::Assert(_) => {
             for e in child_exprs(stmt.syntax()) {
                 interp_expr(ctx, sink, env, control, &e);
+            }
+        }
+        // Assignment (R0 K1 ledger sink, spec §3.2). A Cell-style write
+        // `c = e` (also `c += e` / `c -= e`) to a ledger field leaks the
+        // written value's witnesses (L1 default: an op arg with no `discloses`
+        // clause leaks). Interpret ONLY the RHS as a value — NOT the LHS
+        // write-target (Step 0 minor: reading the l-value emits a spurious
+        // projection advisory). The precise per-op `discloses?` flag table +
+        // container-op (`c.method(arg)`) args are A6.
+        Stmt::Assign(a) => match child_exprs(a.syntax()).as_slice() {
+            [target, value] => {
+                let value_abs = interp_expr(ctx, sink, env, control, value);
+                if is_ledger_field(ctx, target) {
+                    sink.record_leak(
+                        a.syntax().text_range(),
+                        "ledger operation",
+                        witnesses_of(&value_abs),
+                    );
+                }
+            }
+            // Defensive (unexpected shape): realize taint, record no sink.
+            kids => {
+                for e in kids {
+                    interp_expr(ctx, sink, env, control, e);
+                }
+            }
+        },
+        // Return (R0 K7 return sink + `filter_witnesses` asymmetry, spec §3.2).
+        // Only fires inside an exported-circuit root (`disclosing_fn`), and only
+        // for `WitnessReturn` taint — returning the circuit's own argument (or a
+        // constructor argument) is NOT a disclosure. A4 does the DATA leak; the
+        // control-witness leak (K6) is A5.
+        Stmt::Return(r) => {
+            let val = r.value().map(|e| interp_expr(ctx, sink, env, control, &e));
+            if let (Some(fname), Some(val)) = (ctx.disclosing_fn, &val) {
+                let filtered = filter_witnesses(&witnesses_of(val));
+                sink.record_leak(
+                    stmt.syntax().text_range(),
+                    format!("the value returned from exported circuit {fname}"),
+                    filtered,
+                );
             }
         }
         // `if` in statement position (R0 F1 effect position): interpret the
@@ -891,21 +993,20 @@ fn witness_return_ty(ctx: &InterpCtx, def_file: crate::FileId, sym: &crate::Symb
     }
 }
 
-/// The witness union of a call's argument expressions (conservative taint for
-/// the fail-closed circuit/native arms).
-fn union_of_args(
+/// Interprets a call's argument expressions for their side effects (nested
+/// sinks + advisories), discarding the taint — the fail-closed circuit/native
+/// arms return a CLEAN result (the arg taint does not propagate through the
+/// unmodeled callee until A6's conduit table decides which args are conduits).
+fn interp_args_for_effect(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
     env: &Env,
     control: &[Witness],
     call: &CallExpr,
-) -> Vec<Witness> {
-    let mut ws = Vec::new();
+) {
     for arg in arg_exprs(call) {
-        let a = interp_expr(ctx, sink, env, control, &arg);
-        ws = merge_witnesses(&ws, &witnesses_of(&a));
+        interp_expr(ctx, sink, env, control, &arg);
     }
-    ws
 }
 
 /// The direct `Expr` children of a syntax node, in source order.
@@ -941,19 +1042,102 @@ fn is_method_call(call: &CallExpr) -> bool {
         .any(|t| t.kind() == SyntaxKind::DOT)
 }
 
+/// K7 asymmetry (spec §3.2, `analysis-passes.ss:5561`, `filter-witnesses`): at
+/// the `return` sink, keep ONLY `WitnessReturn` witnesses and drop
+/// `ConstructorArg`/`CircuitArg`. Returning an exported circuit's own argument
+/// (or a constructor argument) is NOT a disclosure — the load-bearing
+/// asymmetry. A5 reuses this for the K6 control-witness return leak.
+pub fn filter_witnesses(witnesses: &[Witness]) -> Vec<Witness> {
+    witnesses
+        .iter()
+        .filter(|w| matches!(w.info, WitnessInfo::WitnessReturn { .. }))
+        .cloned()
+        .collect()
+}
+
+/// Whether the assignment target `target` writes a ledger field (R0 K1): its
+/// leftmost identifier resolves to a `SymbolKind::Ledger` declaration. A Cell
+/// write `c = e`, `c.x = e`, or `c[i] = e` all pivot on the root ledger name.
+/// A non-ledger target (impossible for a well-formed circuit body, where the
+/// only assignable l-values are ledger fields) resolves to `false` — no leak.
+fn is_ledger_field(ctx: &InterpCtx, target: &Expr) -> bool {
+    let Some(name_tok) = leftmost_name_token(target) else {
+        return false;
+    };
+    let Some(Definition::Item { file: df, index }) = resolve_query(
+        ctx.db,
+        ctx.file,
+        ctx.src,
+        ctx.fd,
+        ctx.ws,
+        name_tok.text_range().start(),
+    ) else {
+        return false;
+    };
+    let Some(sym) = item_symbol(ctx.db, ctx.file, ctx.src, ctx.fd, df, index) else {
+        return false;
+    };
+    sym.kind == SymbolKind::Ledger
+}
+
+/// The leftmost identifier token of an l-value expression: the root name of a
+/// `Name`/`Member`/`Index` target (`c`, `c.x`, `c[i]` all -> `c`), peeling
+/// parens. `None` for any other shape.
+fn leftmost_name_token(target: &Expr) -> Option<compactp_syntax::SyntaxToken> {
+    match unwrap_paren(target) {
+        Expr::Name(n) => n.ident(),
+        Expr::Member(m) => child_exprs(m.syntax())
+            .into_iter()
+            .next()
+            .and_then(|base| leftmost_name_token(&base)),
+        Expr::Index(i) => child_exprs(i.syntax())
+            .into_iter()
+            .next()
+            .and_then(|base| leftmost_name_token(&base)),
+        _ => None,
+    }
+}
+
 /// The positional index of `field` within the base's struct shape, matching how
 /// `abs_of_type`/struct-literal construction order the `Multiple` children:
 /// from a struct-literal base's own field order, or the base's static struct
 /// type. `None` when it can't be determined (caller fails closed).
-fn field_index(base: &Expr, field: Option<&str>) -> Option<usize> {
+///
+/// Step 0 (A3 review deferral): for a NAME-bound (non-literal) base, resolving
+/// the field index requires the base's static struct type — a name's `Multiple`
+/// has no inline field order to read. We resolve it via the tracked `expr_ty`
+/// (the same query `AnalysisHost::type_at` fronts, `infer.rs:588`), reachable
+/// here from `ctx`. Without this, `interp_member` fell through to a flat
+/// `Atomic(union of ALL fields)`, over-tainting a clean field into a false
+/// positive once the sinks exist. The seeded/name-bound `Multiple` is ordered
+/// by the struct's declared fields, so the declared field order is the correct
+/// index map.
+fn field_index(ctx: &InterpCtx, base: &Expr, field: Option<&str>) -> Option<usize> {
     let field = field?;
     let base = unwrap_paren(base);
+    // Struct-literal base: the `Multiple` the `Expr::Struct` arm builds is in
+    // the literal's own field-init source order, so match against that order.
     if let Expr::Struct(s) = &base {
         return s
             .field_inits()
             .position(|fi| fi.name().map(|n| n.text().to_string()).as_deref() == Some(field));
     }
-    if let TyKind::Struct { fields, .. } = crate::infer::expr_ty_kind(&base) {
+    // Otherwise resolve the base's static struct type (declared field order).
+    // Anchor `expr_ty` at the base's last meaningful token, not its node start:
+    // a NAME_EXPR node can carry leading whitespace, and `enclosing_expr` biases
+    // a whitespace-boundary offset to the preceding token — landing on the wrong
+    // expression (Unknown). The last non-trivia token (`s` in `s`, `b` in `a.b`)
+    // sits inside the base and resolves to the base's own type.
+    let off = base
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.text().trim().is_empty())
+        .last()
+        .map(|t| t.text_range().start())
+        .unwrap_or_else(|| base.syntax().text_range().start());
+    let kind = crate::db::expr_ty(ctx.db, ctx.file, ctx.src, ctx.fd, ctx.ws, off);
+    if let TyKind::Struct { fields, .. } = kind {
         return fields.iter().position(|(n, _)| n.as_ref() == field);
     }
     None
@@ -1229,6 +1413,7 @@ mod tests {
             src,
             fd,
             ws,
+            disclosing_fn: None,
         };
         let root = root_of(&db, src);
         let expr = first_expr(&root, compactp_syntax::SyntaxKind::DISCLOSE_EXPR);
@@ -1249,6 +1434,7 @@ mod tests {
             src,
             fd,
             ws,
+            disclosing_fn: None,
         };
         let root = root_of(&db, src);
         let expr = first_expr(&root, compactp_syntax::SyntaxKind::CALL_EXPR);
@@ -1281,6 +1467,7 @@ mod tests {
             src,
             fd,
             ws,
+            disclosing_fn: None,
         };
         let root = root_of(&db, src);
         let expr = first_expr(&root, compactp_syntax::SyntaxKind::MEMBER_EXPR);
@@ -1308,6 +1495,7 @@ mod tests {
             src,
             fd,
             ws,
+            disclosing_fn: None,
         };
         let root = root_of(&db, src);
         let expr = first_expr(&root, compactp_syntax::SyntaxKind::CAST_EXPR);
@@ -1328,6 +1516,7 @@ mod tests {
             src,
             fd,
             ws,
+            disclosing_fn: None,
         };
         let root = root_of(&db, src);
         let expr = first_expr(&root, compactp_syntax::SyntaxKind::BINARY_EXPR);
@@ -1352,6 +1541,7 @@ mod tests {
             src,
             fd,
             ws,
+            disclosing_fn: None,
         };
         let root = root_of(&db, src);
         let expr = first_expr(&root, compactp_syntax::SyntaxKind::TERNARY_EXPR);
@@ -1377,6 +1567,7 @@ mod tests {
             src,
             fd,
             ws,
+            disclosing_fn: None,
         };
         let root = root_of(&db, src);
         let expr = first_expr(&root, compactp_syntax::SyntaxKind::BINARY_EXPR);
@@ -1397,6 +1588,7 @@ mod tests {
             src,
             fd,
             ws,
+            disclosing_fn: None,
         };
         let root = root_of(&db, src);
         let expr = first_expr(&root, compactp_syntax::SyntaxKind::UNARY_EXPR);
@@ -1412,9 +1604,13 @@ mod tests {
     }
 
     #[test]
-    fn native_call_fails_closed_advisory() {
-        // Unresolved callee -> native/unknown path (A6 deferral): advisory +
-        // conservative union of arg witnesses.
+    fn native_call_fails_closed_to_amber_clean() {
+        // Unresolved callee -> native/unknown path (A6 deferral): fail closed to
+        // an AMBER advisory with a CLEAN result. The arg taint does NOT propagate
+        // through the unmodeled callee (a tainted result would become a
+        // false-positive RED leak at a downstream sink for a native that is
+        // actually a sanitizer, e.g. `persistentCommit`). A6's conduit table
+        // promotes the real conduits (e.g. `persistentHash`) back to tainted.
         let (db, src, fd, ws, file) =
             walk_setup("export circuit f(): Field { return blackbox(w); }\n");
         let ctx = InterpCtx {
@@ -1423,6 +1619,7 @@ mod tests {
             src,
             fd,
             ws,
+            disclosing_fn: None,
         };
         let root = root_of(&db, src);
         let expr = first_expr(&root, compactp_syntax::SyntaxKind::CALL_EXPR);
@@ -1434,7 +1631,10 @@ mod tests {
             !sink.advisories().is_empty(),
             "native/unknown call emits advisory"
         );
-        assert_eq!(witnesses_of(&out).len(), 1, "native call keeps arg taint");
+        assert!(
+            witnesses_of(&out).is_empty(),
+            "native call result is clean (amber, not red) — taint deferred to A6"
+        );
     }
 
     #[test]
@@ -1448,6 +1648,7 @@ mod tests {
             src,
             fd,
             ws,
+            disclosing_fn: None,
         };
         let root = root_of(&db, src);
         let block = root
@@ -1470,5 +1671,128 @@ mod tests {
             1,
             "const binds the witness-return abs"
         );
+    }
+
+    #[test]
+    fn name_bound_struct_member_projects_precisely() {
+        // Step 0 (A3 review deferral): a NAME-bound struct member must project
+        // to the accessed field only. Pre-fix, `field_index` could not resolve a
+        // name's static struct type, so `interp_member` fell to a flat
+        // `Atomic(union of ALL fields)` -> the clean field over-tainted (a false
+        // positive once sinks exist). This test FAILS against that over-taint.
+        let (db, src, fd, ws, file) = walk_setup(
+            "witness getW(): Field;\nstruct S { secret: Field, clean: Field }\n\
+             export circuit f(): [] {\n\
+             const s = S { secret: getW(), clean: 0 };\n\
+             const a = s.clean;\n\
+             const b = s.secret;\n\
+             }\n",
+        );
+        let ctx = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let root = root_of(&db, src);
+        let block = root
+            .descendants()
+            .find(|n| n.kind() == compactp_syntax::SyntaxKind::BLOCK)
+            .and_then(compactp_ast::Block::cast)
+            .expect("circuit body block");
+        let mut env = Env::new();
+        let mut sink = DisclosureSink::new();
+        interp_stmt(
+            &ctx,
+            &mut sink,
+            &mut env,
+            &[],
+            &compactp_ast::Stmt::Block(block),
+        );
+        // `a = s.clean` -> the clean field only: NO witnesses.
+        let a = env.get("a").expect("binding a present");
+        assert!(
+            witnesses_of(a).is_empty(),
+            "clean field must not carry the secret's witness (got {:?})",
+            witnesses_of(a)
+        );
+        // `b = s.secret` -> the witness field: carries getW's witness.
+        let b = env.get("b").expect("binding b present");
+        assert_eq!(
+            witnesses_of(b).len(),
+            1,
+            "secret field must carry exactly its own witness"
+        );
+        assert_eq!(
+            witnesses_of(b)[0].info,
+            WitnessInfo::WitnessReturn {
+                function: "getW".into()
+            }
+        );
+    }
+
+    #[test]
+    fn return_sink_records_only_witness_return_taint() {
+        // K7 asymmetry: a witness-return leaks on `return`; a circuit argument
+        // does not. Drive `interp_root` (which arms the return sink).
+        let (db, src, fd, ws, file) = walk_setup(
+            "witness getW(): Uint<8>;\n\
+             export circuit leaky(): Uint<8> { return getW(); }\n\
+             export circuit ok(x: Uint<8>): Uint<8> { return x; }\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let roots = discover_roots(&tree);
+        let mut sink = DisclosureSink::new();
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        let leaks = sink.drain_leaks();
+        // Exactly one leak: `leaky`'s witness return. `ok` returns its own arg
+        // (CircuitArg) -> filtered out.
+        assert_eq!(leaks.len(), 1, "only the witness-return circuit leaks");
+        assert_eq!(
+            leaks[0].nature,
+            "the value returned from exported circuit leaky"
+        );
+        assert_eq!(leaks[0].witnesses.len(), 1);
+    }
+
+    #[test]
+    fn ledger_cell_write_records_leak() {
+        // K1 ledger sink: `c = getW()` writes a witness value to a ledger Cell.
+        let (db, src, fd, ws, file) = walk_setup(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Uint<8>;\n\
+             witness getW(): Uint<8>;\n\
+             export circuit f(): [] { c = getW(); }\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let roots = discover_roots(&tree);
+        let mut sink = DisclosureSink::new();
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        let leaks = sink.drain_leaks();
+        assert_eq!(leaks.len(), 1, "the ledger write leaks the witness");
+        assert_eq!(leaks[0].nature, "ledger operation");
+        assert_eq!(leaks[0].witnesses.len(), 1);
     }
 }

@@ -88,7 +88,7 @@ const FIXTURES: &[Fixture] = &[
         name: "ledger_leak.compact",
         rule: "K1 ledger sink",
         discloses: true,
-        native_confirms: false,
+        native_confirms: true,
     },
     Fixture {
         name: "ledger_disclosed.compact",
@@ -100,7 +100,7 @@ const FIXTURES: &[Fixture] = &[
         name: "return_witness_leak.compact",
         rule: "K7 return asymmetry (witness-return leaks)",
         discloses: true,
-        native_confirms: false,
+        native_confirms: true,
     },
     Fixture {
         name: "return_arg_ok.compact",
@@ -130,12 +130,18 @@ const FIXTURES: &[Fixture] = &[
         name: "constructor_arg_leak.compact",
         rule: "S2 constructor-argument source",
         discloses: true,
-        native_confirms: false,
+        native_confirms: true,
     },
     Fixture {
         name: "comingled_return.compact",
         rule: "K7 asymmetry edge case (co-mingled return)",
         discloses: true,
+        native_confirms: true,
+    },
+    Fixture {
+        name: "struct_field_projection_ok.compact",
+        rule: "P5 precise name-bound struct member projection (clean field)",
+        discloses: false,
         native_confirms: false,
     },
 ];

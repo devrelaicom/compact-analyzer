@@ -1180,6 +1180,13 @@ fn type_expr(
         }
         // Call `callee(args)`: the callee's declared return type.
         Expr::Call(c) => callee_return_ty(db, file, src, fd, ws, c),
+        // Struct literal `S { … }`: its nominal type, lowered from the struct
+        // name (declared field order). Enables typing a `const s = S { … }`
+        // binding — used by the disclosure interpreter's member projection.
+        Expr::Struct(s) => match s.name() {
+            Some(name) => named_type_ty(db, file, src, fd, ws, name.text_range().start()),
+            None => TyKind::Unknown,
+        },
         _ => TyKind::Unknown,
     }
 }

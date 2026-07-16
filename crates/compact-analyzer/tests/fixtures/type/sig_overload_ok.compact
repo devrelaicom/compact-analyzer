@@ -1,0 +1,4 @@
+pragma language_version >= 0.23;
+circuit f(x: Boolean): Boolean { return x; }
+circuit f(x: Uint<8>): Boolean { return true; }
+export circuit c(): Boolean { return f(5); }

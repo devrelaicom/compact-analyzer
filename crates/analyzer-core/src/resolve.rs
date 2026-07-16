@@ -416,6 +416,20 @@ impl crate::AnalysisHost {
         let ws = self.workspace();
         crate::db::ledger_call_diagnostics_query(self.db_ref(), file, src, fd, ws).to_vec()
     }
+
+    /// Call-argument mismatch diagnostics (`E3006`) for `file`. Resolution-fed
+    /// (callee resolution), so it indexes the file to materialize dependency
+    /// edges, then calls the tracked `call_arg_diagnostics_query`. Merged into
+    /// `type_diagnostics` (v2b.8); editor surfacing is v2b.final.
+    pub fn call_arg_diagnostics(&mut self, file: FileId) -> Vec<Diagnostic> {
+        let Some(src) = self.src_of(file) else {
+            return Vec::new();
+        };
+        self.ensure_indexed(file);
+        let fd = self.file_deps(file);
+        let ws = self.workspace();
+        crate::db::call_arg_diagnostics_query(self.db_ref(), file, src, fd, ws).to_vec()
+    }
 }
 
 /// The sole top-level symbol iff it is exactly one and a module. Mirrors the

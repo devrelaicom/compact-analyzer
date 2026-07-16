@@ -400,24 +400,146 @@ fn return_mismatch_diag(
     )
 }
 
+/// The first `IDENT` token of a witness `STRUCT_FIELD` parameter node (the
+/// parameter name) and its range. Witness args have no pattern wrapper
+/// (`arg → id : type`, grammar's `patterns.rs::arg`), so the direct/first
+/// `IDENT` child is unambiguously the name. NOT used for circuit params:
+/// see `circuit_param_name` for why a raw first-IDENT scan is wrong there.
+fn param_name_ident(node: &compactp_syntax::SyntaxNode) -> Option<(String, text_size::TextRange)> {
+    node.descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == compactp_syntax::SyntaxKind::IDENT)
+        .map(|t| (t.text().to_string(), t.text_range()))
+}
+
+/// The bound name of a circuit parameter, via the typed pattern API
+/// (`compactp_ast::Param::pattern()` / `compactp_ast::Pat`) — contributes a
+/// name only for a simple identifier pattern (`Pat::Ident`).
+///
+/// A raw first-IDENT scan of the `PARAM` subtree (as `param_name_ident`
+/// does for witness `STRUCT_FIELD`s) is wrong here: a circuit parameter can
+/// be a destructuring pattern, and for a struct pattern with field renaming
+/// — `{x: a}: S` — the grammar emits `STRUCT_PAT_FIELD(IDENT "x", COLON,
+/// IDENT_PAT(IDENT "a"))`, so the *first* `IDENT` in document order is the
+/// struct-field key `x`, not the bound local name `a`. Two params
+/// `{x: a}: S` and `{x: b}: S` bind distinct names (`a`, `b`) but a
+/// first-IDENT scan would see `["x", "x"]` and falsely flag `E3005` —
+/// `compactc` accepts that source. Destructuring patterns (`Pat::Tuple`,
+/// `Pat::Struct`) are therefore skipped (contribute no name): a safe
+/// false-negative, out of scope for this check rather than incorrectly
+/// flagged.
+fn circuit_param_name(param: &compactp_ast::Param) -> Option<(String, text_size::TextRange)> {
+    match param.pattern()? {
+        compactp_ast::Pat::Ident(ident) => {
+            let tok = ident.name()?;
+            Some((tok.text().to_string(), tok.text_range()))
+        }
+        compactp_ast::Pat::Tuple(_) | compactp_ast::Pat::Struct(_) => None,
+    }
+}
+
+/// Push an `E3005` for the first duplicate among `params` (name, range) pairs,
+/// in declaration order. Reports only the first duplicate per signature —
+/// whether this matches `compactc`'s own stopping behavior is unverified.
+fn check_duplicate_params(
+    params: impl Iterator<Item = (String, text_size::TextRange)>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let mut seen: Vec<String> = Vec::new();
+    for (name, range) in params {
+        if seen.contains(&name) {
+            diags.push(Diagnostic::error(
+                DiagnosticCode::new("E", 3005),
+                format!("duplicate parameter name {name}"),
+                range,
+            ));
+            return;
+        }
+        seen.push(name);
+    }
+}
+
+/// Signature well-formedness diagnostics for `src`: a circuit or witness with
+/// two parameters of the same name (`E3005`). Pure single-file CST walk — no
+/// resolution. `no_eq`: `Diagnostic` has no `PartialEq` (same rationale as
+/// `type_diagnostics_query`).
+#[salsa::tracked(returns(clone), no_eq)]
+pub fn signature_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnostic]> {
+    use compactp_syntax::SyntaxKind;
+    let root = compactp_syntax::SyntaxNode::new_root(parsed(db, src).green);
+    let mut diags = Vec::new();
+    // Circuit params are PARAM nodes; extract names via the typed pattern
+    // API so struct/tuple destructuring params are skipped rather than
+    // misread (see `circuit_param_name`).
+    for c in root
+        .descendants()
+        .filter_map(compactp_ast::CircuitDef::cast)
+    {
+        let params = c.params().filter_map(|p| circuit_param_name(&p));
+        check_duplicate_params(params, &mut diags);
+    }
+    // Witness params are STRUCT_FIELD nodes (shared grammar with struct fields).
+    for w in root
+        .descendants()
+        .filter_map(compactp_ast::WitnessDecl::cast)
+    {
+        let params = w
+            .syntax()
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::STRUCT_FIELD)
+            .filter_map(|n| param_name_ident(&n));
+        check_duplicate_params(params, &mut diags);
+    }
+    Arc::from(diags)
+}
+
+/// Full text ranges of every GENERIC `module` (one with a generic parameter
+/// list) in `src`. compactc does not type-check a generic module's body until
+/// it is instantiated, so native suppresses any type diagnostic whose span
+/// falls inside one of these ranges (never a false positive; instantiated
+/// generic bodies become a safe false-negative).
+pub(crate) fn generic_module_ranges(db: &dyn Db, src: SourceText) -> Vec<text_size::TextRange> {
+    let root = compactp_syntax::SyntaxNode::new_root(parsed(db, src).green);
+    root.descendants()
+        .filter_map(compactp_ast::ModuleDef::cast)
+        .filter(|m| m.generic_params().is_some())
+        .map(|m| m.syntax().text_range())
+        .collect()
+}
+
 impl crate::AnalysisHost {
     /// Type diagnostics for `file` (foundation: primitive-literal return
     /// mismatch) plus generic-specialization (arity) diagnostics plus
-    /// ledger method-call argument-type diagnostics (`E3004`). Thin bridge
-    /// over the tracked `type_diagnostics_query`, mirroring
-    /// `resolution_diagnostics`, merged with `generic_diagnostics` and
-    /// `ledger_call_diagnostics` so this is the single type-diagnostics
-    /// surface the differential harness (and, later, the editor) consumes.
-    /// Single-file typing: no `FileDeps`/`Workspace` inputs are needed for
-    /// the `type_diagnostics_query` slice. Editor surfacing (Problems panel
-    /// + toggle) is wired in v2b.final, which consumes this method.
+    /// duplicate-param diagnostics (`E3005`) plus ledger method-call
+    /// argument-type diagnostics (`E3004`) plus user circuit/witness
+    /// call-argument diagnostics (`E3006`). Thin bridge over the tracked
+    /// `type_diagnostics_query`, mirroring `resolution_diagnostics`, merged
+    /// with `signature_diagnostics_query`, `generic_diagnostics`,
+    /// `ledger_call_diagnostics`, and `call_arg_diagnostics` so this is the
+    /// single type-diagnostics surface the differential harness (and, later,
+    /// the editor) consumes. Single-file typing: no `FileDeps`/`Workspace`
+    /// inputs are needed for the `type_diagnostics_query` slice. Editor
+    /// surfacing (Problems panel + toggle) is wired in v2b.final, which
+    /// consumes this method.
     pub fn type_diagnostics(&mut self, file: crate::FileId) -> Vec<Diagnostic> {
         let Some(src) = self.src_of(file) else {
             return Vec::new();
         };
         let mut diags = type_diagnostics_query(self.db_ref(), src).to_vec();
+        diags.extend(signature_diagnostics_query(self.db_ref(), src).to_vec());
         diags.extend(self.generic_diagnostics(file));
         diags.extend(self.ledger_call_diagnostics(file));
+        diags.extend(self.call_arg_diagnostics(file));
+        // compactc does not type-check a generic module's template body until
+        // it is instantiated (verified against live compactc 0.31.1): drop any
+        // diagnostic whose span falls inside a generic module, regardless of
+        // which rule emitted it. Safe (false-negative only, never a false
+        // positive): un-instantiated is the correct suppression; instantiated
+        // is a safe false-negative.
+        let ranges = generic_module_ranges(self.db_ref(), src);
+        if !ranges.is_empty() {
+            diags.retain(|d| !ranges.iter().any(|r| r.contains_range(d.primary_span)));
+        }
         diags
     }
 }
@@ -956,6 +1078,309 @@ mod tests {
                 .type_diagnostics(file2)
                 .iter()
                 .all(|d| d.code.number != 3004)
+        );
+    }
+
+    #[test]
+    fn duplicate_param_circuit_and_witness_flagged() {
+        let db = CompactDatabase::default();
+        // Circuit with two params named `a` -> one E3005.
+        let a = SourceText::new(
+            &db,
+            Arc::from("export circuit c(a: Uint<8>, a: Boolean): Boolean { return true; }"),
+        );
+        let da = signature_diagnostics_query(&db, a);
+        assert_eq!(da.len(), 1);
+        assert_eq!(da[0].code.number, 3005);
+        // Witness with two params named `x` -> one E3005 (witness params are STRUCT_FIELD).
+        let b = SourceText::new(
+            &db,
+            Arc::from("witness w(x: Uint<8>, x: Boolean): Boolean;"),
+        );
+        let db2 = signature_diagnostics_query(&db, b);
+        assert_eq!(db2.len(), 1);
+        assert_eq!(db2[0].code.number, 3005);
+    }
+
+    #[test]
+    fn distinct_params_emit_nothing() {
+        let db = CompactDatabase::default();
+        let a = SourceText::new(
+            &db,
+            Arc::from("export circuit c(a: Uint<8>, b: Boolean): Boolean { return true; }"),
+        );
+        assert!(signature_diagnostics_query(&db, a).is_empty());
+        let b = SourceText::new(
+            &db,
+            Arc::from("witness w(x: Uint<8>, y: Boolean): Boolean;"),
+        );
+        assert!(signature_diagnostics_query(&db, b).is_empty());
+    }
+
+    #[test]
+    fn struct_destructuring_params_with_distinct_bound_names_no_false_positive() {
+        // Regression for a Critical false positive: `param_name_ident`'s raw
+        // first-IDENT scan of a circuit PARAM subtree picked up a struct
+        // pattern's field *key* for a renaming field (`{x: a}`), not the
+        // bound local name `a`. Two params `{x: a}: S` / `{x: b}: S` bind
+        // distinct names (`a`, `b`) but were seen as `["x", "x"]` and
+        // falsely flagged E3005 — source `compactc` accepts. Must emit
+        // zero diagnostics.
+        let db = CompactDatabase::default();
+        let src = SourceText::new(
+            &db,
+            Arc::from(
+                "pragma language_version >= 0.23;\n\
+                 struct S { x: Field; }\n\
+                 export circuit f({x: a}: S, {x: b}: S): Field { return a; }"
+                    .to_string(),
+            ),
+        );
+        let diags = signature_diagnostics_query(&db, src);
+        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:?}");
+    }
+
+    #[test]
+    fn call_arg_type_mismatch_emits_e3006() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/ca.compact"));
+        host.vfs_mut().set_overlay(
+            file,
+            "circuit f(x: Boolean): Boolean { return x; }\n\
+             export circuit c(): Boolean { return f(5); }"
+                .to_string(),
+            1,
+        );
+        let diags = host.type_diagnostics(file);
+        assert!(
+            diags.iter().any(|d| d.code.number == 3006),
+            "expected E3006, got {:?}",
+            diags.iter().map(|d| d.code.number).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn call_arg_count_mismatch_emits_e3006() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/cc.compact"));
+        host.vfs_mut().set_overlay(
+            file,
+            "circuit f(x: Boolean, y: Boolean): Boolean { return x; }\n\
+             export circuit c(): Boolean { return f(true); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            host.type_diagnostics(file)
+                .iter()
+                .any(|d| d.code.number == 3006)
+        );
+    }
+
+    #[test]
+    fn call_arg_good_overloaded_and_generic_suppress() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        // Correct arg -> no E3006.
+        let mut h1 = AnalysisHost::new();
+        let f1 = h1.vfs_mut().file_id(Path::new("/t/ok.compact"));
+        h1.vfs_mut().set_overlay(
+            f1,
+            "circuit f(x: Uint<8>): Boolean { return true; }\n\
+             export circuit c(): Boolean { return f(5); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            h1.type_diagnostics(f1)
+                .iter()
+                .all(|d| d.code.number != 3006)
+        );
+
+        // Overloaded name (two `f`) -> suppress even though f(5) mismatches the Boolean one.
+        let mut h2 = AnalysisHost::new();
+        let f2 = h2.vfs_mut().file_id(Path::new("/t/ovl.compact"));
+        h2.vfs_mut().set_overlay(
+            f2,
+            "circuit f(x: Boolean): Boolean { return x; }\n\
+             circuit f(x: Uint<8>): Boolean { return true; }\n\
+             export circuit c(): Boolean { return f(5); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            h2.type_diagnostics(f2)
+                .iter()
+                .all(|d| d.code.number != 3006)
+        );
+
+        // Generic callee -> param is `T` (Unknown) -> suppress.
+        let mut h3 = AnalysisHost::new();
+        let f3 = h3.vfs_mut().file_id(Path::new("/t/gen.compact"));
+        h3.vfs_mut().set_overlay(
+            f3,
+            "circuit f<T>(x: T): Boolean { return true; }\n\
+             export circuit c(): Boolean { return f<Uint<8>>(5); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            h3.type_diagnostics(f3)
+                .iter()
+                .all(|d| d.code.number != 3006)
+        );
+    }
+
+    /// Locks in two of `call_arg_diagnostics_query`'s (`db.rs`) safety-critical
+    /// `E3006` suppression branches — both guard the "never a false positive"
+    /// rule and were previously untested.
+    #[test]
+    fn call_arg_e3006_suppression_branches() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+
+        // Branch 1 (db.rs: `actual == TyKind::Unknown -> continue`): a
+        // non-literal (param-ref) argument. `g` declares `Boolean`; the call
+        // site passes `p`, a `Uint<8>` *parameter reference* — a literal `5`
+        // here would mismatch and emit E3006, but `expr_ty_kind` on a
+        // `NAME_EXPR` (anything that isn't a literal/cast/array) returns
+        // `Unknown`, and native must suppress on `Unknown` rather than guess.
+        // Reading db.rs's `call_arg_diagnostics_query`: if the `if actual ==
+        // TyKind::Unknown { continue; }` guard (immediately after `let actual
+        // = crate::infer::expr_ty_kind(arg);`) were deleted, `actual` would
+        // stay `TyKind::Unknown` and fall into `is_subtype(&actual, param)` —
+        // `is_subtype(Unknown, Boolean)` is `false` (`Unknown` is not a
+        // declared subtype of anything in the lattice), so the diagnostic
+        // would fire and this assertion would fail.
+        let mut h1 = AnalysisHost::new();
+        let f1 = h1.vfs_mut().file_id(Path::new("/t/e3006-paramref.compact"));
+        h1.vfs_mut().set_overlay(
+            f1,
+            "circuit g(x: Boolean): Boolean { return x; }\n\
+             export circuit c(p: Uint<8>): Boolean { return g(p); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            h1.type_diagnostics(f1)
+                .iter()
+                .all(|d| d.code.number != 3006),
+            "non-literal (param-ref) argument must suppress E3006, got {:?}",
+            h1.type_diagnostics(f1)
+                .iter()
+                .map(|d| d.code.number)
+                .collect::<Vec<_>>()
+        );
+
+        // Branch 2 (db.rs: spread-in-argument-list -> suppress the whole
+        // call): a `SPREAD_EXPR` anywhere in the call's argument list makes
+        // arity indeterminate, so native must not even attempt the
+        // arg-count/per-arg checks.
+        //
+        // NOTE: a bare `...expr` cannot be written as a *direct* positional
+        // call argument under the current `compactp_parser` grammar — its
+        // `call_arg` production (`grammar/expressions.rs`) only accepts a
+        // plain `expr` or a `NAMED_ARG` (`id = expr`); the `...expr` ->
+        // `SPREAD_EXPR` production (`array_element`) is wired up only for
+        // array- and `Bytes[...]`-literal elements. Verified empirically:
+        // `g(...xs)` does not parse into a `CALL_EXPR` holding a `SPREAD_EXPR`
+        // child — `call_arg`'s `expr(p)` hits `lhs()`'s `_ => { p.error(...);
+        // None }` fallback on the leading `...` and the surrounding call
+        // recovers as a 0-argument `CALL_EXPR`, which would instead (wrongly)
+        // exercise the arg-*count*-mismatch branch, not the spread guard.
+        // So db.rs's direct `args.iter().any(|e| e.syntax().kind() ==
+        // SPREAD_EXPR)` check (over the call's *direct* argument `Expr`
+        // children) is defense-in-depth for a shape this parser's grammar
+        // does not currently produce there; it is exercised below via the
+        // one construction that *does* parse and *does* place a `SPREAD_EXPR`
+        // node under a call argument: a spread inside an array-literal
+        // argument (`h(...)` -> `h([...xs])`). This is nested one level
+        // deeper than db.rs's direct-child check, so it is actually caught by
+        // the sibling suppression in `infer::expr_ty_kind`'s `Expr::Array`
+        // arm (`arr.syntax().children().any(|c| c.kind() == SPREAD_EXPR) ->
+        // Unknown`, `infer.rs`), which then hits the same `actual ==
+        // TyKind::Unknown -> continue` as branch 1 above. If *that* array-arm
+        // spread check were deleted, `expr_ty_kind` would instead type the
+        // array as `TyKind::Tuple([Unknown])` and, since `h`'s declared
+        // `Vector<2, Boolean>` param is concretely modeled, the per-arg
+        // `is_subtype` check would very likely fail and emit E3006 — so this
+        // assertion still fails closed if that suppression regresses, even
+        // though it is not literally db.rs's whole-call `SPREAD_EXPR` guard.
+        let mut h2 = AnalysisHost::new();
+        let f2 = h2.vfs_mut().file_id(Path::new("/t/e3006-spread.compact"));
+        h2.vfs_mut().set_overlay(
+            f2,
+            "circuit h(v: Vector<2, Boolean>): Boolean { return true; }\n\
+             export circuit c(xs: Vector<2, Boolean>): Boolean { return h([...xs]); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            h2.type_diagnostics(f2)
+                .iter()
+                .all(|d| d.code.number != 3006),
+            "spread-containing argument must suppress E3006, got {:?}",
+            h2.type_diagnostics(f2)
+                .iter()
+                .map(|d| d.code.number)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn generic_module_body_errors_are_suppressed() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/gm.compact"));
+        // A generic module whose circuit body has a return-type error AND a
+        // duplicate-param circuit AND a bad call — compactc accepts (template
+        // uninstantiated), so native must emit nothing.
+        host.vfs_mut().set_overlay(
+            file,
+            "pragma language_version >= 0.23;\n\
+             module M<#T> {\n\
+               export circuit bad(): Field { return true; }\n\
+               circuit dup(a: Uint<8>, a: Boolean): Boolean { return true; }\n\
+               circuit callee(x: Boolean): Boolean { return x; }\n\
+               export circuit caller(): Boolean { return callee(5); }\n\
+             }"
+            .to_string(),
+            1,
+        );
+        assert!(
+            host.type_diagnostics(file).is_empty(),
+            "generic-module bodies must be suppressed, got {:?}",
+            host.type_diagnostics(file)
+                .iter()
+                .map(|d| d.code.number)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nongeneric_module_body_errors_still_reported() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/nm.compact"));
+        // A NON-generic module body error IS checked by compactc -> native must still flag it.
+        host.vfs_mut().set_overlay(
+            file,
+            "pragma language_version >= 0.23;\n\
+             module M { export circuit bad(): Field { return true; } }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            host.type_diagnostics(file)
+                .iter()
+                .any(|d| d.code.number == 3001),
+            "non-generic module body error must still be reported"
         );
     }
 }

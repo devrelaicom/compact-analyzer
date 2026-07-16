@@ -1,0 +1,2 @@
+pragma language_version >= 0.23;
+witness w(x: Uint<8>, x: Boolean): Boolean;

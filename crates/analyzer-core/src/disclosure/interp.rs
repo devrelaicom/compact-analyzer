@@ -371,9 +371,10 @@ pub fn interp_expr(
         Expr::Call(call) => interp_call(ctx, sink, env, control, call, src),
         Expr::Member(m) => interp_member(ctx, sink, env, control, m, src),
         Expr::Index(_) => interp_index(ctx, sink, env, control, expr, src),
-        // Struct literal (R0 P5 `new`): `Multiple`, one child per field init
-        // in source order. A struct-update (spread) can't be merged
-        // positionally here -> fail closed.
+        // Struct literal (R0 P5 `new`): `Multiple`, one child per field, slotted
+        // into DECLARED field order so it agrees with the projection path
+        // (`field_index`/`abs_of_type`, both declared-order). A struct-update
+        // (spread) can't be merged positionally here -> fail closed.
         Expr::Struct(s) => {
             if s.update().is_some() {
                 return fail_closed_expr(
@@ -385,14 +386,7 @@ pub fn interp_expr(
                     "struct-update (spread) construction not modeled",
                 );
             }
-            Abs::Multiple(
-                s.field_inits()
-                    .map(|fi| match child_exprs(fi.syntax()).first() {
-                        Some(e) => interp_expr(ctx, sink, env, control, e),
-                        None => Abs::Atomic(Vec::new()),
-                    })
-                    .collect(),
-            )
+            interp_struct_literal(ctx, sink, env, control, s, src)
         }
         // Array literal (R0 AB1/P5 `vector`): arrays are tracked in the
         // aggregate -> `Single` over the join of all element abses.
@@ -621,10 +615,80 @@ fn interp_call(
     }
 }
 
+/// Struct literal `S { … }` (R0 P5 `new`): a `Multiple` whose children are in
+/// the struct's DECLARED field order — canonically agreeing with `abs_of_type`
+/// (seeded params) and `field_index` (member projection), both declared-order.
+/// Field-init expressions are still interpreted in SOURCE order (their
+/// evaluation-order side effects — nested sinks/advisories — are preserved),
+/// then slotted into their declared index. Fails closed to source order + an
+/// advisory when the struct's declared type can't be resolved (never a
+/// confident wrong order).
+fn interp_struct_literal(
+    ctx: &InterpCtx,
+    sink: &mut DisclosureSink,
+    env: &Env,
+    control: &[Witness],
+    s: &compactp_ast::expr::StructExpr,
+    src: TextRange,
+) -> Abs {
+    // Interpret every field-init once, in source order, keyed by field name.
+    let inits: Vec<(Option<String>, Abs)> = s
+        .field_inits()
+        .map(|fi| {
+            let name = fi.name().map(|n| n.text().to_string());
+            let abs = match child_exprs(fi.syntax()).first() {
+                Some(e) => interp_expr(ctx, sink, env, control, e),
+                None => Abs::Atomic(Vec::new()),
+            };
+            (name, abs)
+        })
+        .collect();
+
+    // Resolve the struct's declared field order (same path `field_index` uses).
+    let declared: Option<Vec<String>> = s.name().and_then(|name| {
+        match crate::db::named_type_ty(
+            ctx.db,
+            ctx.file,
+            ctx.src,
+            ctx.fd,
+            ctx.ws,
+            name.text_range().start(),
+        ) {
+            TyKind::Struct { fields, .. } => {
+                Some(fields.iter().map(|(n, _)| n.to_string()).collect())
+            }
+            _ => None,
+        }
+    });
+
+    match declared {
+        Some(order) => Abs::Multiple(
+            order
+                .iter()
+                .map(|fname| {
+                    inits
+                        .iter()
+                        .find(|(n, _)| n.as_deref() == Some(fname.as_str()))
+                        .map(|(_, abs)| abs.clone())
+                        .unwrap_or_else(|| Abs::Atomic(Vec::new()))
+                })
+                .collect(),
+        ),
+        None => {
+            sink.emit_advisory(
+                src,
+                "struct literal type could not be resolved; fields kept in source order"
+                    .to_string(),
+            );
+            Abs::Multiple(inits.into_iter().map(|(_, abs)| abs).collect())
+        }
+    }
+}
+
 /// Member access `expr.field` (R0 P5 projection). Projects the field out of a
-/// `Multiple` when the field's positional index is resolvable (from a struct
-/// literal base's field order, or the base's static struct type). Fail closed
-/// (advisory + conservative union) when the shape/index can't be resolved.
+/// `Multiple` when the field's positional index is resolvable (the base's
+/// static struct type, declared field order). Fail closed (advisory +
+/// conservative union) when the shape/index can't be resolved.
 fn interp_member(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
@@ -1098,31 +1162,21 @@ fn leftmost_name_token(target: &Expr) -> Option<compactp_syntax::SyntaxToken> {
     }
 }
 
-/// The positional index of `field` within the base's struct shape, matching how
-/// `abs_of_type`/struct-literal construction order the `Multiple` children:
-/// from a struct-literal base's own field order, or the base's static struct
-/// type. `None` when it can't be determined (caller fails closed).
+/// The positional index of `field` within the base's struct shape, in the
+/// struct's DECLARED field order — the single canonical order every `Multiple`
+/// is built in (`abs_of_type` for seeded params, `interp_struct_literal` for
+/// literals). `None` when it can't be determined (caller fails closed).
 ///
-/// Step 0 (A3 review deferral): for a NAME-bound (non-literal) base, resolving
-/// the field index requires the base's static struct type — a name's `Multiple`
-/// has no inline field order to read. We resolve it via the tracked `expr_ty`
-/// (the same query `AnalysisHost::type_at` fronts, `infer.rs:588`), reachable
-/// here from `ctx`. Without this, `interp_member` fell through to a flat
-/// `Atomic(union of ALL fields)`, over-tainting a clean field into a false
-/// positive once the sinks exist. The seeded/name-bound `Multiple` is ordered
-/// by the struct's declared fields, so the declared field order is the correct
-/// index map.
+/// Resolved uniformly via the tracked `expr_ty` (the query `AnalysisHost::type_at`
+/// fronts, `infer.rs:588`), reachable here from `ctx` — for a struct-literal base
+/// AND a name-bound base alike, since both now carry a declared-order `Multiple`.
+/// Step 0 (A3 review deferral): without this, a NAME-bound struct member fell
+/// through to a flat `Atomic(union of ALL fields)`, over-tainting a clean field
+/// into a false positive once the sinks exist.
 fn field_index(ctx: &InterpCtx, base: &Expr, field: Option<&str>) -> Option<usize> {
     let field = field?;
     let base = unwrap_paren(base);
-    // Struct-literal base: the `Multiple` the `Expr::Struct` arm builds is in
-    // the literal's own field-init source order, so match against that order.
-    if let Expr::Struct(s) = &base {
-        return s
-            .field_inits()
-            .position(|fi| fi.name().map(|n| n.text().to_string()).as_deref() == Some(field));
-    }
-    // Otherwise resolve the base's static struct type (declared field order).
+    // Resolve the base's static struct type (declared field order).
     // Anchor `expr_ty` at the base's last meaningful token, not its node start:
     // a NAME_EXPR node can carry leading whitespace, and `enclosing_expr` biases
     // a whitespace-boundary offset to the preceding token — landing on the wrong
@@ -1727,6 +1781,68 @@ mod tests {
         );
         assert_eq!(
             witnesses_of(b)[0].info,
+            WitnessInfo::WitnessReturn {
+                function: "getW".into()
+            }
+        );
+    }
+
+    #[test]
+    fn out_of_order_struct_literal_member_projects_precisely() {
+        // Corpus-safety regression: a struct literal written OUT OF declared
+        // field order must still project by field identity. The `Multiple` is
+        // built in DECLARED order (`a`, `b`), so `s.b` (declared idx 1) resolves
+        // to the clean field even though the literal lists `b` first. Against a
+        // source-order `Multiple`, `s.b` would index the FIRST child (`a`'s
+        // witness) -> a confident WRONG index -> false-positive red on a clean
+        // field (compactc accepts this).
+        let (db, src, fd, ws, file) = walk_setup(
+            "witness getW(): Uint<8>;\nstruct S { a: Uint<8>, b: Uint<8> }\n\
+             export circuit f(): [] {\n\
+             const s = S { b: 0, a: getW() };\n\
+             const clean = s.b;\n\
+             const secret = s.a;\n\
+             }\n",
+        );
+        let ctx = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let root = root_of(&db, src);
+        let block = root
+            .descendants()
+            .find(|n| n.kind() == compactp_syntax::SyntaxKind::BLOCK)
+            .and_then(compactp_ast::Block::cast)
+            .expect("circuit body block");
+        let mut env = Env::new();
+        let mut sink = DisclosureSink::new();
+        interp_stmt(
+            &ctx,
+            &mut sink,
+            &mut env,
+            &[],
+            &compactp_ast::Stmt::Block(block),
+        );
+        // `s.b` -> the clean field (declared idx 1): NO witnesses.
+        let clean = env.get("clean").expect("binding clean present");
+        assert!(
+            witnesses_of(clean).is_empty(),
+            "clean field b must not carry a's witness (got {:?})",
+            witnesses_of(clean)
+        );
+        // `s.a` -> the witness field (declared idx 0): carries getW.
+        let secret = env.get("secret").expect("binding secret present");
+        assert_eq!(
+            witnesses_of(secret).len(),
+            1,
+            "field a must carry exactly its own witness"
+        );
+        assert_eq!(
+            witnesses_of(secret)[0].info,
             WitnessInfo::WitnessReturn {
                 function: "getW".into()
             }

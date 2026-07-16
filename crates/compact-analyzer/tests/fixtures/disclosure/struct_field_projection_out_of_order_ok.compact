@@ -1,0 +1,10 @@
+pragma language_version >= 0.23;
+
+witness getW(): Uint<8>;
+
+struct S { a: Uint<8>, b: Uint<8> }
+
+export circuit f(): Uint<8> {
+  const s = S { b: 0, a: getW() };
+  return s.b;
+}

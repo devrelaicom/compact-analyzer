@@ -144,6 +144,12 @@ const FIXTURES: &[Fixture] = &[
         discloses: false,
         native_confirms: false,
     },
+    Fixture {
+        name: "struct_field_projection_out_of_order_ok.compact",
+        rule: "P5 declared-order projection (out-of-order named literal, clean field)",
+        discloses: false,
+        native_confirms: false,
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

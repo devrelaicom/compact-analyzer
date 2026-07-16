@@ -116,6 +116,33 @@ suite("Compact Analyzer activation smoke", () => {
     assert.strictEqual(api.serverStatus(), "running", "server should remain running after publishing diagnostics");
   });
 
+  test("scenario 1b: a native type diagnostic (E3001) reaches the Problems panel", async function () {
+    this.timeout(DIAGNOSTIC_TIMEOUT_MS + 15_000);
+    assert.strictEqual(api.serverStatus(), "running", "server should be running for the type-diagnostic check");
+
+    const uri = fixtureUri("type-error.compact");
+    const document = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(document);
+
+    const deadline = Date.now() + DIAGNOSTIC_TIMEOUT_MS;
+    let typeDiags: vscode.Diagnostic[] = [];
+    for (;;) {
+      const diagnostics = vscode.languages.getDiagnostics(uri);
+      typeDiags = diagnostics.filter(
+        (d) => (d.source ?? "").includes("compact-analyzer") && String(d.code) === "E3001",
+      );
+      if (typeDiags.length >= 1 || Date.now() >= deadline) {
+        break;
+      }
+      await delay(200);
+    }
+    assert.ok(
+      typeDiags.length >= 1,
+      `expected an E3001 native type diagnostic within ${DIAGNOSTIC_TIMEOUT_MS}ms, ` +
+        `got ${JSON.stringify(vscode.languages.getDiagnostics(uri).map((d) => ({ source: d.source, code: d.code, message: d.message })))}`,
+    );
+  });
+
   test("scenario 2: a nonexistent serverPath degrades to an unavailable session", async function () {
     this.timeout(60_000);
 

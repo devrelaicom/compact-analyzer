@@ -493,6 +493,20 @@ pub fn signature_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnos
     Arc::from(diags)
 }
 
+/// Full text ranges of every GENERIC `module` (one with a generic parameter
+/// list) in `src`. compactc does not type-check a generic module's body until
+/// it is instantiated, so native suppresses any type diagnostic whose span
+/// falls inside one of these ranges (never a false positive; instantiated
+/// generic bodies become a safe false-negative).
+pub(crate) fn generic_module_ranges(db: &dyn Db, src: SourceText) -> Vec<text_size::TextRange> {
+    let root = compactp_syntax::SyntaxNode::new_root(parsed(db, src).green);
+    root.descendants()
+        .filter_map(compactp_ast::ModuleDef::cast)
+        .filter(|m| m.generic_params().is_some())
+        .map(|m| m.syntax().text_range())
+        .collect()
+}
+
 impl crate::AnalysisHost {
     /// Type diagnostics for `file` (foundation: primitive-literal return
     /// mismatch) plus generic-specialization (arity) diagnostics plus
@@ -516,6 +530,16 @@ impl crate::AnalysisHost {
         diags.extend(self.generic_diagnostics(file));
         diags.extend(self.ledger_call_diagnostics(file));
         diags.extend(self.call_arg_diagnostics(file));
+        // compactc does not type-check a generic module's template body until
+        // it is instantiated (verified against live compactc 0.31.1): drop any
+        // diagnostic whose span falls inside a generic module, regardless of
+        // which rule emitted it. Safe (false-negative only, never a false
+        // positive): un-instantiated is the correct suppression; instantiated
+        // is a safe false-negative.
+        let ranges = generic_module_ranges(self.db_ref(), src);
+        if !ranges.is_empty() {
+            diags.retain(|d| !ranges.iter().any(|r| r.contains_range(d.primary_span)));
+        }
         diags
     }
 }
@@ -1208,6 +1232,59 @@ mod tests {
             h3.type_diagnostics(f3)
                 .iter()
                 .all(|d| d.code.number != 3006)
+        );
+    }
+
+    #[test]
+    fn generic_module_body_errors_are_suppressed() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/gm.compact"));
+        // A generic module whose circuit body has a return-type error AND a
+        // duplicate-param circuit AND a bad call — compactc accepts (template
+        // uninstantiated), so native must emit nothing.
+        host.vfs_mut().set_overlay(
+            file,
+            "pragma language_version >= 0.23;\n\
+             module M<#T> {\n\
+               export circuit bad(): Field { return true; }\n\
+               circuit dup(a: Uint<8>, a: Boolean): Boolean { return true; }\n\
+               circuit callee(x: Boolean): Boolean { return x; }\n\
+               export circuit caller(): Boolean { return callee(5); }\n\
+             }"
+            .to_string(),
+            1,
+        );
+        assert!(
+            host.type_diagnostics(file).is_empty(),
+            "generic-module bodies must be suppressed, got {:?}",
+            host.type_diagnostics(file)
+                .iter()
+                .map(|d| d.code.number)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nongeneric_module_body_errors_still_reported() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+        let mut host = AnalysisHost::new();
+        let file = host.vfs_mut().file_id(Path::new("/t/nm.compact"));
+        // A NON-generic module body error IS checked by compactc -> native must still flag it.
+        host.vfs_mut().set_overlay(
+            file,
+            "pragma language_version >= 0.23;\n\
+             module M { export circuit bad(): Field { return true; } }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            host.type_diagnostics(file)
+                .iter()
+                .any(|d| d.code.number == 3001),
+            "non-generic module body error must still be reported"
         );
     }
 }

@@ -255,6 +255,11 @@ const FIXTURES: &[Fixture] = &[
         native_rejects: false,
         rule: "witness-circuit-signature",
     },
+    Fixture {
+        name: "sig_generic_module_body_ok.compact",
+        native_rejects: false,
+        rule: "witness-circuit-signature",
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

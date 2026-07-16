@@ -17,14 +17,9 @@
 //! from every root and drain its leak table, giving the lattice operations
 //! (`disclose`/`combine_abs`/`merge_witnesses`/`witnesses_of`) and the
 //! `Abs::Boolean`/`WitnessInfo::WitnessReturn` constructors a live non-test
-//! caller — their scaffold dead-code markers are gone. `abs_equal` /
-//! `witness_sets_equal` (FX3 fixpoint-convergence) are still consumed only by
-//! this file's tests until A7 lands `fold`/`map`, so they keep a targeted
-//! `#[cfg_attr(not(test), allow(dead_code))]` — `allow`, not `expect`:
-//! empirically, `expect(dead_code)` on a function that constructs/matches
-//! `Abs`/`WitnessInfo` variants makes rustc treat the surrounding scope as an
-//! intentional dead-code root, so the expectation itself goes unfulfilled in
-//! the build it is meant to cover.
+//! caller — their scaffold dead-code markers are gone. A7 (`interp_fold`) is
+//! the live non-test caller of `abs_equal` / `witness_sets_equal` (FX3
+//! fixpoint-convergence).
 
 /// A witness value's origin (spec §3.1). Deduped by `uid` in a set.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -154,10 +149,9 @@ pub fn combine_abs(a: &Abs, b: &Abs) -> Abs {
     }
 }
 
-/// `abs-equal?` (R0 FX3): structural equality used by the fold/map fixpoint
-/// (FX1) to detect convergence. Same `Abs` shape and the same witness set at
-/// every level (uid + path, order-independent).
-#[cfg_attr(not(test), allow(dead_code))] // used by A3's interpreter walk (FX3 fixpoint)
+/// `abs-equal?` (R0 FX3): structural equality used by the fold fixpoint (FX1,
+/// `interp_fold`) to detect convergence. Same `Abs` shape and the same witness
+/// set at every level (uid + path, order-independent).
 pub fn abs_equal(a: &Abs, b: &Abs) -> bool {
     match (a, b) {
         (Abs::Atomic(w1), Abs::Atomic(w2)) => witness_sets_equal(w1, w2),
@@ -180,7 +174,6 @@ pub fn abs_equal(a: &Abs, b: &Abs) -> bool {
 }
 
 /// Order-independent witness-set equality (uid + path), used by `abs_equal`.
-#[cfg_attr(not(test), allow(dead_code))] // used by abs_equal above
 fn witness_sets_equal(w1: &[Witness], w2: &[Witness]) -> bool {
     let mut s1 = w1.to_vec();
     let mut s2 = w2.to_vec();

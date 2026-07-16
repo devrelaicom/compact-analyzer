@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use compactp_ast::AstNode;
-use compactp_ast::expr::{CallExpr, Expr};
+use compactp_ast::expr::{CallExpr, Expr, FoldExpr, LambdaExpr, MapExpr};
 use compactp_syntax::{SyntaxKind, SyntaxNode};
 use text_size::TextRange;
 
@@ -24,7 +24,8 @@ use crate::item_tree::{ItemTree, SymbolKind};
 use crate::ty::TyKind;
 
 use super::abs::{
-    Abs, PathPoint, Witness, WitnessInfo, combine_abs, disclose, merge_witnesses, witnesses_of,
+    Abs, PathPoint, Witness, WitnessInfo, abs_equal, combine_abs, disclose, merge_witnesses,
+    witnesses_of,
 };
 use super::leaks::DisclosureSink;
 use super::tables;
@@ -415,25 +416,15 @@ pub fn interp_expr(
             }
             Abs::Atomic(ws)
         }
+        // `map`/`fold` (R0 FX1/FX2/FX3, A7): interpret the lambda body over the
+        // sequences' element abstracts — an inner `disclose` clears, an inner
+        // sink records — with the fold iterated to a bounded `abs_equal` fixed
+        // point. Routed out of the fail-closed catch-all.
+        Expr::Map(m) => interp_map(ctx, sink, env, control, m),
+        Expr::Fold(f) => interp_fold(ctx, sink, env, control, f),
         // Not in the R0 index (or deferred): fail closed.
-        // `map`/`fold` -> A7 fixpoint; `slice`/`pad`/`spread`/`lambda`/unary
-        // -> unmodeled. Advisory + conservative union of subexpr witnesses.
-        Expr::Map(_) => fail_closed_expr(
-            ctx,
-            sink,
-            env,
-            control,
-            expr,
-            "map not modeled (fixpoint deferred to A7)",
-        ),
-        Expr::Fold(_) => fail_closed_expr(
-            ctx,
-            sink,
-            env,
-            control,
-            expr,
-            "fold not modeled (fixpoint deferred to A7)",
-        ),
+        // `slice`/`pad`/`spread`/`lambda`/unary -> unmodeled. Advisory +
+        // conservative union of subexpr witnesses.
         Expr::Slice(_) => fail_closed_expr(
             ctx,
             sink,
@@ -969,6 +960,311 @@ fn interp_index(
             Abs::Atomic(ws)
         }
         other => Abs::Atomic(merge_witnesses(&witnesses_of(&other), &idx_ws)),
+    }
+}
+
+// ===========================================================================
+// A7: fold/map over aggregates (R0 FX1/FX2/FX3)
+// ===========================================================================
+
+/// `map(fun, seq1, …, seqN)` (R0 FX2). Binds the lambda's params to the
+/// sequences' element abstracts and interprets the lambda BODY via
+/// `interp_expr` (so an inner `disclose` clears taint, an inner sink records a
+/// leak) to produce the result element abstract. Two regimes, mirroring the
+/// compiler (`analysis-passes.ss:5402`):
+/// - any sequence is a heterogeneous `Multiple` (tuple) ⇒ fully unroll,
+///   applying the body per index ⇒ `Multiple` of the per-index results;
+/// - otherwise (homogeneous aggregated arrays — `Single`/`Atomic`) ⇒ one
+///   application over the aggregated element ⇒ `Single(result_elem)`.
+///
+/// No fixpoint is needed for `map` (each element is independent). A first arg
+/// that is not an expression-bodied lambda (a named function reference, or a
+/// block body) is unmodeled ⇒ fail closed (§0).
+fn interp_map(
+    ctx: &InterpCtx,
+    sink: &mut DisclosureSink,
+    env: &Env,
+    control: &[Witness],
+    m: &MapExpr,
+) -> Abs {
+    let kids = child_exprs(m.syntax());
+    let Some((fun, seqs)) = kids.split_first() else {
+        return fail_closed_expr(
+            ctx,
+            sink,
+            env,
+            control,
+            &Expr::Map(m.clone()),
+            "malformed map",
+        );
+    };
+    let Some((body, params)) = lambda_parts(fun) else {
+        return fail_closed_expr(
+            ctx,
+            sink,
+            env,
+            control,
+            &Expr::Map(m.clone()),
+            "map with a non-lambda function reference not modeled",
+        );
+    };
+    // A map with no sequences degenerates to an empty aggregate (FX2 `len = 0`).
+    if seqs.is_empty() {
+        return Abs::Multiple(Vec::new());
+    }
+    let seq_abses: Vec<Abs> = seqs
+        .iter()
+        .map(|s| interp_expr(ctx, sink, env, control, s))
+        .collect();
+
+    if let Some(len) = unroll_len(&seq_abses) {
+        // Heterogeneous unroll: apply the body per index.
+        let results = (0..len)
+            .map(|i| {
+                let values = seq_abses.iter().map(|s| seq_element_at(s, i));
+                let child = bind_lambda_env(env, &params, values);
+                interp_expr(ctx, sink, &child, control, &body)
+            })
+            .collect();
+        Abs::Multiple(results)
+    } else {
+        // Homogeneous aggregate: one application over the element abstracts.
+        let values = seq_abses.iter().map(seq_element_abs);
+        let child = bind_lambda_env(env, &params, values);
+        let elem = interp_expr(ctx, sink, &child, control, &body);
+        Abs::Single(Box::new(elem))
+    }
+}
+
+/// `fold(fun, init, seq1, …, seqN)` (R0 FX1/FX3). The accumulator starts at
+/// `init`; the lambda body is interpreted with its params bound to
+/// `(acc, elem1, …, elemN)`. Two regimes, mirroring the compiler
+/// (`analysis-passes.ss:5428`):
+/// - any sequence is a heterogeneous `Multiple` (tuple) ⇒ fully unroll
+///   element-by-element (exact, bounded by the tuple length);
+/// - otherwise (homogeneous aggregated arrays) ⇒ iterate to an `abs_equal`
+///   fixed point, HARD-BOUNDED by `fold_fixpoint_bound` so the analysis always
+///   terminates (see that function for the bound + termination argument).
+///
+/// The ambient `control` (implicit flow) is threaded into every body
+/// interpretation, so a fold inside a witness-gated branch keeps the K2/K6
+/// control-leak semantics. A non-lambda function / block body / a fold missing
+/// its init or sequence is unmodeled ⇒ fail closed (§0).
+fn interp_fold(
+    ctx: &InterpCtx,
+    sink: &mut DisclosureSink,
+    env: &Env,
+    control: &[Witness],
+    f: &FoldExpr,
+) -> Abs {
+    let kids = child_exprs(f.syntax());
+    // fun, init, then one-or-more sequences.
+    let (Some(fun), Some(init_expr), Some(seqs)) = (kids.first(), kids.get(1), kids.get(2..))
+    else {
+        return fail_closed_expr(
+            ctx,
+            sink,
+            env,
+            control,
+            &Expr::Fold(f.clone()),
+            "fold missing its function, init value, or sequence",
+        );
+    };
+    if seqs.is_empty() {
+        return fail_closed_expr(
+            ctx,
+            sink,
+            env,
+            control,
+            &Expr::Fold(f.clone()),
+            "fold missing its sequence",
+        );
+    }
+    let Some((body, params)) = lambda_parts(fun) else {
+        return fail_closed_expr(
+            ctx,
+            sink,
+            env,
+            control,
+            &Expr::Fold(f.clone()),
+            "fold with a non-lambda function reference not modeled",
+        );
+    };
+    let init_abs = interp_expr(ctx, sink, env, control, init_expr);
+    let seq_abses: Vec<Abs> = seqs
+        .iter()
+        .map(|s| interp_expr(ctx, sink, env, control, s))
+        .collect();
+
+    if let Some(len) = unroll_len(&seq_abses) {
+        // Heterogeneous unroll: exact, `len` applications.
+        let mut acc = init_abs;
+        for i in 0..len {
+            let values =
+                std::iter::once(acc.clone()).chain(seq_abses.iter().map(|s| seq_element_at(s, i)));
+            let child = bind_lambda_env(env, &params, values);
+            acc = interp_expr(ctx, sink, &child, control, &body);
+        }
+        acc
+    } else {
+        // Homogeneous aggregate: iterate to an `abs_equal` fixed point,
+        // hard-bounded for termination.
+        let elems: Vec<Abs> = seq_abses.iter().map(seq_element_abs).collect();
+        let bound = fold_fixpoint_bound(&init_abs, &elems);
+        let mut acc = init_abs;
+        for _ in 0..bound {
+            let values = std::iter::once(acc.clone()).chain(elems.iter().cloned());
+            let child = bind_lambda_env(env, &params, values);
+            let next = interp_expr(ctx, sink, &child, control, &body);
+            if abs_equal(&next, &acc) {
+                return next;
+            }
+            acc = next;
+        }
+        acc
+    }
+}
+
+/// The fold fixpoint iteration bound (R0 FX1/FX3) for the aggregated regime.
+///
+/// **Termination.** The loop runs at most this many times regardless of
+/// convergence, so `interp_fold` always terminates — the load-bearing
+/// requirement. The compiler bounds by the array's static length; once
+/// `slice`/aggregation has erased that length (the abstract is a `Single`/
+/// `Atomic`), we recover a finite bound from the witness UNIVERSE instead: the
+/// distinct witnesses reachable from `init` and the sequence elements, plus a
+/// small margin.
+///
+/// **Why the universe bounds convergence.** Interpreting the fixed body over a
+/// fixed `env` draws witnesses only from that env (params bound to `acc` +ele-
+/// ments); no operation invents a witness UID except a `witness()` call, which
+/// a `map`/`fold` lambda body does not perform over these element abstracts,
+/// and `disclose` only ever REMOVES. So the accumulator's witness set is
+/// monotone within this universe and stabilizes within `|universe|`
+/// applications; `abs_equal` early-stops there. The `+ 2` margin covers the
+/// clean-init first step and the confirming equal iteration. (If a body did
+/// mint fresh witnesses each step, the hard bound still guarantees termination
+/// — a finite fail-closed approximation, never a hang.)
+fn fold_fixpoint_bound(init: &Abs, elems: &[Abs]) -> usize {
+    let mut universe = witnesses_of(init);
+    for e in elems {
+        universe = merge_witnesses(&universe, &witnesses_of(e));
+    }
+    universe.len() + 2
+}
+
+/// The lambda `(body_expr, param_names)` of a map/fold's first argument, or
+/// `None` when it is not an expression-bodied lambda (a named function
+/// reference, or a block-bodied lambda `… => { … }` — both unmodeled, caller
+/// fails closed). Params are positional; a non-identifier param pattern yields
+/// a `None` slot so index alignment with the bound element abstracts holds.
+fn lambda_parts(fun: &Expr) -> Option<(Expr, Vec<Option<String>>)> {
+    let Expr::Lambda(lam) = unwrap_paren(fun) else {
+        return None;
+    };
+    let body = lambda_body_expr(&lam)?;
+    let params = lambda_param_names(&lam);
+    Some((body, params))
+}
+
+/// The body expression of an expression-bodied lambda (`… => expr`); `None`
+/// for a block body (`… => { … }`). The body is the sole `Expr` child of the
+/// `LAMBDA_EXPR` — the `PARAM_LIST` and an optional return-`Type` node do not
+/// cast to `Expr`.
+fn lambda_body_expr(lam: &LambdaExpr) -> Option<Expr> {
+    if lam.body_block().is_some() {
+        return None;
+    }
+    lam.syntax().children().filter_map(Expr::cast).last()
+}
+
+/// The lambda's parameter names, in order. A lambda param is a bare `IDENT_PAT`
+/// (untyped, `(x, y) => …`) or a `PARAM` wrapping a pattern (typed,
+/// `(x: T) => …`) — `ParamList::params` only yields the latter, so this walks
+/// the `PARAM_LIST`'s child nodes directly to catch both. A non-identifier
+/// pattern contributes a `None` slot (kept for positional alignment).
+fn lambda_param_names(lam: &LambdaExpr) -> Vec<Option<String>> {
+    let Some(pl) = lam.param_list() else {
+        return Vec::new();
+    };
+    pl.syntax()
+        .children()
+        .map(|child| ident_name_of_param_child(&child))
+        .collect()
+}
+
+/// The identifier name of a `PARAM_LIST` child node — either a bare `IdentPat`
+/// (untyped lambda param) or a `Param` wrapping an `IdentPat` (typed). `None`
+/// for any other (tuple/struct) pattern.
+fn ident_name_of_param_child(child: &SyntaxNode) -> Option<String> {
+    if let Some(param) = compactp_ast::Param::cast(child.clone()) {
+        return match param.pattern() {
+            Some(compactp_ast::Pat::Ident(id)) => id.name().map(|t| t.text().to_string()),
+            _ => None,
+        };
+    }
+    match compactp_ast::Pat::cast(child.clone()) {
+        Some(compactp_ast::Pat::Ident(id)) => id.name().map(|t| t.text().to_string()),
+        _ => None,
+    }
+}
+
+/// A child `Env` = `base` with the lambda's params (positionally) bound to
+/// `values`. A `None` param slot (non-identifier pattern) is skipped; a surplus
+/// value with no matching param is ignored (`zip` stops at the shorter).
+fn bind_lambda_env(
+    base: &Env,
+    params: &[Option<String>],
+    values: impl IntoIterator<Item = Abs>,
+) -> Env {
+    let mut child = base.clone();
+    for (name, val) in params.iter().zip(values) {
+        if let Some(name) = name {
+            child.insert(name.clone(), val);
+        }
+    }
+    child
+}
+
+/// The unroll length when a fold/map should be fully unrolled: `Some(len)` iff
+/// at least one sequence is a heterogeneous `Multiple` (tuple/struct), taking
+/// the minimum `Multiple` arity (defensive against a shape mismatch). `None`
+/// ⇒ every sequence is homogeneous (`Single`/`Atomic`), the aggregated regime.
+fn unroll_len(seq_abses: &[Abs]) -> Option<usize> {
+    seq_abses
+        .iter()
+        .filter_map(|a| match a {
+            Abs::Multiple(children) => Some(children.len()),
+            _ => None,
+        })
+        .min()
+}
+
+/// The aggregated element abstract of a sequence (map/fold homogeneous
+/// regime): a `Single`'s inner element; an `Atomic`/`Boolean` stands for its
+/// own aggregated element. A `Multiple` is unexpected here (the caller routes
+/// any-`Multiple` to the unroll regime) — its children are joined defensively.
+fn seq_element_abs(seq: &Abs) -> Abs {
+    match seq {
+        Abs::Single(inner) => (**inner).clone(),
+        Abs::Multiple(children) => children
+            .iter()
+            .fold(Abs::Atomic(Vec::new()), |acc, c| combine_abs(&acc, c)),
+        other => other.clone(),
+    }
+}
+
+/// The element abstract at index `i` of a sequence (unroll regime): a
+/// `Multiple`'s i-th child; a `Single`/`Atomic`/`Boolean` yields the same
+/// aggregated element at every index.
+fn seq_element_at(seq: &Abs, i: usize) -> Abs {
+    match seq {
+        Abs::Multiple(children) => children
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| Abs::Atomic(Vec::new())),
+        Abs::Single(inner) => (**inner).clone(),
+        other => other.clone(),
     }
 }
 
@@ -2456,6 +2752,134 @@ mod tests {
             }
         );
         assert!(!had_advisory, "known ledger op emits no advisory");
+    }
+
+    // -- A7 fold/map fixpoint over aggregates ---------------------------
+
+    /// Interprets the sole map/fold expr of a one-line circuit body against a
+    /// hand-built `env` (the sequence bindings), returning its `Abs`.
+    fn interp_agg_expr(
+        text: &str,
+        kind: compactp_syntax::SyntaxKind,
+        seeds: &[(&str, Abs)],
+    ) -> (Abs, Vec<String>) {
+        let (db, src, fd, ws, file) = walk_setup(text);
+        let ctx = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let root = root_of(&db, src);
+        let expr = first_expr(&root, kind);
+        let mut env = Env::new();
+        for (name, abs) in seeds {
+            env.insert((*name).to_string(), abs.clone());
+        }
+        let mut sink = DisclosureSink::new();
+        let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
+        let advisories: Vec<String> = sink.advisories().iter().map(|a| a.reason.clone()).collect();
+        (out, advisories)
+    }
+
+    #[test]
+    fn map_with_disclosing_lambda_is_clean() {
+        // FX2 + D1: the lambda `disclose(x + y)` sanitizes INSIDE the map, so
+        // the result carries NO witnesses — even though both sequences are
+        // tainted. This FAILS against A3's catch-all (which unions the
+        // sequences' witnesses without ever looking in the lambda). This is the
+        // root-caused corpus FP (`slice_part_one` `test19`).
+        let (out, _adv) = interp_agg_expr(
+            "export circuit f(): [] { const r = map((x, y) => disclose(x + y), a, b); }\n",
+            compactp_syntax::SyntaxKind::MAP_EXPR,
+            &[
+                ("a", Abs::Single(Box::new(Abs::Atomic(vec![witness(1)])))),
+                ("b", Abs::Single(Box::new(Abs::Atomic(vec![witness(2)])))),
+            ],
+        );
+        assert!(
+            witnesses_of(&out).is_empty(),
+            "a disclosing map lambda clears taint (got {:?})",
+            witnesses_of(&out)
+        );
+    }
+
+    #[test]
+    fn map_without_disclose_propagates_taint() {
+        // FX2: no disclose ⇒ the map is a conduit — the tainted sequence's
+        // witness rides through into the `Single` element result.
+        let (out, _adv) = interp_agg_expr(
+            "export circuit f(): [] { const r = map((x, y) => x + y, a, b); }\n",
+            compactp_syntax::SyntaxKind::MAP_EXPR,
+            &[
+                ("a", Abs::Single(Box::new(Abs::Atomic(vec![witness(1)])))),
+                ("b", Abs::Single(Box::new(Abs::Atomic(vec![])))),
+            ],
+        );
+        assert!(
+            matches!(out, Abs::Single(_)),
+            "map over aggregated arrays yields a Single"
+        );
+        assert_eq!(
+            witnesses_of(&out).len(),
+            1,
+            "no disclose ⇒ the map propagates the sequence's taint"
+        );
+    }
+
+    #[test]
+    fn fold_over_witness_array_reaches_fixpoint() {
+        // FX1/FX3: `fold((a, b) => a + b, 0, s)` accumulating a tainted array
+        // stabilizes at an `abs_equal` fixed point (the test COMPLETING proves
+        // termination) and the accumulator carries the array's taint.
+        let (out, _adv) = interp_agg_expr(
+            "export circuit f(): [] { const r = fold((a, b) => a + b, 0, s); }\n",
+            compactp_syntax::SyntaxKind::FOLD_EXPR,
+            &[("s", Abs::Single(Box::new(Abs::Atomic(vec![witness(1)]))))],
+        );
+        assert_eq!(
+            witnesses_of(&out).len(),
+            1,
+            "the accumulator carries the folded array's taint"
+        );
+    }
+
+    #[test]
+    fn fold_with_disclosing_lambda_is_clean() {
+        // FX1 + D1: a disclosing fold body clears the accumulator every step ⇒
+        // the fixed point is clean.
+        let (out, _adv) = interp_agg_expr(
+            "export circuit f(): [] { const r = fold((a, b) => disclose(a + b), 0, s); }\n",
+            compactp_syntax::SyntaxKind::FOLD_EXPR,
+            &[("s", Abs::Single(Box::new(Abs::Atomic(vec![witness(1)]))))],
+        );
+        assert!(
+            witnesses_of(&out).is_empty(),
+            "a disclosing fold lambda clears taint (got {:?})",
+            witnesses_of(&out)
+        );
+    }
+
+    #[test]
+    fn fold_over_heterogeneous_tuple_unrolls() {
+        // FX1 unroll regime: a heterogeneous `Multiple` (tuple) sequence is
+        // fully unrolled element-by-element (no fixpoint). `(a, b) => a + b`
+        // over a 2-tuple whose second element is tainted accumulates that taint.
+        let (out, _adv) = interp_agg_expr(
+            "export circuit f(): [] { const r = fold((a, b) => a + b, 0, t); }\n",
+            compactp_syntax::SyntaxKind::FOLD_EXPR,
+            &[(
+                "t",
+                Abs::Multiple(vec![Abs::Atomic(vec![]), Abs::Atomic(vec![witness(7)])]),
+            )],
+        );
+        assert_eq!(
+            witnesses_of(&out).len(),
+            1,
+            "unrolled fold accumulates the tuple's tainted element"
+        );
     }
 
     #[test]

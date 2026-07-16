@@ -1,0 +1,11 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+export ledger acc: Field;
+
+// FX1 + D1 (A7): folding a CircuitArg source (`vector`) with a disclosing
+// lambda clears the accumulator every step, so the ledger write is clean and
+// compactc ACCEPTS. Without A7, native's catch-all over-taints the fold.
+export circuit f(vector: Vector<3, Field>): [] {
+  acc = fold((a, b) => disclose(a + b), 0 as Field, vector);
+}

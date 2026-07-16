@@ -1,0 +1,13 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+export ledger v: Vector<3, Field>;
+
+// FX2 + D1 (A7): `vector` is a CircuitArg source, but the map lambda
+// `disclose(x + y)` sanitizes INSIDE the map, so the ledger write is clean.
+// Mirrors the root-caused corpus FP (`examples/vectors/slice_part_one.compact`
+// `test19`). Without A7, native over-taints (the catch-all never looks in the
+// lambda) and false-positives this ledger write that compactc ACCEPTS.
+export circuit f(vector: Vector<3, Field>): [] {
+  v = map((x, y) => disclose(x + y), slice<3>(v, 0), slice<3>(vector, 0));
+}

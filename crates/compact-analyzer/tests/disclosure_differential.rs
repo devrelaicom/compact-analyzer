@@ -162,6 +162,18 @@ const FIXTURES: &[Fixture] = &[
         discloses: false,
         native_confirms: false,
     },
+    Fixture {
+        name: "map_disclose_ok.compact",
+        rule: "FX2 map with disclosing lambda over a circuit-arg source (A7)",
+        discloses: false,
+        native_confirms: false,
+    },
+    Fixture {
+        name: "fold_disclose_ok.compact",
+        rule: "FX1 fold with disclosing lambda over a circuit-arg source (A7)",
+        discloses: false,
+        native_confirms: false,
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

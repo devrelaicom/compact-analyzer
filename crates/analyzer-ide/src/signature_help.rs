@@ -70,13 +70,33 @@ pub fn signature_help(host: &mut AnalysisHost, pos: FilePosition) -> Option<Sign
     let Definition::Item { file, index } = def else {
         return None;
     };
-    let sym = host
-        .analyze(file)?
-        .item_tree
-        .symbols
-        .get(index as usize)?
-        .clone();
+    // Cheap `Arc` clone: keeps the item tree available below without holding
+    // a borrow of `host` across the later `host.analyze` call site.
+    let item_tree = host.analyze(file)?.item_tree.clone();
+    let sym = item_tree.symbols.get(index as usize)?.clone();
     if !matches!(sym.kind, SymbolKind::Circuit | SymbolKind::Witness) {
+        return None;
+    }
+
+    // Uniqueness guard, mirroring `callee_sig` (analyzer-core's `db.rs`,
+    // ~1577-1620): if MORE THAN ONE callable symbol shares this name in the
+    // callee's resolved file, `resolve_in_file`'s first-match landed on an
+    // arbitrary one of several candidates (an overload set, or — since this
+    // still parses — a duplicate-declaration error state that's mid-edit).
+    // Suppress rather than guess which one the call site means.
+    //
+    // Unlike `callee_sig`, signature help INTENTIONALLY shows cross-file and
+    // generic signatures (a display feature wants those); it applies only
+    // the uniqueness guard, to avoid showing an arbitrary one of several
+    // same-named candidates.
+    let same_name_callables = item_tree
+        .symbols
+        .iter()
+        .filter(|s| {
+            s.name == sym.name && matches!(s.kind, SymbolKind::Circuit | SymbolKind::Witness)
+        })
+        .count();
+    if same_name_callables != 1 {
         return None;
     }
 
@@ -351,6 +371,36 @@ mod tests {
             "p: [Field, Field]"
         );
         assert_eq!(d.active_param, Some(0));
+    }
+
+    #[test]
+    fn duplicate_named_circuit_is_none() {
+        // Two top-level circuits named `foo` — a duplicate-declaration error
+        // state that still PARSES (and can be mid-edit). `resolve_in_file`
+        // first-matches to one of them, so signature help must suppress
+        // rather than deterministically show an arbitrary candidate's
+        // signature at the call site.
+        let d = sig_help_at(
+            "circuit foo(x: Field): Field { return x; }\n\
+             circuit foo(x: Field): Field { return x; }\n\
+             circuit c(): Field { return foo($01); }",
+        );
+        assert!(d.is_none());
+    }
+
+    #[test]
+    fn callee_resolving_to_non_circuit_witness_item_is_none() {
+        // `export circuit foo(x: Field): Field;` (no body, terminated by
+        // `;`) parses as a `CircuitDecl` item -> `SymbolKind::CircuitSig`,
+        // NOT `SymbolKind::Circuit`. `foo` is a plain (non-dotted) call
+        // callee that resolves cleanly via `resolve_in_file`'s unfiltered
+        // top-level name match, so this reaches (and exercises) the
+        // kind-filter check rather than the earlier "unresolved" `None`.
+        let d = sig_help_at(
+            "export circuit foo(x: Field): Field;\n\
+             circuit c(): Field { return foo($01); }",
+        );
+        assert!(d.is_none());
     }
 
     #[test]

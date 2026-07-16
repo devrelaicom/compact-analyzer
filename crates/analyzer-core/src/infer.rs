@@ -400,6 +400,78 @@ fn return_mismatch_diag(
     )
 }
 
+/// The first `IDENT` token of a parameter node (the parameter name) and its
+/// range. For a witness `STRUCT_FIELD` the name `IDENT` is a direct token
+/// child. For a circuit `PARAM` the name sits one level deeper, inside an
+/// `IDENT_PAT` child (`PARAM -> IDENT_PAT -> IDENT`) — the grammar wraps a
+/// simple-identifier parameter pattern in `IDENT_PAT` before the `:` and
+/// type. `descendants_with_tokens` (a depth-first, document-order walk)
+/// finds the name in both shapes uniformly: it's the first `IDENT` token
+/// encountered either way, since the pattern always precedes the type.
+fn param_name_ident(node: &compactp_syntax::SyntaxNode) -> Option<(String, text_size::TextRange)> {
+    node.descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == compactp_syntax::SyntaxKind::IDENT)
+        .map(|t| (t.text().to_string(), t.text_range()))
+}
+
+/// Push an `E3005` for the first duplicate among `params` (name, range) pairs,
+/// in declaration order. Only the first repeat is reported per signature
+/// (matches compactc, which stops at the first duplicate).
+fn check_duplicate_params(
+    params: impl Iterator<Item = (String, text_size::TextRange)>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let mut seen: Vec<String> = Vec::new();
+    for (name, range) in params {
+        if seen.contains(&name) {
+            diags.push(Diagnostic::error(
+                DiagnosticCode::new("E", 3005),
+                format!("duplicate parameter name {name}"),
+                range,
+            ));
+            return;
+        }
+        seen.push(name);
+    }
+}
+
+/// Signature well-formedness diagnostics for `src`: a circuit or witness with
+/// two parameters of the same name (`E3005`). Pure single-file CST walk — no
+/// resolution. `no_eq`: `Diagnostic` has no `PartialEq` (same rationale as
+/// `type_diagnostics_query`).
+#[salsa::tracked(returns(clone), no_eq)]
+pub fn signature_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnostic]> {
+    use compactp_syntax::SyntaxKind;
+    let root = compactp_syntax::SyntaxNode::new_root(parsed(db, src).green);
+    let mut diags = Vec::new();
+    // Circuit params are PARAM nodes.
+    for c in root
+        .descendants()
+        .filter_map(compactp_ast::CircuitDef::cast)
+    {
+        let params = c
+            .syntax()
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::PARAM)
+            .filter_map(|n| param_name_ident(&n));
+        check_duplicate_params(params, &mut diags);
+    }
+    // Witness params are STRUCT_FIELD nodes (shared grammar with struct fields).
+    for w in root
+        .descendants()
+        .filter_map(compactp_ast::WitnessDecl::cast)
+    {
+        let params = w
+            .syntax()
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::STRUCT_FIELD)
+            .filter_map(|n| param_name_ident(&n));
+        check_duplicate_params(params, &mut diags);
+    }
+    Arc::from(diags)
+}
+
 impl crate::AnalysisHost {
     /// Type diagnostics for `file` (foundation: primitive-literal return
     /// mismatch) plus generic-specialization (arity) diagnostics plus
@@ -957,5 +1029,41 @@ mod tests {
                 .iter()
                 .all(|d| d.code.number != 3004)
         );
+    }
+
+    #[test]
+    fn duplicate_param_circuit_and_witness_flagged() {
+        let db = CompactDatabase::default();
+        // Circuit with two params named `a` -> one E3005.
+        let a = SourceText::new(
+            &db,
+            Arc::from("export circuit c(a: Uint<8>, a: Boolean): Boolean { return true; }"),
+        );
+        let da = signature_diagnostics_query(&db, a);
+        assert_eq!(da.len(), 1);
+        assert_eq!(da[0].code.number, 3005);
+        // Witness with two params named `x` -> one E3005 (witness params are STRUCT_FIELD).
+        let b = SourceText::new(
+            &db,
+            Arc::from("witness w(x: Uint<8>, x: Boolean): Boolean;"),
+        );
+        let db2 = signature_diagnostics_query(&db, b);
+        assert_eq!(db2.len(), 1);
+        assert_eq!(db2[0].code.number, 3005);
+    }
+
+    #[test]
+    fn distinct_params_emit_nothing() {
+        let db = CompactDatabase::default();
+        let a = SourceText::new(
+            &db,
+            Arc::from("export circuit c(a: Uint<8>, b: Boolean): Boolean { return true; }"),
+        );
+        assert!(signature_diagnostics_query(&db, a).is_empty());
+        let b = SourceText::new(
+            &db,
+            Arc::from("witness w(x: Uint<8>, y: Boolean): Boolean;"),
+        );
+        assert!(signature_diagnostics_query(&db, b).is_empty());
     }
 }

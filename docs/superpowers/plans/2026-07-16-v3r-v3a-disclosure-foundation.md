@@ -133,30 +133,32 @@ git commit -m "test(v3-R): compactc-disclosure differential harness (no-op basel
 
 **Interfaces:**
 - Consumes: R0 rule index (one fixture per rule row).
-- Produces: fixture files + `FIXTURES` entries `{ name, native_discloses: bool, rule }`.
+- Produces: fixture files + a **two-field** `Fixture { name, rule, discloses: bool, native_confirms: bool }` and `FIXTURES` entries. **`discloses`** = compactc's ground-truth WPP verdict (validated against real `compactc` NOW). **`native_confirms`** = whether the CURRENT native analyzer is expected to emit a confirmed E-leak (starts `false` for every fixture — native is a no-op stub; each v3a task flips its fixtures `false→true` as it implements the sink). This **green pending-flip** model (user-approved 2026-07-16) supersedes the plan's original single-field committed-RED baseline: the branch stays green at every step while every fixture is still compiler-validated up front.
 
-- [ ] **Step 1: Write one accept + one reject fixture per source/sink/sanitizer rule.** Each is minimal and derived from the R0 index / corpus `examples/`. Examples (verify each expected verdict against local `compactc` in Step 2):
-  - `ledger_leak.compact` (reject) / `ledger_disclosed.compact` (accept, `disclose()` added) — ledger sink, from spec §3.8's `setf` example.
+- [ ] **Step 1: Refactor the harness to the two-field model.** In `disclosure_differential.rs`, change `struct Fixture` to `{ name: &'static str, rule: &'static str, discloses: bool, native_confirms: bool }`. Update `rule_tagged_disclosure_fixtures`: assert `native_discloses(text, path) == fx.native_confirms` (the native side matches its CURRENT expectation), and when the toolchain is present, cross-check `compiler_discloses(tc, path) == Some(fx.discloses)` (a `None`/indeterminate still just `eprintln!`s and skips, as today). Keep `corpus_no_false_positive_disclosures` unchanged.
+
+- [ ] **Step 2: Write one accept + one reject fixture per source/sink/sanitizer rule.** Each is minimal and derived from the R0 index / corpus `examples/`. Verify each `discloses` value against local `compactc` in Step 3:
+  - `ledger_leak.compact` (discloses:true) / `ledger_disclosed.compact` (discloses:false, `disclose()` added) — ledger sink, from spec §3.8's `setf` example.
   - ~~`emit_leak`/`emit_disclosed`~~ — **DROPPED (Rev-2.1):** `emit` does not exist in 0.31.1. Do not create these fixtures.
-  - `return_witness_leak.compact` (reject) / `return_arg_ok.compact` (accept — returning a circuit arg is NOT a disclosure, §3.2 asymmetry).
-  - `impure_call_leak.compact` (reject) / `pure_call_ok.compact` (accept — pure cross-contract call is not a sink, §3.2).
-  - `implicit_flow_leak.compact` (reject — `if (w) { F.increment(1); }`) / `implicit_flow_disclosed.compact` (accept).
-  - `hash_then_leak.compact` (reject — `transientHash(w)` into ledger; hashing doesn't sanitize, §3.5).
-  - `constructor_arg_leak.compact` (reject) — constructor-argument source.
-  - `comingled_return.compact` (reject) — witness-return + circuit-arg co-mingled in a returned struct (spec §8 risk #4).
+  - `return_witness_leak.compact` (discloses:true) / `return_arg_ok.compact` (discloses:false — returning a circuit arg is NOT a disclosure, §3.2 asymmetry).
+  - `contract_call_witness_leak.compact` (discloses:**true** — contract-call is an **unconditional** sink in 0.31.1, NOT `pure?`-gated per Rev-2.1) / `contract_call_no_witness.compact` (discloses:false — a cross-contract call passing no witness data). **The reject fixture keeps `native_confirms: false` through ALL of v3a** — v3a deliberately fails closed to an amber advisory for the deferred contract-call sink (never a confirmed E-leak), so its native-confirm verdict stays false while `discloses:true` is compiler-validated. A8 separately asserts the advisory is emitted; v3b later flips it. This is the §0 fail-closed divergence, expressed cleanly by the two-field split.
+  - `implicit_flow_leak.compact` (discloses:true — `if (w) { F.increment(1); }`) / `implicit_flow_disclosed.compact` (discloses:false).
+  - `hash_then_leak.compact` (discloses:true — `transientHash(w)` into ledger; hashing doesn't sanitize, §3.5).
+  - `constructor_arg_leak.compact` (discloses:true) — constructor-argument source.
+  - `comingled_return.compact` (discloses:true) — witness-return + circuit-arg co-mingled in a returned struct (spec §8 risk #4).
 
-- [ ] **Step 2: Capture the ground-truth verdict from real `compactc`** for each fixture and set `native_discloses` to match. (If `compactc` is absent locally, the fixture's expected verdict is derived from the R0 index and the live cross-check self-skips — same as `type_differential.rs`.)
+- [ ] **Step 3: Capture ground truth from real `compactc`** and set each `discloses` to match; set **`native_confirms: false` for every fixture** (the native side is still a no-op). (If `compactc` is absent locally, `discloses` is derived from the R0 index and the live cross-check self-skips — same as `type_differential.rs`.)
 Run: `for f in crates/compact-analyzer/tests/fixtures/disclosure/*.compact; do echo "== $f"; compact compile --skip-zk --vscode "$f" "$(mktemp -d)"; done`
-Expected: reject fixtures print the `witness-value disclosure` banner; accept fixtures exit 0.
+Expected: `discloses:true` fixtures print the exact WPP banner (`potential witness-value disclosure must be declared but is not:` — confirm it matches `WPP_BANNER`); `discloses:false` fixtures exit 0. This is also the first LIVE validation of the R0-extracted banner string against a real reject.
 
-- [ ] **Step 3: Run the harness** — the native side still no-ops, so every `native_discloses: true` fixture FAILS the native assertion. This is the intended RED that v3a turns green.
-Run: `cargo test -p compact-analyzer --test disclosure_differential --locked rule_tagged`
-Expected: FAIL on the reject fixtures (native silent; expected disclose). Reject fixtures with `native_discloses: false`? none. Record which fail.
+- [ ] **Step 4: Run the harness — expect GREEN.** Native no-op emits nothing ⇒ `native_discloses == false == native_confirms` for every fixture; the live cross-check confirms `compiler == discloses`. So the fixtures are compiler-validated now and the suite is green.
+Run: `cargo test -p compact-analyzer --test disclosure_differential --locked`
+Expected: PASS (both tests). `cargo fmt --check` + `cargo clippy -p compact-analyzer --tests -- -D warnings` clean.
 
-- [ ] **Step 4: Commit** (RED fixtures are a legitimate committed baseline for v3a).
+- [ ] **Step 5: Commit** (green, compiler-validated fixture baseline).
 ```bash
 git add crates/compact-analyzer/tests/fixtures/disclosure crates/compact-analyzer/tests/disclosure_differential.rs
-git commit -m "test(v3-R): rule-tagged disclosure fixtures (RED pending v3a)"
+git commit -m "test(v3-R): rule-tagged disclosure fixtures (compiler-validated, green pending-flip baseline)"
 ```
 
 ---
@@ -164,6 +166,8 @@ git commit -m "test(v3-R): rule-tagged disclosure fixtures (RED pending v3a)"
 ## Phase v3a — Intraprocedural WPP (fail-closed)
 
 > Each interpreter task below CONSUMES the R0 rule index and pins its behavior with the matching R2 fixture. Where an implementation walks the `compactp_ast`/`compactp_syntax` tree, Step 1 of the task is always: **read the as-merged AST API for that node kind** (the exact `Expr`/`Stmt` variant accessors) — do not assume shapes. This mirrors v2b's per-rule just-in-time discipline.
+>
+> **Green pending-flip protocol (R2 model):** each fixture carries `discloses` (compiler truth, fixed by R2) and `native_confirms` (starts `false`). When a v3a task implements the sink/rule that a fixture pins, it **flips that fixture's `native_confirms` to `true`** in the same commit, so `native_discloses == native_confirms` stays exact and the suite stays green. The contract-call reject fixture stays `native_confirms: false` through all of v3a (deferred to v3b; A8 asserts its amber advisory instead). Never leave `native_confirms` stale — a flipped-late fixture makes the harness assert the wrong thing.
 
 ### Task A1: `disclosure/` scaffold, `Abs` lattice, and empty query
 
@@ -291,12 +295,12 @@ git commit -m "feat(v3a): disclosure module scaffold + Abs lattice + empty query
 - Produces: `record_leak(table, src, nature, witnesses)`; sink handling for ledger write/update and `return`; `filter_witnesses` (return asymmetry, §3.2); `LeakTable::drain() -> Vec<DisclosureLeak>`; `leak_to_diagnostic(leak) -> Diagnostic` (E3100, wording per §3.8, `secondary_spans` = source + path points).
 
 - [ ] **Step 1: Read** how ledger writes / `return` appear in the AST (statement vs expr position).
-- [ ] **Step 2: Write failing differential-backed tests:** wire `disclosure_diagnostics_query` to run the interpreter from each root and drain the table; assert the R2 fixtures `ledger_leak`, `return_witness_leak` now produce an E3100, and `return_arg_ok` does NOT (asymmetry).
-- [ ] **Step 3: Run → FAIL.**
-- [ ] **Step 4: Implement** `record_leak` (dedup by `(src, nature)`, union witnesses — §4.2), the three sinks, `filter_witnesses` (keep only `WitnessReturn` at the return sink), the leak table drain in the query, and `leak_to_diagnostic` with related-info `secondary_spans`.
+- [ ] **Step 2: Write failing differential-backed tests:** wire `disclosure_diagnostics_query` to run the interpreter from each root and drain the table; assert the R2 fixtures `ledger_leak`, `return_witness_leak` now produce an E3100, and `return_arg_ok` does NOT (asymmetry). **Flip `native_confirms → true`** on the fixtures this task turns confirmable (`ledger_leak`, `return_witness_leak`, `constructor_arg_leak` [constructor source seeded in A2 + ledger sink here], `comingled_return` [return sink + filter]) in the SAME commit. Leave `hash_then_leak` (needs A6 conduit) and `implicit_flow_leak` (A5) unflipped.
+- [ ] **Step 3: Run → FAIL** (native emits nothing yet, but `native_confirms` is now true for the flipped fixtures ⇒ mismatch).
+- [ ] **Step 4: Implement** `record_leak` (dedup by `(src, nature)`, union witnesses — §4.2), the **two sinks** (ledger write/update, return), `filter_witnesses` (keep only `WitnessReturn` at the return sink), the leak table drain in the query, and `leak_to_diagnostic` with related-info `secondary_spans`.
 - [ ] **Step 5: Run the interpreter tests + the differential fixtures.**
 Run: `cargo test -p analyzer-core disclosure && cargo test -p compact-analyzer --test disclosure_differential --locked rule_tagged`
-Expected: `ledger_leak`/`return_witness_leak`/`constructor_arg_leak`/`hash_then_leak` GREEN; `*_ok`/`*_disclosed` accept.
+Expected: GREEN — `ledger_leak`/`return_witness_leak`/`constructor_arg_leak`/`comingled_return` now native-confirm (matching their flipped `native_confirms:true`); `*_ok`/`*_disclosed` still accept; `hash_then_leak`/`implicit_flow_leak` still `native_confirms:false` (green, pending A6/A5).
 - [ ] **Step 6: Commit.** `feat(v3a): ledger/return sinks + confirmed-leak diagnostics with path related-info`
 
 ### Task A5: Implicit flow — threaded control witnesses + separate control-leaks

@@ -40,10 +40,13 @@ fn native_discloses(text: &str, path: &Path) -> bool {
 
 /// `compactc`'s disclosure verdict for one source file on disk: `Some(true)`
 /// on a post-parse reject whose stderr carries the WPP banner, `Some(false)`
-/// on a clean compile or a post-parse reject for an unrelated reason, `None`
-/// on a parse rejection or an indeterminate outcome (usage error, timeout,
-/// cancellation) — the disclosure phase never ran, so there is no verdict to
-/// pin.
+/// ONLY on a clean compile, `None` otherwise (a parse rejection, a
+/// post-parse reject WITHOUT the banner, or an indeterminate outcome —
+/// usage error, timeout, cancellation). The WPP pass runs over a late IR
+/// (`Lwithpaths`); if compactc bails on an unrelated (e.g. type) error
+/// before that IR is built, "no banner" is NOT evidence the file is
+/// disclosure-clean — the pass may never have run — so that case is
+/// indeterminate, not a confirmed non-disclosure.
 fn compiler_discloses(tc: &Toolchain, source: &Path) -> Option<bool> {
     let scratch = tempfile::tempdir().expect("scratch");
     let outcome = compile_file(
@@ -56,7 +59,7 @@ fn compiler_discloses(tc: &Toolchain, source: &Path) -> Option<bool> {
     );
     match classify(&outcome) {
         CompilerVerdict::Accept => Some(false),
-        CompilerVerdict::RejectPostParse => Some(outcome.stderr.contains(WPP_BANNER)),
+        CompilerVerdict::RejectPostParse => outcome.stderr.contains(WPP_BANNER).then_some(true),
         CompilerVerdict::RejectParse | CompilerVerdict::Indeterminate => None,
     }
 }
@@ -133,8 +136,10 @@ fn rule_tagged_disclosure_fixtures() {
 }
 
 /// Binary corpus gate (foundation direction: no false positives). For every
-/// corpus file compactc's disclosure verdict is clean on (accepted outright,
-/// or rejected for an unrelated reason), the native checker must emit zero
+/// corpus file compactc ACCEPTS outright (`compiler_discloses` ==
+/// `Some(false)`, i.e. the WPP pass provably ran and found nothing — see
+/// that function's doc comment for why a post-parse reject is excluded
+/// rather than counted as clean), the native checker must emit zero
 /// confirmed-leak (E-family, number >= 3100) diagnostics; advisories are
 /// allowed. Skips when the toolchain or corpus is absent.
 #[test]
@@ -156,7 +161,7 @@ fn corpus_no_false_positive_disclosures() {
         files.len()
     );
 
-    let mut clean = 0usize;
+    let mut accepted = 0usize;
     let mut confirmed_leak = 0usize;
     let mut indeterminate = 0usize;
     let mut false_positives: Vec<PathBuf> = Vec::new();
@@ -167,7 +172,7 @@ fn corpus_no_false_positive_disclosures() {
         };
         match compiler_discloses(&tc, &path) {
             Some(false) => {
-                clean += 1;
+                accepted += 1;
                 if native_discloses(&text, &path) {
                     false_positives.push(path);
                 }
@@ -178,19 +183,19 @@ fn corpus_no_false_positive_disclosures() {
     }
 
     eprintln!(
-        "disclosure corpus gate: clean={clean} compiler_confirmed_leak={confirmed_leak} indeterminate={indeterminate} false_positives={}",
+        "disclosure corpus gate: accepted={accepted} compiler_confirmed_leak={confirmed_leak} indeterminate={indeterminate} false_positives={}",
         false_positives.len()
     );
     assert!(
-        clean > 0,
-        "disclosure corpus gate exercised no compactc-clean files (clean={clean}, \
+        accepted > 0,
+        "disclosure corpus gate exercised no compactc-accepted files (accepted={accepted}, \
          confirmed_leak={confirmed_leak}, indeterminate={indeterminate}); \
          the toolchain or invocation may be misconfigured"
     );
     assert!(
         false_positives.is_empty(),
-        "native emitted a confirmed-leak diagnostic on {} file(s) compactc's disclosure \
-         verdict is clean on (false positives): {:?}",
+        "native emitted a confirmed-leak diagnostic on {} file(s) compactc accepts \
+         (false positives): {:?}",
         false_positives.len(),
         false_positives
     );

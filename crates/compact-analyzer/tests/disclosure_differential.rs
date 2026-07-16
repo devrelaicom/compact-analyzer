@@ -8,15 +8,17 @@
 //! gate over the corpus. Both self-skip cleanly when the toolchain / corpus
 //! is absent.
 //!
-//! This is a **green pending-flip baseline** (Task R2): the native side
-//! (`AnalysisHost::disclosure_diagnostics`) is still stubbed to always return
-//! empty until Task A1 lands the interpreter, but `FIXTURES` now carries one
-//! compiler-validated fixture per WPP rule from the R0 index. Each fixture
-//! tracks two verdicts: `discloses` (compactc's ground truth, validated here
-//! against real `compactc`) and `native_confirms` (the current native
-//! verdict, `false` for every fixture until each v3a task flips its own).
-//! The harness must compile and pass green so v3a has a stable RED->GREEN
-//! gate to work against.
+//! **Green pending-flip model.** The native side
+//! (`AnalysisHost::disclosure_diagnostics`) is the fully-landed intraprocedural
+//! WPP analyzer. `FIXTURES` carries one compiler-validated fixture per WPP rule
+//! from the R0 index. Each fixture tracks two verdicts: `discloses` (compactc's
+//! ground truth, validated here against real `compactc`) and `native_confirms`
+//! (whether the native analyzer emits a confirmed E-family leak). Every v3a task
+//! flipped its own fixtures' `native_confirms` from `false` to `true` as it
+//! implemented that rule, keeping the harness green at every step (rather than
+//! committing a red baseline). Deferred/version-gated cases (e.g. cross-contract
+//! calls) intentionally keep `native_confirms: false` — the analyzer fails closed
+//! to an amber U-family advisory there, which is excluded from `native_discloses`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

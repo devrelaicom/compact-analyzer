@@ -71,14 +71,17 @@ pub fn disclose(abs: &Abs) -> Abs {
 
 /// `combine-abs` (R0 F2): the join / lattice union. Witnesses are unioned
 /// (`merge_witnesses`, not intersected); `Multiple`/`Single` join elementwise
-/// over matching shapes. Two constant `Boolean`s keep `Boolean` only if their
-/// `value`s agree; otherwise (or against a non-`Boolean` operand) the result
-/// decays to `Atomic`, per the source's `Abs-boolean` arm.
+/// over matching shapes, and `Single` distributes over `Multiple` (each
+/// `Multiple` child is joined against the `Single`'s element). Two constant
+/// `Boolean`s keep `Boolean` only if their `value`s agree; otherwise (or
+/// against a non-`Boolean` operand) the result decays to `Atomic`, per the
+/// source's `Abs-boolean` arm.
 ///
-/// The source's own invariant is that `abs1` and `abs2` have the same shape;
-/// any other combination (e.g. `Multiple` vs `Single`) is defensive-only —
-/// fail-closed by unioning every reachable witness into a single `Atomic`
-/// rather than silently dropping taint.
+/// The remaining combinations (`Atomic`/`Boolean` vs `Multiple`/`Single`) are
+/// shapes the source's own invariant forbids (`abs1`/`abs2` always have the
+/// same shape, up to the `Single`-distributes-over-`Multiple` case above) —
+/// defensive-only, fail-closed by unioning every reachable witness into a
+/// single `Atomic` rather than silently dropping taint.
 pub fn combine_abs(a: &Abs, b: &Abs) -> Abs {
     match (a, b) {
         (Abs::Atomic(w1), Abs::Atomic(w2)) => Abs::Atomic(merge_witnesses(w1, w2)),
@@ -105,13 +108,24 @@ pub fn combine_abs(a: &Abs, b: &Abs) -> Abs {
         | (Abs::Atomic(w2), Abs::Boolean { witnesses: w1, .. }) => {
             Abs::Atomic(merge_witnesses(w1, w2))
         }
-        (Abs::Multiple(a1), Abs::Multiple(a2)) => Abs::Multiple(
-            a1.iter()
-                .zip(a2.iter())
-                .map(|(x, y)| combine_abs(x, y))
-                .collect(),
-        ),
+        (Abs::Multiple(a1), Abs::Multiple(a2)) => {
+            // Typing guarantees equal arity (same struct/tuple shape); zip
+            // would otherwise silently truncate to the shorter side.
+            debug_assert_eq!(a1.len(), a2.len());
+            Abs::Multiple(
+                a1.iter()
+                    .zip(a2.iter())
+                    .map(|(x, y)| combine_abs(x, y))
+                    .collect(),
+            )
+        }
         (Abs::Single(a1), Abs::Single(a2)) => Abs::Single(Box::new(combine_abs(a1, a2))),
+        (Abs::Multiple(a1), Abs::Single(a2)) => {
+            Abs::Multiple(a1.iter().map(|x| combine_abs(x, a2)).collect())
+        }
+        (Abs::Single(a1), Abs::Multiple(a2)) => {
+            Abs::Multiple(a2.iter().map(|y| combine_abs(a1, y)).collect())
+        }
         (x, y) => Abs::Atomic(merge_witnesses(&witnesses_of(x), &witnesses_of(y))),
     }
 }
@@ -150,24 +164,32 @@ fn witness_sets_equal(w1: &[Witness], w2: &[Witness]) -> bool {
 }
 
 /// Collects every witness reachable from `abs`, at every level (`Atomic`,
-/// `Boolean`, and recursively through `Multiple`/`Single`). Used by sinks
-/// (A4) and as a test helper here.
+/// `Boolean`, and recursively through `Multiple`/`Single`), folded through
+/// `merge_witnesses` (R0 `abs->witnesses`: dedup by uid, union paths) so the
+/// same witness reachable from two `Multiple` children is reported once, not
+/// once per occurrence. Used by sinks (A4) and as a test helper here.
 pub fn witnesses_of(abs: &Abs) -> Vec<Witness> {
     match abs {
         Abs::Atomic(witnesses) | Abs::Boolean { witnesses, .. } => witnesses.clone(),
-        Abs::Multiple(items) => items.iter().flat_map(witnesses_of).collect(),
+        Abs::Multiple(items) => items
+            .iter()
+            .map(witnesses_of)
+            .fold(Vec::new(), |acc, w| merge_witnesses(&acc, &w)),
         Abs::Single(inner) => witnesses_of(inner),
     }
 }
 
 /// Union of two witness lists, deduped by `uid` and kept sorted by `uid`
-/// (mirrors the source's own invariant on `witness*`, line 4714: "sorted by
-/// uid, no duplicates"). On a duplicate uid the first-seen entry (from `w1`)
-/// wins.
+/// (R0 F2 `merge-witnesses`: "dedup by uid, union"). On a duplicate uid the
+/// two entries are merged into one by unioning their `path`s (mirrors the
+/// source's `(append path1* path2*)`) rather than discarding either side —
+/// dropping a path would lose part of the witness->sink trail (spec §3.7).
 pub fn merge_witnesses(w1: &[Witness], w2: &[Witness]) -> Vec<Witness> {
     let mut out: Vec<Witness> = w1.to_vec();
     for w in w2 {
-        if !out.iter().any(|existing| existing.uid == w.uid) {
+        if let Some(existing) = out.iter_mut().find(|existing| existing.uid == w.uid) {
+            existing.path.extend(w.path.iter().cloned());
+        } else {
             out.push(w.clone());
         }
     }
@@ -199,6 +221,84 @@ mod tests {
         // combine_abs unions (not intersects):
         let joined = combine_abs(&Abs::Atomic(vec![w.clone()]), &Abs::Atomic(vec![]));
         assert_eq!(witnesses_of(&joined).len(), 1);
+    }
+
+    #[test]
+    fn combine_abs_distributes_single_over_multiple() {
+        let w = Witness {
+            uid: 1,
+            src: text_size::TextRange::empty(0.into()),
+            info: WitnessInfo::CircuitArg {
+                function: "f".into(),
+                arg: "x".into(),
+            },
+            path: vec![],
+        };
+        let multiple = Abs::Multiple(vec![Abs::Atomic(vec![w.clone()])]);
+        let single = Abs::Single(Box::new(Abs::Atomic(vec![])));
+        // R0 F2: Single distributes over Multiple -- the result stays
+        // Multiple (never flattens to Atomic), and each child is joined
+        // against the Single's element.
+        let joined = combine_abs(&multiple, &single);
+        match joined {
+            Abs::Multiple(children) => {
+                assert_eq!(children.len(), 1);
+                assert_eq!(witnesses_of(&children[0]).len(), 1);
+            }
+            other => panic!("expected Abs::Multiple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_witnesses_unions_paths_on_uid_collision() {
+        let path_a = PathPoint {
+            src: text_size::TextRange::empty(0.into()),
+            description: "A".into(),
+            exposure: "".into(),
+        };
+        let path_b = PathPoint {
+            src: text_size::TextRange::empty(0.into()),
+            description: "B".into(),
+            exposure: "".into(),
+        };
+        let info = WitnessInfo::CircuitArg {
+            function: "f".into(),
+            arg: "x".into(),
+        };
+        let w1 = Witness {
+            uid: 1,
+            src: text_size::TextRange::empty(0.into()),
+            info: info.clone(),
+            path: vec![path_a.clone()],
+        };
+        let w2 = Witness {
+            uid: 1,
+            src: text_size::TextRange::empty(0.into()),
+            info,
+            path: vec![path_b.clone()],
+        };
+        // R0 F2 merge-witnesses: dedup by uid, UNION (not first-wins) --
+        // both witnesses' paths survive in one merged entry.
+        let merged = merge_witnesses(&[w1], &[w2]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].path, vec![path_a, path_b]);
+    }
+
+    #[test]
+    fn witnesses_of_dedups_across_multiple_children() {
+        let w = Witness {
+            uid: 1,
+            src: text_size::TextRange::empty(0.into()),
+            info: WitnessInfo::CircuitArg {
+                function: "f".into(),
+                arg: "x".into(),
+            },
+            path: vec![],
+        };
+        // The same witness (uid) reachable from two Multiple children --
+        // abs->witnesses folds via merge-witnesses, so it's reported once.
+        let abs = Abs::Multiple(vec![Abs::Atomic(vec![w.clone()]), Abs::Atomic(vec![w])]);
+        assert_eq!(witnesses_of(&abs).len(), 1);
     }
 
     #[test]

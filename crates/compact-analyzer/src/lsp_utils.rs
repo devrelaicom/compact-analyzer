@@ -166,6 +166,28 @@ pub(crate) fn completion_item_to_lsp(c: analyzer_ide::CompletionItem) -> lsp_typ
     }
 }
 
+/// `analyzer_ide::InlayHint` -> LSP `InlayHint`: `position` is the byte
+/// offset converted through the line index (mirrors `range_to_lsp`'s
+/// offset->`Position` conversion). `kind: TYPE` and zero padding on both
+/// sides match the brief's rendering (`": Field"` immediately after the
+/// binding name, no extra whitespace inserted by the client).
+pub(crate) fn inlay_hint_to_lsp(
+    hint: &analyzer_ide::InlayHint,
+    li: &LineIndex,
+) -> lsp_types::InlayHint {
+    let pos = li.line_col(TextSize::new(hint.offset));
+    lsp_types::InlayHint {
+        position: Position::new(pos.line, pos.col),
+        label: lsp_types::InlayHintLabel::String(hint.label.clone()),
+        kind: Some(lsp_types::InlayHintKind::TYPE),
+        text_edits: None,
+        tooltip: None,
+        padding_left: Some(false),
+        padding_right: Some(false),
+        data: None,
+    }
+}
+
 /// One `SignatureInformation` (v2c never proposes overload alternatives —
 /// `signature_help` already resolved to exactly one circuit/witness item),
 /// `active_signature: Some(0)`. Each `ParamLabel`'s byte offsets are rendered

@@ -179,6 +179,72 @@ fn signature_help_is_advertised_and_reports_active_parameter() {
 }
 
 #[test]
+fn inlay_hint_is_advertised_and_reports_const_binding_type() {
+    let (_dir, uri) = temp_doc();
+    let mut client = Client::start();
+    let caps = client.initialize_with_options(json!({}));
+    assert!(
+        caps["inlayHintProvider"].is_object() || caps["inlayHintProvider"] == json!(true),
+        "initialize must advertise inlayHintProvider: {caps}"
+    );
+
+    let src = "circuit c(): Field { const x = 1; return x; }";
+    did_open(&mut client, &uri, 1, src);
+
+    // A range covering the whole (single-line) document.
+    let resp = client.request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": uri},
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": src.encode_utf16().count() as u32},
+            },
+        }),
+    );
+    let hints = resp["result"].as_array().expect("hints array");
+    // `1` types to `TyKind::Uint(Some(2))`, and `display_kind` spells an
+    // exact-power-of-two upper bound (2 == 1 << 1) as `Uint<1>` rather than
+    // the range form `Uint<0..2>` — ground truth confirmed against
+    // analyzer-core's own `ty.rs` display test.
+    assert!(
+        hints
+            .iter()
+            .any(|h| h["label"] == ": Uint<1>" && h["kind"] == 1),
+        "expected a `: Uint<1>` TYPE inlay hint, got {hints:#?}"
+    );
+    let hint = hints.iter().find(|h| h["label"] == ": Uint<1>").unwrap();
+    let (line, col) = lsp_position(src, "const x");
+    assert_eq!(
+        hint["position"],
+        json!({"line": line, "character": col + "const x".encode_utf16().count() as u32}),
+        "hint must land right after the binding name: {hint}"
+    );
+
+    // A range that does NOT cover `const x = 1` (only the trailing
+    // `return x; }`) must exclude the hint — proves the handler actually
+    // filters by range rather than returning every document hint.
+    let (rline, rcol) = lsp_position(src, "return x");
+    let resp2 = client.request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": uri},
+            "range": {
+                "start": {"line": rline, "character": rcol},
+                "end": {"line": rline, "character": src.encode_utf16().count() as u32},
+            },
+        }),
+    );
+    let hints2 = resp2["result"].as_array().expect("hints array");
+    assert!(
+        hints2.iter().all(|h| h["label"] != ": Uint<1>"),
+        "range excluding the const binding must not return its hint: {hints2:#?}"
+    );
+
+    client.shutdown();
+}
+
+#[test]
 fn type_diagnostics_toggle_off_suppresses_type_but_keeps_parse() {
     let (_dir, uri) = temp_doc();
     let mut client = Client::start();

@@ -100,6 +100,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             retrigger_characters: None,
             work_done_progress_options: Default::default(),
         }),
+        inlay_hint_provider: Some(lsp_types::OneOf::Left(true)),
         semantic_tokens_provider: Some(
             lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
                 lsp_types::SemanticTokensOptions {
@@ -492,6 +493,35 @@ impl GlobalState {
                             self.position_to_file_position(&doc.text_document.uri, doc.position)?;
                         let data = analyzer_ide::signature_help(&mut self.host, pos)?;
                         Some(lsp_utils::signature_help_to_lsp(data))
+                    });
+                self.respond_ok(req.id, result);
+            }
+            "textDocument/inlayHint" => {
+                let result = serde_json::from_value::<lsp_types::InlayHintParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let file = *self.open_files.get(&params.text_document.uri)?;
+                        let li = self.host.analyze(file)?.line_index.clone();
+                        // Byte-offset window for `params.range`: an endpoint
+                        // that doesn't resolve (e.g. a stale range past the
+                        // document's current end) falls back to the
+                        // document boundary on that side, rather than
+                        // dropping every hint.
+                        let range_start = lsp_utils::offset_from_position(&li, params.range.start)
+                            .unwrap_or(TextSize::new(0));
+                        let range_end = lsp_utils::offset_from_position(&li, params.range.end)
+                            .unwrap_or(TextSize::new(u32::MAX));
+                        let hints = analyzer_ide::inlay_hints(&mut self.host, file);
+                        Some(
+                            hints
+                                .iter()
+                                .filter(|h| {
+                                    let offset = TextSize::new(h.offset);
+                                    range_start <= offset && offset <= range_end
+                                })
+                                .map(|h| lsp_utils::inlay_hint_to_lsp(h, &li))
+                                .collect::<Vec<_>>(),
+                        )
                     });
                 self.respond_ok(req.id, result);
             }

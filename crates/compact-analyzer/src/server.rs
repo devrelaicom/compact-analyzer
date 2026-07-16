@@ -95,6 +95,11 @@ pub(crate) fn run() -> anyhow::Result<()> {
             resolve_provider: Some(false),
             ..Default::default()
         }),
+        signature_help_provider: Some(lsp_types::SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: None,
+            work_done_progress_options: Default::default(),
+        }),
         semantic_tokens_provider: Some(
             lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
                 lsp_types::SemanticTokensOptions {
@@ -476,6 +481,18 @@ impl GlobalState {
                             .collect::<Vec<_>>()
                     })
                     .map(lsp_types::CompletionResponse::Array);
+                self.respond_ok(req.id, result);
+            }
+            "textDocument/signatureHelp" => {
+                let result = serde_json::from_value::<lsp_types::SignatureHelpParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        let doc = params.text_document_position_params;
+                        let pos =
+                            self.position_to_file_position(&doc.text_document.uri, doc.position)?;
+                        let data = analyzer_ide::signature_help(&mut self.host, pos)?;
+                        Some(lsp_utils::signature_help_to_lsp(data))
+                    });
                 self.respond_ok(req.id, result);
             }
             "textDocument/semanticTokens/full" => {

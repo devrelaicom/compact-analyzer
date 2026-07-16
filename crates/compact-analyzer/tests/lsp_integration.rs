@@ -4,7 +4,7 @@
 mod support;
 
 use serde_json::json;
-use support::{Client, did_open, temp_doc};
+use support::{Client, did_open, lsp_position, temp_doc};
 
 #[test]
 fn initialize_reports_server_info() {
@@ -138,6 +138,43 @@ fn publishes_native_type_diagnostic_on_open() {
             .any(|d| d["code"] == "E3001" && d["source"] == "compact-analyzer"),
         "expected an E3001 type diagnostic from compact-analyzer, got {diags:#?}"
     );
+    client.shutdown();
+}
+
+#[test]
+fn signature_help_is_advertised_and_reports_active_parameter() {
+    let (_dir, uri) = temp_doc();
+    let mut client = Client::start();
+    let caps = client.initialize_with_options(json!({}));
+    assert!(
+        caps["signatureHelpProvider"].is_object(),
+        "initialize must advertise signatureHelpProvider: {caps}"
+    );
+
+    let src = "circuit add(x: Field, y: Field): Field { return x + y; }\n\
+               circuit c(): Field { return add(1, 2); }";
+    did_open(&mut client, &uri, 1, src);
+
+    // Position ON the second argument's `2` — after the top-level comma.
+    let (line, col) = lsp_position(src, "2);");
+    let resp = client.request(
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+        }),
+    );
+    let result = &resp["result"];
+    assert_eq!(result["activeParameter"], 1, "{resp}");
+    assert_eq!(result["activeSignature"], 0, "{resp}");
+    let sigs = result["signatures"].as_array().expect("signatures array");
+    assert_eq!(sigs.len(), 1);
+    assert_eq!(sigs[0]["label"], "circuit add(x: Field, y: Field): Field");
+    let params = sigs[0]["parameters"].as_array().expect("parameters array");
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0]["label"], "x: Field");
+    assert_eq!(params[1]["label"], "y: Field");
+
     client.shutdown();
 }
 

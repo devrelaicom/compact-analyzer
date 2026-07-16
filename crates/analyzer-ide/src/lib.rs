@@ -10,6 +10,7 @@ mod references;
 mod rename;
 mod selection_ranges;
 mod semantic_tokens;
+mod signature_help;
 mod workspace_symbols;
 
 pub use completion::{CompletionItem, CompletionKind, completion};
@@ -21,6 +22,7 @@ pub use references::{find_references, find_references_cancellable};
 pub use rename::{RenameError, SourceEdit, rename, rename_cancellable};
 pub use selection_ranges::selection_ranges;
 pub use semantic_tokens::{SemToken, TokenMods, TokenType, semantic_tokens};
+pub use signature_help::{ParamLabel, SignatureHelpData, signature_help};
 pub use workspace_symbols::{WorkspaceSymbolItem, workspace_symbols};
 
 use analyzer_core::{FileId, TextRange};

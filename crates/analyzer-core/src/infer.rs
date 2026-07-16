@@ -400,19 +400,42 @@ fn return_mismatch_diag(
     )
 }
 
-/// The first `IDENT` token of a parameter node (the parameter name) and its
-/// range. For a witness `STRUCT_FIELD` the name `IDENT` is a direct token
-/// child. For a circuit `PARAM` the name sits one level deeper, inside an
-/// `IDENT_PAT` child (`PARAM -> IDENT_PAT -> IDENT`) — the grammar wraps a
-/// simple-identifier parameter pattern in `IDENT_PAT` before the `:` and
-/// type. `descendants_with_tokens` (a depth-first, document-order walk)
-/// finds the name in both shapes uniformly: it's the first `IDENT` token
-/// encountered either way, since the pattern always precedes the type.
+/// The first `IDENT` token of a witness `STRUCT_FIELD` parameter node (the
+/// parameter name) and its range. Witness args have no pattern wrapper
+/// (`arg → id : type`, grammar's `patterns.rs::arg`), so the direct/first
+/// `IDENT` child is unambiguously the name. NOT used for circuit params:
+/// see `circuit_param_name` for why a raw first-IDENT scan is wrong there.
 fn param_name_ident(node: &compactp_syntax::SyntaxNode) -> Option<(String, text_size::TextRange)> {
     node.descendants_with_tokens()
         .filter_map(|e| e.into_token())
         .find(|t| t.kind() == compactp_syntax::SyntaxKind::IDENT)
         .map(|t| (t.text().to_string(), t.text_range()))
+}
+
+/// The bound name of a circuit parameter, via the typed pattern API
+/// (`compactp_ast::Param::pattern()` / `compactp_ast::Pat`) — contributes a
+/// name only for a simple identifier pattern (`Pat::Ident`).
+///
+/// A raw first-IDENT scan of the `PARAM` subtree (as `param_name_ident`
+/// does for witness `STRUCT_FIELD`s) is wrong here: a circuit parameter can
+/// be a destructuring pattern, and for a struct pattern with field renaming
+/// — `{x: a}: S` — the grammar emits `STRUCT_PAT_FIELD(IDENT "x", COLON,
+/// IDENT_PAT(IDENT "a"))`, so the *first* `IDENT` in document order is the
+/// struct-field key `x`, not the bound local name `a`. Two params
+/// `{x: a}: S` and `{x: b}: S` bind distinct names (`a`, `b`) but a
+/// first-IDENT scan would see `["x", "x"]` and falsely flag `E3005` —
+/// `compactc` accepts that source. Destructuring patterns (`Pat::Tuple`,
+/// `Pat::Struct`) are therefore skipped (contribute no name): a safe
+/// false-negative, out of scope for this check rather than incorrectly
+/// flagged.
+fn circuit_param_name(param: &compactp_ast::Param) -> Option<(String, text_size::TextRange)> {
+    match param.pattern()? {
+        compactp_ast::Pat::Ident(ident) => {
+            let tok = ident.name()?;
+            Some((tok.text().to_string(), tok.text_range()))
+        }
+        compactp_ast::Pat::Tuple(_) | compactp_ast::Pat::Struct(_) => None,
+    }
 }
 
 /// Push an `E3005` for the first duplicate among `params` (name, range) pairs,
@@ -445,16 +468,14 @@ pub fn signature_diagnostics_query(db: &dyn Db, src: SourceText) -> Arc<[Diagnos
     use compactp_syntax::SyntaxKind;
     let root = compactp_syntax::SyntaxNode::new_root(parsed(db, src).green);
     let mut diags = Vec::new();
-    // Circuit params are PARAM nodes.
+    // Circuit params are PARAM nodes; extract names via the typed pattern
+    // API so struct/tuple destructuring params are skipped rather than
+    // misread (see `circuit_param_name`).
     for c in root
         .descendants()
         .filter_map(compactp_ast::CircuitDef::cast)
     {
-        let params = c
-            .syntax()
-            .children()
-            .filter(|n| n.kind() == SyntaxKind::PARAM)
-            .filter_map(|n| param_name_ident(&n));
+        let params = c.params().filter_map(|p| circuit_param_name(&p));
         check_duplicate_params(params, &mut diags);
     }
     // Witness params are STRUCT_FIELD nodes (shared grammar with struct fields).
@@ -1065,5 +1086,28 @@ mod tests {
             Arc::from("witness w(x: Uint<8>, y: Boolean): Boolean;"),
         );
         assert!(signature_diagnostics_query(&db, b).is_empty());
+    }
+
+    #[test]
+    fn struct_destructuring_params_with_distinct_bound_names_no_false_positive() {
+        // Regression for a Critical false positive: `param_name_ident`'s raw
+        // first-IDENT scan of a circuit PARAM subtree picked up a struct
+        // pattern's field *key* for a renaming field (`{x: a}`), not the
+        // bound local name `a`. Two params `{x: a}: S` / `{x: b}: S` bind
+        // distinct names (`a`, `b`) but were seen as `["x", "x"]` and
+        // falsely flagged E3005 — source `compactc` accepts. Must emit
+        // zero diagnostics.
+        let db = CompactDatabase::default();
+        let src = SourceText::new(
+            &db,
+            Arc::from(
+                "pragma language_version >= 0.23;\n\
+                 struct S { x: Field; }\n\
+                 export circuit f({x: a}: S, {x: b}: S): Field { return a; }"
+                    .to_string(),
+            ),
+        );
+        let diags = signature_diagnostics_query(&db, src);
+        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:?}");
     }
 }

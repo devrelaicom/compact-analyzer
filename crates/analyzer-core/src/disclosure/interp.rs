@@ -309,8 +309,10 @@ enum CalleeClass {
 /// Interprets an expression, returning its abstract taint value (`Abs`).
 /// Every form is pinned to an R0 row; anything not in R0 routes through the
 /// fail-closed catch-all (advisory + conservative witness union), never a
-/// silent taint drop (spec §0). `control` is threaded inertly — control-witness
-/// merging at branches is A5.
+/// silent taint drop (spec §0). `control` carries the ambient implicit-flow
+/// witnesses (A5): branch forms (`&&`/`||`, the ternary) thread the condition
+/// into it for their gated operands, and a ledger-field method call records a
+/// control-flow leak keyed on it.
 pub fn interp_expr(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
@@ -461,15 +463,26 @@ fn interp_binary(
     src: TextRange,
 ) -> Abs {
     let kids = child_exprs(b.syntax());
+    let op = b.op().map(|t| t.kind());
     let lhs = kids
         .first()
         .map(|e| interp_expr(ctx, sink, env, control, e))
         .unwrap_or_else(|| Abs::Atomic(Vec::new()));
+    // `&&`/`||` short-circuit (R0 F3): they desugar to `if`, so the RHS runs only
+    // under the LHS — a sink inside the RHS is control-dependent on the LHS's
+    // witnesses. Thread the LHS into `control` for the RHS (`thread_control`).
+    // The DATA result below still unions both operands' taint — separate
+    // mechanism from the control set.
+    let rhs_control = match op {
+        Some(SyntaxKind::AMP_AMP | SyntaxKind::PIPE_PIPE) => {
+            thread_control(witnesses_of(&lhs), control, src)
+        }
+        _ => control.to_vec(),
+    };
     let rhs = kids
         .get(1)
-        .map(|e| interp_expr(ctx, sink, env, control, e))
+        .map(|e| interp_expr(ctx, sink, env, &rhs_control, e))
         .unwrap_or_else(|| Abs::Atomic(Vec::new()));
-    let op = b.op().map(|t| t.kind());
     match op {
         Some(SyntaxKind::PLUS | SyntaxKind::MINUS | SyntaxKind::STAR) => {
             let exposure = match op {
@@ -515,8 +528,9 @@ fn interp_binary(
 /// `cond ? then : else` — the `if` expression (R0 F1, DATA join). Const-boolean
 /// condition -> mirror the taken branch; otherwise join both branches
 /// (`combine_abs`) and, in expression position, fold the condition's own taint
-/// into the result value (F1(d) `add-witnesses`). Control-witness threading is
-/// A5 — `control` passes through inert.
+/// into the result value (F1(d) `add-witnesses`). Both branches are also gated
+/// on the condition, so its witnesses thread into `control` for a sink inside
+/// either branch (A5) — distinct from the F1(d) value fold.
 fn interp_ternary(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
@@ -530,13 +544,18 @@ fn interp_ternary(
         .first()
         .map(|e| interp_expr(ctx, sink, env, control, e))
         .unwrap_or_else(|| Abs::Atomic(Vec::new()));
+    // Both branches are gated on the condition (R0 F1/§3.3): thread its
+    // witnesses into `control` so a sink inside either branch records the
+    // control-flow leak. DISTINCT from the F1(d) DATA fold below, which folds
+    // the condition into the branch VALUE.
+    let branch_control = thread_control(witnesses_of(&cond), control, src);
     let then_abs = kids
         .get(1)
-        .map(|e| interp_expr(ctx, sink, env, control, e))
+        .map(|e| interp_expr(ctx, sink, env, &branch_control, e))
         .unwrap_or_else(|| Abs::Atomic(Vec::new()));
     let else_abs = kids
         .get(2)
-        .map(|e| interp_expr(ctx, sink, env, control, e))
+        .map(|e| interp_expr(ctx, sink, env, &branch_control, e))
         .unwrap_or_else(|| Abs::Atomic(Vec::new()));
     let joined = match &cond {
         Abs::Boolean { value, .. } => {
@@ -609,6 +628,20 @@ fn interp_call(
         }
         CalleeClass::Native => {
             interp_args_for_effect(ctx, sink, env, control, call);
+            // A5 (K2): a ledger-field METHOD call (`c.method(args)`, receiver a
+            // ledger field) is a ledger OPERATION. When gated, emit the
+            // control-flow leak on the ambient `control` set (`record_leak`
+            // no-ops when `control` is empty ⇒ a top-level container op records
+            // no control leak). KEEP the amber advisory below for the still-
+            // unmodeled per-arg DATA flags (the `discloses?` table is A6): a
+            // top-level container op stays amber, never silent green (§0). No
+            // container-op DATA leak is recorded here — A6 owns that table.
+            if is_method_call(call)
+                && let Some(recv) = method_receiver(call)
+                && is_ledger_field(ctx, &recv)
+            {
+                sink.record_leak(src, "performing this ledger operation", control.to_vec());
+            }
             sink.emit_advisory(src, "native call not yet modeled (A6)".to_string());
             Abs::Atomic(Vec::new())
         }
@@ -760,9 +793,10 @@ fn interp_index(
 }
 
 /// Interprets a statement, threading `env` (mutated by bindings). Blocks
-/// sequence; `const` binds; `return`/assign/`assert` interpret their operands
-/// for taint (SINK recording is A4); `if` interprets condition + both branches
-/// (data only, control-witness threading is A5); `for` is deferred to A7.
+/// sequence; `const` binds; `return`/assign interpret their operands and record
+/// both the A4 DATA sink and the A5 control-flow sink; `if` threads the
+/// condition's witnesses into `control` for both branches (A5); `for` is
+/// deferred to A7.
 pub fn interp_stmt(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
@@ -803,11 +837,14 @@ pub fn interp_stmt(
             [target, value] => {
                 let value_abs = interp_expr(ctx, sink, env, control, value);
                 if is_ledger_field(ctx, target) {
-                    sink.record_leak(
-                        a.syntax().text_range(),
-                        "ledger operation",
-                        witnesses_of(&value_abs),
-                    );
+                    let range = a.syntax().text_range();
+                    sink.record_leak(range, "ledger operation", witnesses_of(&value_abs));
+                    // A5 (K2): conditioning a ledger op on a witness discloses
+                    // that witness as a SEPARATE control-flow leak — a distinct
+                    // nature ⇒ a distinct table entry (never merged into the data
+                    // leak, never tainting the written value). `record_leak`
+                    // no-ops when `control` is empty (fires only when gated).
+                    sink.record_leak(range, "performing this ledger operation", control.to_vec());
                 }
             }
             // Defensive (unexpected shape): realize taint, record no sink.
@@ -825,33 +862,52 @@ pub fn interp_stmt(
         Stmt::Return(r) => {
             let val = r.value().map(|e| interp_expr(ctx, sink, env, control, &e));
             if let (Some(fname), Some(val)) = (ctx.disclosing_fn, &val) {
+                let range = stmt.syntax().text_range();
                 let filtered = filter_witnesses(&witnesses_of(val));
                 sink.record_leak(
-                    stmt.syntax().text_range(),
+                    range,
                     format!("the value returned from exported circuit {fname}"),
                     filtered,
                 );
+                // A5 (K6): a return gated on a witness discloses the gating
+                // witness as a distinct control-flow leak. The SAME K7 asymmetry
+                // applies (`filter_witnesses`) — being gated on the circuit's own
+                // argument is not a disclosure, only a `WitnessReturn` control
+                // witness leaks. `record_leak` no-ops on an empty (filtered) set.
+                sink.record_leak(
+                    range,
+                    format!("returning this value from exported circuit {fname}"),
+                    filter_witnesses(control),
+                );
             }
         }
-        // `if` in statement position (R0 F1 effect position): interpret the
-        // condition and both branches. Branches get a child scope (bindings do
-        // not escape). Control-witness merging is A5 — `control` inert.
+        // `if` in statement position (R0 F1/§3.3): interpret the condition under
+        // the ambient `control`, then thread its witnesses into `control` for
+        // every branch (`thread_control`) — a sink inside a branch records the
+        // separate control-flow leak. The condition is the sole `Expr` child and
+        // precedes the branch blocks in source order, so `branch_control` is set
+        // before any branch runs. Branches get a child scope (bindings do not
+        // escape). An `else if` is a nested `If` Stmt: it re-threads its own
+        // condition on top of this branch_control, so gating accumulates.
         Stmt::If(_) => {
+            let mut branch_control = control.to_vec();
             for child in stmt.syntax().children() {
                 if let Some(e) = Expr::cast(child.clone()) {
-                    interp_expr(ctx, sink, env, control, &e);
+                    let cond = interp_expr(ctx, sink, env, control, &e);
+                    branch_control =
+                        thread_control(witnesses_of(&cond), control, stmt.syntax().text_range());
                 } else if let Some(blk) = compactp_ast::Block::cast(child.clone()) {
                     let mut scope = env.clone();
                     interp_stmt(
                         ctx,
                         sink,
                         &mut scope,
-                        control,
+                        &branch_control,
                         &compactp_ast::Stmt::Block(blk),
                     );
                 } else if let Some(nested) = compactp_ast::Stmt::cast(child.clone()) {
                     let mut scope = env.clone();
-                    interp_stmt(ctx, sink, &mut scope, control, &nested);
+                    interp_stmt(ctx, sink, &mut scope, &branch_control, &nested);
                 }
             }
         }
@@ -1097,6 +1153,23 @@ fn arg_exprs(call: &CallExpr) -> Vec<Expr> {
         .collect()
 }
 
+/// A method call's receiver expression (`recv` in `recv.method(args)`): the sole
+/// `Expr` child before the `(`. Used by A5 to recognize a ledger-field method
+/// call (`c.increment(1)`) as a ledger operation for the control-flow leak.
+/// `None` when there is no `(` or no receiver expression (a plain call).
+fn method_receiver(call: &CallExpr) -> Option<Expr> {
+    let lparen = call
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == SyntaxKind::L_PAREN)
+        .map(|t| t.text_range().start())?;
+    call.syntax()
+        .children()
+        .filter_map(Expr::cast)
+        .find(|e| e.syntax().text_range().start() < lparen)
+}
+
 /// A method call carries a `.` token child (`recv.method(..)`); a plain call
 /// does not.
 fn is_method_call(call: &CallExpr) -> bool {
@@ -1218,6 +1291,34 @@ fn bool_literal(node: &SyntaxNode) -> Option<bool> {
             SyntaxKind::FALSE_KW => Some(false),
             _ => None,
         })
+}
+
+/// Threads a branch condition's witnesses into the ambient `control` set for a
+/// branch body (spec §3.3, R0 F1): each condition witness gains a "the
+/// conditional branch" path point (exposure "the boolean value of"), then unions
+/// with the incoming `control`. This threaded set is the implicit-flow carrier
+/// the control-flow leak (K2/K6) keys on at every sink inside the branch — a
+/// SEPARATE mechanism from the F1(d) DATA fold (which taints the branch VALUE);
+/// the condition's witnesses are NOT folded into any branch value here. A
+/// disclosed condition (`disclose(cond)`) has an empty witness set ⇒ nothing is
+/// added ⇒ no control leak (the `implicit_flow_disclosed` invariant).
+fn thread_control(
+    cond_ws: Vec<Witness>,
+    control: &[Witness],
+    branch_src: TextRange,
+) -> Vec<Witness> {
+    let tagged: Vec<Witness> = cond_ws
+        .into_iter()
+        .map(|mut w| {
+            w.path.push(PathPoint {
+                src: branch_src,
+                description: "the conditional branch".into(),
+                exposure: "the boolean value of".into(),
+            });
+            w
+        })
+        .collect();
+    merge_witnesses(&tagged, control)
 }
 
 /// `add-witnesses` (R0 F1(d)/P5): unions `extra` into every atomic/boolean leaf
@@ -1910,5 +2011,175 @@ mod tests {
         assert_eq!(leaks.len(), 1, "the ledger write leaks the witness");
         assert_eq!(leaks[0].nature, "ledger operation");
         assert_eq!(leaks[0].witnesses.len(), 1);
+    }
+
+    // -- A5 implicit-flow (control-witness) tests -----------------------
+
+    #[test]
+    fn control_witness_threads_through_if_and_leaks_at_sink() {
+        // A5 (K2): a ledger Cell-write gated on a witness records a CONTROL-flow
+        // leak on the gating witness, and NO data leak on the clean written
+        // value `5` (record_leak no-ops on an empty witness set).
+        let (db, src, fd, ws, file) = walk_setup(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Uint<8>;\n\
+             witness getW(): Boolean;\n\
+             export circuit f(): [] { if (getW()) { c = 5; } }\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let roots = discover_roots(&tree);
+        let mut sink = DisclosureSink::new();
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        let leaks = sink.drain_leaks();
+        assert_eq!(
+            leaks.len(),
+            1,
+            "only the control-flow leak, not a data leak on the clean `5`"
+        );
+        assert_eq!(leaks[0].nature, "performing this ledger operation");
+        assert_eq!(leaks[0].witnesses.len(), 1);
+        assert_eq!(
+            leaks[0].witnesses[0].info,
+            WitnessInfo::WitnessReturn {
+                function: "getW".into()
+            }
+        );
+    }
+
+    #[test]
+    fn control_leak_is_distinct_from_data_leak() {
+        // A witness written to a ledger field UNDER a DIFFERENT witness control
+        // yields TWO distinct leak-table entries: the DATA leak (the written
+        // value's witness) and the CONTROL leak (the gating witness), keyed by
+        // distinct nature strings.
+        let (db, src, fd, ws, file) = walk_setup(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Uint<8>;\n\
+             witness getCtl(): Boolean;\n\
+             witness getData(): Uint<8>;\n\
+             export circuit f(): [] { if (getCtl()) { c = getData(); } }\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let roots = discover_roots(&tree);
+        let mut sink = DisclosureSink::new();
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        let mut leaks = sink.drain_leaks();
+        // Sort by nature: "ledger operation" (data) < "performing …" (control).
+        leaks.sort_by(|a, b| a.nature.cmp(&b.nature));
+        assert_eq!(leaks.len(), 2, "distinct data + control leak entries");
+        assert_eq!(leaks[0].nature, "ledger operation");
+        assert_eq!(leaks[0].witnesses.len(), 1);
+        assert_eq!(
+            leaks[0].witnesses[0].info,
+            WitnessInfo::WitnessReturn {
+                function: "getData".into()
+            }
+        );
+        assert_eq!(leaks[1].nature, "performing this ledger operation");
+        assert_eq!(leaks[1].witnesses.len(), 1);
+        assert_eq!(
+            leaks[1].witnesses[0].info,
+            WitnessInfo::WitnessReturn {
+                function: "getCtl".into()
+            }
+        );
+    }
+
+    #[test]
+    fn disclosed_condition_clears_control_no_leak() {
+        // `if (disclose(getW())) { c = 5; }` — the disclosed condition has an
+        // empty witness set, so `control` stays empty inside the branch and NO
+        // control leak fires (the `implicit_flow_disclosed` invariant).
+        let (db, src, fd, ws, file) = walk_setup(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Uint<8>;\n\
+             witness getW(): Boolean;\n\
+             export circuit f(): [] { if (disclose(getW())) { c = 5; } }\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let roots = discover_roots(&tree);
+        let mut sink = DisclosureSink::new();
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        assert!(
+            sink.drain_leaks().is_empty(),
+            "a disclosed condition clears control ⇒ no control leak"
+        );
+    }
+
+    #[test]
+    fn ledger_method_call_control_leaks_and_keeps_advisory() {
+        // A5/A6 boundary: a ledger-field METHOD call (`c.increment(1)`,
+        // c: Counter) gated on a witness records the control leak, while KEEPING
+        // the amber advisory for the still-unmodeled per-arg DATA flags (A6). No
+        // container-op DATA leak is recorded here.
+        let (db, src, fd, ws, file) = walk_setup(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Counter;\n\
+             witness getW(): Boolean;\n\
+             export circuit f(): [] { if (getW()) { c.increment(1); } }\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let roots = discover_roots(&tree);
+        let mut sink = DisclosureSink::new();
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        let advisory_kept = !sink.advisories().is_empty();
+        let leaks = sink.drain_leaks();
+        assert_eq!(
+            leaks.len(),
+            1,
+            "only the control leak (no container-op data)"
+        );
+        assert_eq!(leaks[0].nature, "performing this ledger operation");
+        assert_eq!(leaks[0].witnesses.len(), 1);
+        assert_eq!(
+            leaks[0].witnesses[0].info,
+            WitnessInfo::WitnessReturn {
+                function: "getW".into()
+            }
+        );
+        assert!(
+            advisory_kept,
+            "amber advisory kept for the unmodeled container-op data flags (A6)"
+        );
     }
 }

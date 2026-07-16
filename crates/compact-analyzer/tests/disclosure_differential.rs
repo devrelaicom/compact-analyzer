@@ -112,7 +112,7 @@ const FIXTURES: &[Fixture] = &[
         name: "implicit_flow_leak.compact",
         rule: "K2 implicit flow at ledger sink",
         discloses: true,
-        native_confirms: false,
+        native_confirms: true,
     },
     Fixture {
         name: "implicit_flow_disclosed.compact",

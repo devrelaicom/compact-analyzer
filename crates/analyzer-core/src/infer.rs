@@ -53,6 +53,39 @@ pub(crate) fn type_node_kind(ty: &compactp_ast::Type) -> TyKind {
     }
 }
 
+/// Resolution-aware type lowering: primitives/sequences via the pure
+/// [`type_node_kind`], a named (struct/enum) `Type::Ref` via the resolution-fed
+/// [`crate::db::named_type_ty`] so it becomes nominal (`TyKind::Struct`/`Enum`).
+/// Callers that only need primitive/sequence lowering keep calling
+/// `type_node_kind` directly; this is the entry a caller uses where a named type
+/// must become nominal (param typing for `expr_ty`, wired in a later task).
+/// Mirrors the resolution-fed `(db, file, src, fd, ws, …)` parameter shape (the
+/// brief's sketch omitted `fd`, but `named_type_ty`/`resolve_query` require it).
+///
+/// A `Type::Ref` with no name token, or one that does not resolve to a
+/// struct/enum decl, lowers to `Unknown` (suppress, never guess).
+///
+/// First consumed by v2b.9 Task 3's `expr_ty` (param / const-annotation /
+/// callee-return typing).
+pub(crate) fn type_kind_resolved(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: crate::db::FileDeps,
+    ws: crate::db::Workspace,
+    ty: &compactp_ast::Type,
+) -> TyKind {
+    match ty {
+        compactp_ast::Type::Ref(r) => match r.name() {
+            Some(name_tok) => {
+                crate::db::named_type_ty(db, file, src, fd, ws, name_tok.text_range().start())
+            }
+            None => TyKind::Unknown,
+        },
+        _ => type_node_kind(ty),
+    }
+}
+
 /// Parse a `Uint` size or an integer-literal token's text to a `u128`.
 /// Accepts decimal, `0x`/`0X` hex, `0o`/`0O` octal, and `0b`/`0B` binary.
 /// `None` if the text is not a plain integer literal (e.g. a generic numeric
@@ -541,6 +574,26 @@ impl crate::AnalysisHost {
             diags.retain(|d| !ranges.iter().any(|r| r.contains_range(d.primary_span)));
         }
         diags
+    }
+
+    /// The `TyKind` of the expression at `offset` in `file`, or `None` when the
+    /// position is unmodeled/`Unknown`. IDE-facing entry consumed by v2c (typed
+    /// member completion, inlay hints, signature-help detail): the IDE renders
+    /// it via `display_kind`/`ty_display` and enumerates `Struct.fields`.
+    /// Resolution-fed, so — like the other resolution bridges — it indexes the
+    /// file to materialize its dependency edges, provisions the salsa inputs,
+    /// and hands off to the tracked `crate::db::expr_ty`. `Unknown` is projected
+    /// to `None` so callers get a value only when the checker actually modeled
+    /// the expression.
+    pub fn type_at(&mut self, file: crate::FileId, offset: text_size::TextSize) -> Option<TyKind> {
+        let src = self.src_of(file)?;
+        self.ensure_indexed(file);
+        let fd = self.file_deps(file);
+        let ws = self.workspace();
+        match crate::db::expr_ty(self.db_ref(), file, src, fd, ws, offset) {
+            TyKind::Unknown => None,
+            kind => Some(kind),
+        }
     }
 }
 

@@ -1,0 +1,3 @@
+struct S { a: Field; }
+struct T { s: S; }
+export circuit c(t: T): Field { return t.s.a; }

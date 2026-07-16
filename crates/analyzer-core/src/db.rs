@@ -864,6 +864,515 @@ fn item_symbol(
     item_tree(db, tsrc).symbols.get(index as usize).cloned()
 }
 
+/// Maximum nominal-lowering recursion depth. A struct-field chain deeper than
+/// this lowers the over-deep reference to `TyKind::Unknown` (suppress, never a
+/// false positive). Belt-and-suspenders alongside the `visited`-set cycle
+/// guard: `visited` already bounds recursion to the number of *distinct* struct
+/// names on the active path, but a pathological deep-but-acyclic chain is capped
+/// here too.
+const MAX_NOMINAL_DEPTH: usize = 32;
+
+/// Lowers the struct/enum type-name token at `name_offset` in `file` to its
+/// nominal `TyKind`, by resolving the name to a `Struct`/`Enum` decl and reading
+/// its child fields/variants from the target file's item tree. Returns
+/// `TyKind::Unknown` when the name does not resolve to a struct/enum decl
+/// (suppress, never guess) — this preserves never-a-false-positive. This query
+/// can only *widen* what the typing layer can attribute (an `Unknown` result
+/// suppresses downstream rules). Resolution-fed, mirroring `callee_sig`'s
+/// `(file, src, fd, ws, offset)` parameter shape.
+///
+/// Recursion/cycle safety is load-bearing: a struct whose field (transitively)
+/// references its own type must not loop. The recursion runs in the plain,
+/// non-tracked helper [`lower_named_at`] carrying an explicit `visited` set of
+/// struct names (the `&mut Vec` cannot be a salsa key), exactly as
+/// `resolve_includes` carries its `active` guard. A back-edge to a name already
+/// on the active path — and any reference past [`MAX_NOMINAL_DEPTH`] — lowers to
+/// `TyKind::Unknown`.
+#[salsa::tracked(returns(clone))]
+pub(crate) fn named_type_ty(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    name_offset: text_size::TextSize,
+) -> crate::ty::TyKind {
+    let mut visited: Vec<Arc<str>> = Vec::new();
+    lower_named_at(db, file, src, fd, ws, name_offset, &mut visited)
+}
+
+/// Recursive nominal lowering carrying an explicit `visited` set of struct names
+/// so a self- or mutually-recursive struct can't loop. Plain `db`-taking helper
+/// (NOT a tracked query) — the `&mut Vec` guard can't be a salsa key — mirroring
+/// `resolve_includes`. `(file, src, fd)` are the resolution context in which
+/// `name_offset` lives; after resolving to a decl in `def_file`, the struct's
+/// *own* field-type names are resolved in `def_file`'s context.
+fn lower_named_at(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    name_offset: text_size::TextSize,
+    visited: &mut Vec<Arc<str>>,
+) -> crate::ty::TyKind {
+    use crate::ty::TyKind;
+    // Over-deep chain -> suppress (belt-and-suspenders with the `visited` guard).
+    if visited.len() >= MAX_NOMINAL_DEPTH {
+        return TyKind::Unknown;
+    }
+    // 1. Resolve the type-name token to its decl.
+    let Some(crate::Definition::Item {
+        file: def_file,
+        index,
+    }) = resolve_query(db, file, src, fd, ws, name_offset)
+    else {
+        return TyKind::Unknown; // unresolved, or a local/generic-param -> suppress
+    };
+    // 2. Read the decl's Symbol from the *target* file's item tree.
+    let Some(dsrc) = source_text_for(db, def_file, file, src, ws) else {
+        return TyKind::Unknown;
+    };
+    let dtree = item_tree(db, dsrc);
+    let Some(sym) = dtree.symbols.get(index as usize).cloned() else {
+        return TyKind::Unknown;
+    };
+    match sym.kind {
+        // 3a. Struct: lower each `StructField` child's declared type.
+        crate::SymbolKind::Struct => {
+            let name: Arc<str> = Arc::from(sym.name.as_str());
+            // Back-edge: this struct is already being lowered on the active
+            // path -> break the cycle by suppressing this reference.
+            if visited.iter().any(|n| **n == *name) {
+                return TyKind::Unknown;
+            }
+            let dfd = deps_for(db, def_file, file, fd, ws);
+            visited.push(name.clone());
+            let fields = build_struct_fields(db, def_file, dsrc, dfd, ws, sym.name_range, visited);
+            visited.pop();
+            TyKind::Struct { name, fields }
+        }
+        // 3b. Enum: collect `EnumVariant` child names.
+        crate::SymbolKind::Enum => {
+            let name: Arc<str> = Arc::from(sym.name.as_str());
+            let variants: Vec<Arc<str>> = dtree
+                .children_of(index)
+                .filter(|(_, s)| s.kind == crate::SymbolKind::EnumVariant)
+                .map(|(_, s)| Arc::<str>::from(s.name.as_str()))
+                .collect();
+            TyKind::Enum {
+                name,
+                variants: Arc::from(variants),
+            }
+        }
+        // Any other decl (type alias, ledger, circuit, …) -> not nominal here.
+        _ => TyKind::Unknown,
+    }
+}
+
+/// The `(field-name, field-TyKind)` list of the struct whose name token spans
+/// `struct_name_range` in `dsrc`. Field types are lowered in `def_file`'s
+/// resolution context ([`lower_type_in`]); a struct-typed field recurses through
+/// [`lower_named_at`] under the shared `visited` guard.
+#[allow(clippy::too_many_arguments)]
+fn build_struct_fields(
+    db: &dyn Db,
+    def_file: crate::FileId,
+    dsrc: SourceText,
+    dfd: Option<FileDeps>,
+    ws: Workspace,
+    struct_name_range: text_size::TextRange,
+    visited: &mut Vec<Arc<str>>,
+) -> Arc<[(Arc<str>, crate::ty::TyKind)]> {
+    use compactp_ast::AstNode;
+    let root = compactp_syntax::SyntaxNode::new_root(crate::db::parsed(db, dsrc).green);
+    let Some(sdef) = root
+        .descendants()
+        .filter_map(compactp_ast::StructDef::cast)
+        .find(|s| s.name().map(|n| n.text_range()) == Some(struct_name_range))
+    else {
+        return Arc::from(Vec::new());
+    };
+    let fields: Vec<(Arc<str>, crate::ty::TyKind)> = sdef
+        .fields()
+        .filter_map(|f| {
+            let fname = f.name()?;
+            let fkind = f
+                .ty()
+                .map(|t| lower_type_in(db, def_file, dsrc, dfd, ws, &t, visited))
+                .unwrap_or(crate::ty::TyKind::Unknown);
+            Some((Arc::<str>::from(fname.text()), fkind))
+        })
+        .collect();
+    Arc::from(fields)
+}
+
+/// Lowers a CST `Type` in `def_file`'s context. Primitives/sequences go through
+/// the pure `type_node_kind`; a named `Type::Ref` recurses through
+/// [`lower_named_at`] so a struct/enum-typed field becomes nominal. A named
+/// field type with no available resolution context (`dfd == None`: a cross-file
+/// target whose deps were not published) suppresses to `Unknown` (never guess).
+fn lower_type_in(
+    db: &dyn Db,
+    def_file: crate::FileId,
+    dsrc: SourceText,
+    dfd: Option<FileDeps>,
+    ws: Workspace,
+    ty: &compactp_ast::Type,
+    visited: &mut Vec<Arc<str>>,
+) -> crate::ty::TyKind {
+    match ty {
+        compactp_ast::Type::Ref(r) => {
+            let (Some(name_tok), Some(dfd)) = (r.name(), dfd) else {
+                return crate::ty::TyKind::Unknown;
+            };
+            lower_named_at(
+                db,
+                def_file,
+                dsrc,
+                dfd,
+                ws,
+                name_tok.text_range().start(),
+                visited,
+            )
+        }
+        // Primitives, Uint/Bytes, and tuple/vector sequences: pure lowering.
+        // (Named types nested inside a tuple/vector element lower to `Unknown`
+        // via `type_node_kind` — a safe widening limitation, not this task's
+        // scope.)
+        _ => crate::infer::type_node_kind(ty),
+    }
+}
+
+/// The `FileDeps` for `target` in the current resolution context: the caller's
+/// own `fd` when `target` is the current file, else the workspace-published
+/// per-file deps (needed to resolve a *cross-file* struct's own field-type
+/// names). `None` when `target` has no published deps — callers suppress named
+/// field lowering in that case.
+fn deps_for(
+    db: &dyn Db,
+    target: crate::FileId,
+    this_file: crate::FileId,
+    this_fd: FileDeps,
+    ws: Workspace,
+) -> Option<FileDeps> {
+    if target == this_file {
+        Some(this_fd)
+    } else {
+        ws.file_deps(db).get(&target).copied()
+    }
+}
+
+/// Types the innermost expression enclosing `offset` in `file`, returning its
+/// `TyKind` — or `TyKind::Unknown` for every unmodeled / unresolved / uncertain
+/// case (never a guess). IDE-only (no diagnostics): the `AnalysisHost::type_at`
+/// bridge surfaces this for typed member completion, inlay hints, and
+/// signature-help detail (v2c). Resolution-fed, mirroring `named_type_ty`'s
+/// `(file, src, fd, ws, offset)` parameter shape.
+///
+/// Recursion — an identifier through its initializer (`const x = expr`), and a
+/// member/receiver chain (`a.b.c`) — runs in the plain helper [`type_expr`]
+/// carrying an explicit `depth` counter, capped at [`MAX_NOMINAL_DEPTH`]: a
+/// cycle (`const a = b; const b = a;`) or an over-deep chain lowers to
+/// `TyKind::Unknown` (safe false-negative). Named (struct/enum) types flow
+/// through [`crate::infer::type_kind_resolved`] → [`named_type_ty`], which
+/// carries its own nominal-lowering cycle guard.
+#[salsa::tracked(returns(clone))]
+pub(crate) fn expr_ty(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    offset: text_size::TextSize,
+) -> crate::ty::TyKind {
+    let green = crate::db::parsed(db, src).green;
+    let root = compactp_syntax::SyntaxNode::new_root(green);
+    match enclosing_expr(&root, offset) {
+        Some(expr) => type_expr(db, file, src, fd, ws, &expr, 0),
+        None => crate::ty::TyKind::Unknown,
+    }
+}
+
+/// The innermost `Expr` node enclosing `offset`: the token at `offset` (or its
+/// left neighbor at a between-token boundary, biasing to an `IDENT` on the
+/// right), then the nearest `Expr` ancestor. `None` when no expression encloses
+/// the position. Clamps `offset` to end-of-file so a stale/out-of-range offset
+/// can never panic `token_at_offset` (mirrors `resolve::anchor_token`).
+fn enclosing_expr(
+    root: &compactp_syntax::SyntaxNode,
+    offset: text_size::TextSize,
+) -> Option<compactp_ast::expr::Expr> {
+    use compactp_ast::AstNode;
+    use rowan::TokenAtOffset;
+    let offset = offset.min(root.text_range().end());
+    let token = match root.token_at_offset(offset) {
+        TokenAtOffset::None => return None,
+        TokenAtOffset::Single(t) => t,
+        TokenAtOffset::Between(l, r) => {
+            if r.kind() == compactp_syntax::SyntaxKind::IDENT {
+                r
+            } else {
+                l
+            }
+        }
+    };
+    token
+        .parent()?
+        .ancestors()
+        .find_map(compactp_ast::expr::Expr::cast)
+}
+
+/// Recursively types `expr` in `file`'s resolution context, capped at
+/// [`MAX_NOMINAL_DEPTH`] hops (identifier→initializer, member-receiver chains).
+/// A plain `db`-taking helper (NOT tracked): the `depth` guard breaks
+/// initializer cycles that a tracked, offset-keyed recursion would turn into a
+/// salsa cycle. Every arm the checker does not model returns `TyKind::Unknown`.
+fn type_expr(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    expr: &compactp_ast::expr::Expr,
+    depth: usize,
+) -> crate::ty::TyKind {
+    use crate::ty::TyKind;
+    use compactp_ast::AstNode;
+    use compactp_ast::expr::Expr;
+
+    if depth >= MAX_NOMINAL_DEPTH {
+        return TyKind::Unknown; // over-deep chain / cycle -> suppress
+    }
+    match expr {
+        // Literal / cast / array: the pure, single-file typing (existing).
+        Expr::Literal(_) | Expr::Cast(_) | Expr::Array(_) => crate::infer::expr_ty_kind(expr),
+        // Identifier reference: resolve, then type the definition.
+        Expr::Name(n) => {
+            let Some(ident) = n.ident() else {
+                return TyKind::Unknown;
+            };
+            let off = ident.text_range().start();
+            let Some(def) = resolve_query(db, file, src, fd, ws, off) else {
+                return TyKind::Unknown;
+            };
+            type_of_definition(db, file, src, fd, ws, &def, depth)
+        }
+        // Member access `recv.field`: type the receiver; if it is a struct with
+        // that field, yield the field's type, else suppress.
+        Expr::Member(m) => {
+            let Some(recv) = m.syntax().children().find_map(Expr::cast) else {
+                return TyKind::Unknown;
+            };
+            let TyKind::Struct { fields, .. } = type_expr(db, file, src, fd, ws, &recv, depth + 1)
+            else {
+                return TyKind::Unknown;
+            };
+            let Some(field) = m.field() else {
+                return TyKind::Unknown;
+            };
+            let fname = field.text();
+            fields
+                .iter()
+                .find(|(n, _)| n.as_ref() == fname)
+                .map(|(_, k)| k.clone())
+                .unwrap_or(TyKind::Unknown)
+        }
+        // Call `callee(args)`: the callee's declared return type.
+        Expr::Call(c) => callee_return_ty(db, file, src, fd, ws, c),
+        _ => TyKind::Unknown,
+    }
+}
+
+/// Types a resolved [`crate::Definition`] as a *value*. An item declaration
+/// (struct/enum type, circuit/witness, ledger field, …) is not a modeled value
+/// here → `Unknown`. A same-file local (param / `const`) is typed by
+/// [`local_binding_ty`]; a cross-file local (never produced today) → `Unknown`.
+fn type_of_definition(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    def: &crate::Definition,
+    depth: usize,
+) -> crate::ty::TyKind {
+    match def {
+        crate::Definition::Item { .. } => crate::ty::TyKind::Unknown,
+        crate::Definition::Local {
+            file: lf,
+            name_range,
+            ..
+        } => {
+            if *lf != file {
+                return crate::ty::TyKind::Unknown; // cross-file local -> suppress
+            }
+            local_binding_ty(db, file, src, fd, ws, *name_range, depth)
+        }
+    }
+}
+
+/// Types the local binding whose name token spans `name_range`: a simple
+/// identifier circuit/lambda parameter → its declared `Type` annotation
+/// ([`crate::infer::type_kind_resolved`]); a simple identifier `const` →
+/// its annotation, else (bounded) recursion into its initializer. A
+/// *destructuring* param/const binds a field or element (not the whole
+/// annotated type), so those suppress to `Unknown` (never guess) — matching
+/// `infer::circuit_param_name`'s discipline. A `for`-loop / lambda-untyped
+/// binding has no modeled type → `Unknown`.
+fn local_binding_ty(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    name_range: text_size::TextRange,
+    depth: usize,
+) -> crate::ty::TyKind {
+    use crate::ty::TyKind;
+    use compactp_syntax::SyntaxKind;
+
+    let root = compactp_syntax::SyntaxNode::new_root(crate::db::parsed(db, src).green);
+    let start = match root.covering_element(name_range) {
+        rowan::NodeOrToken::Token(t) => t.parent(),
+        rowan::NodeOrToken::Node(n) => Some(n),
+    };
+    let Some(start) = start else {
+        return TyKind::Unknown;
+    };
+    // The binding site's IDENT must be a *simple* identifier pattern for the
+    // whole-binding type to apply.
+    let simple_ident = |pat: Option<compactp_ast::Pat>| -> bool {
+        matches!(
+            pat,
+            Some(compactp_ast::Pat::Ident(ref id))
+                if id.name().map(|t| t.text_range()) == Some(name_range)
+        )
+    };
+    for anc in start.ancestors() {
+        match anc.kind() {
+            SyntaxKind::PARAM => {
+                let Some(p) = compactp_ast::Param::cast(anc.clone()) else {
+                    return TyKind::Unknown;
+                };
+                if !simple_ident(p.pattern()) {
+                    return TyKind::Unknown; // destructuring param -> field, not param type
+                }
+                return p
+                    .ty()
+                    .map(|t| crate::infer::type_kind_resolved(db, file, src, fd, ws, &t))
+                    .unwrap_or(TyKind::Unknown);
+            }
+            SyntaxKind::CONST_STMT => {
+                let Some(c) = compactp_ast::ConstStmt::cast(anc.clone()) else {
+                    return TyKind::Unknown;
+                };
+                if !simple_ident(c.pattern()) {
+                    return TyKind::Unknown; // destructuring const -> element, not init type
+                }
+                // `const x: T = …` -> the annotation; else the initializer.
+                if let Some(ty) = c.ty() {
+                    return crate::infer::type_kind_resolved(db, file, src, fd, ws, &ty);
+                }
+                return match c.value() {
+                    Some(val) => type_expr(db, file, src, fd, ws, &val, depth + 1),
+                    None => TyKind::Unknown,
+                };
+            }
+            _ => {}
+        }
+    }
+    TyKind::Unknown
+}
+
+/// The declared return type of the plain (non-method) call `call`'s callee,
+/// lowered in `file`'s context. `Some` only when the callee resolves to a
+/// **same-file**, **non-generic**, **unique** `Circuit`/`Witness` — the same
+/// overload- and cross-file-safe restriction `callee_sig` applies, so a return
+/// type is attributed only when it is unambiguous. Every other case (method
+/// call, unresolved callee, overload set, generic callee, cross-file callee,
+/// absent return annotation) → `Unknown`.
+fn callee_return_ty(
+    db: &dyn Db,
+    file: crate::FileId,
+    src: SourceText,
+    fd: FileDeps,
+    ws: Workspace,
+    call: &compactp_ast::expr::CallExpr,
+) -> crate::ty::TyKind {
+    use crate::ty::TyKind;
+    use compactp_ast::AstNode;
+
+    // A method call (`recv.method(args)`, a DOT child) resolves by receiver
+    // type — out of scope here.
+    let has_dot = call
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .any(|t| t.kind() == compactp_syntax::SyntaxKind::DOT);
+    if has_dot {
+        return TyKind::Unknown;
+    }
+    let Some(name_tok) = call.name() else {
+        return TyKind::Unknown;
+    };
+    let Some(crate::Definition::Item { file: df, index }) =
+        resolve_query(db, file, src, fd, ws, name_tok.text_range().start())
+    else {
+        return TyKind::Unknown;
+    };
+    if df != file {
+        return TyKind::Unknown; // cross-file callee: return type needs its own ctx -> suppress
+    }
+    let Some(sym) = item_symbol(db, file, src, fd, df, index) else {
+        return TyKind::Unknown;
+    };
+    if !matches!(
+        sym.kind,
+        crate::SymbolKind::Circuit | crate::SymbolKind::Witness
+    ) {
+        return TyKind::Unknown;
+    }
+    if sym.generic_param_count > 0 {
+        return TyKind::Unknown; // generic callee: return type may be `T` -> suppress
+    }
+    // Uniqueness: an overload set has an ambiguous return type -> suppress.
+    let tree = item_tree(db, src);
+    let same_name_callables = tree
+        .symbols
+        .iter()
+        .filter(|s| {
+            s.name == sym.name
+                && matches!(
+                    s.kind,
+                    crate::SymbolKind::Circuit | crate::SymbolKind::Witness
+                )
+        })
+        .count();
+    if same_name_callables != 1 {
+        return TyKind::Unknown;
+    }
+    // Read the declared return type from the decl node and lower it.
+    let root = compactp_syntax::SyntaxNode::new_root(crate::db::parsed(db, src).green);
+    let ret_ty = match sym.kind {
+        crate::SymbolKind::Circuit => root
+            .descendants()
+            .filter_map(compactp_ast::CircuitDef::cast)
+            .find(|c| c.name().map(|n| n.text_range()) == Some(sym.name_range))
+            .and_then(|c| c.return_type()),
+        crate::SymbolKind::Witness => root
+            .descendants()
+            .filter_map(compactp_ast::WitnessDecl::cast)
+            .find(|w| w.name().map(|n| n.text_range()) == Some(sym.name_range))
+            .and_then(|w| w.return_type()),
+        _ => None,
+    };
+    match ret_ty {
+        Some(t) => crate::infer::type_kind_resolved(db, file, src, fd, ws, &t),
+        None => TyKind::Unknown,
+    }
+}
+
 /// The generic-arity mismatch diagnostic (`E3003`). Wording tracks compactc's
 /// ("mismatch between actual number A and declared number D of generic
 /// parameters for Name"); wording is not gated by the harness.
@@ -1648,6 +2157,116 @@ mod tests {
     }
 
     #[test]
+    fn named_type_lowers_struct_to_nominal() {
+        use crate::ty::TyKind;
+        let db = CompactDatabase::default();
+        let text =
+            "struct S { a: Field; b: Boolean; }\nexport circuit c(s: S): Boolean { return s.b; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = Workspace::new(
+            &db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        let file = crate::FileId::from_raw_for_test(0);
+        // Offset of the `S` type-name token in `s: S` (unique `": S"` slice).
+        let off = text.find(": S").expect("`: S` present") + 2;
+        let kind = named_type_ty(&db, file, src, fd, ws, (off as u32).into());
+        assert_eq!(
+            kind,
+            TyKind::Struct {
+                name: Arc::from("S"),
+                fields: Arc::from(vec![
+                    (Arc::<str>::from("a"), TyKind::Field),
+                    (Arc::<str>::from("b"), TyKind::Boolean),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn named_type_lowers_enum_to_nominal() {
+        use crate::ty::TyKind;
+        let db = CompactDatabase::default();
+        let text = "enum E { A, B }\nexport circuit c(e: E): E { return e; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = Workspace::new(
+            &db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        let file = crate::FileId::from_raw_for_test(0);
+        let off = text.find(": E").expect("`: E` present") + 2;
+        let kind = named_type_ty(&db, file, src, fd, ws, (off as u32).into());
+        assert_eq!(
+            kind,
+            TyKind::Enum {
+                name: Arc::from("E"),
+                variants: Arc::from(vec![Arc::<str>::from("A"), Arc::<str>::from("B")]),
+            }
+        );
+    }
+
+    #[test]
+    fn named_type_self_referential_struct_terminates() {
+        // A struct whose field references its own type must not infinitely
+        // recurse: the back-edge lowers to `Unknown`. `Node` here holds a
+        // `next: Node` — the outer type is `Struct{name:"Node", ...}` with the
+        // self-field's kind suppressed to `Unknown`.
+        use crate::ty::TyKind;
+        let db = CompactDatabase::default();
+        let text = "struct Node { v: Field; next: Node; }\nexport circuit c(n: Node): Field { return n.v; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = Workspace::new(
+            &db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        let file = crate::FileId::from_raw_for_test(0);
+        let off = text.find(": Node").expect("`: Node` present") + 2;
+        let kind = named_type_ty(&db, file, src, fd, ws, (off as u32).into());
+        assert_eq!(
+            kind,
+            TyKind::Struct {
+                name: Arc::from("Node"),
+                fields: Arc::from(vec![
+                    (Arc::<str>::from("v"), TyKind::Field),
+                    (Arc::<str>::from("next"), TyKind::Unknown),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn named_type_unresolved_is_unknown() {
+        // A name that does not resolve to a struct/enum decl -> Unknown (never
+        // guess). Here `Nope` has no declaration.
+        use crate::ty::TyKind;
+        let db = CompactDatabase::default();
+        let text = "export circuit c(x: Nope): Field { return 0; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = Workspace::new(
+            &db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        let file = crate::FileId::from_raw_for_test(0);
+        let off = text.find(": Nope").expect("`: Nope` present") + 2;
+        assert_eq!(
+            named_type_ty(&db, file, src, fd, ws, (off as u32).into()),
+            TyKind::Unknown
+        );
+    }
+
+    #[test]
     fn generic_typeref_arity_is_checked() {
         use crate::AnalysisHost;
         use std::path::Path;
@@ -1692,6 +2311,294 @@ mod tests {
         // Unresolved name suppresses (never a false positive).
         assert!(
             diags("export circuit m(): Nope<Field> { return default<Nope<Field>>; }").is_empty()
+        );
+    }
+
+    // ---- v2b.9 Task 3: expr_ty (expression-at-offset typing) ----
+
+    /// Empty resolution context (no deps, no stdlib, empty workspace maps) for
+    /// single-file `expr_ty` tests — mirrors the `named_type_ty` test setup.
+    fn empty_ctx(db: &CompactDatabase) -> (FileDeps, Workspace) {
+        let fd = FileDeps::new(db, Arc::from(Vec::new()));
+        let ws = Workspace::new(
+            db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        (fd, ws)
+    }
+
+    fn s_struct() -> crate::ty::TyKind {
+        crate::ty::TyKind::Struct {
+            name: Arc::from("S"),
+            fields: Arc::from(vec![
+                (Arc::<str>::from("a"), crate::ty::TyKind::Field),
+                (Arc::<str>::from("b"), crate::ty::TyKind::Boolean),
+            ]),
+        }
+    }
+
+    /// CARRIED-FORWARD (Task 3 review): pins the `MAX_NOMINAL_DEPTH` guard in
+    /// [`type_expr`]'s local-const recursion (`depth >= MAX_NOMINAL_DEPTH ->
+    /// Unknown`), which was traced-correct but had no direct test.
+    ///
+    /// Two constructions, both asserted never to panic/hang and to yield
+    /// `Unknown`.
+    ///
+    /// Construction 1 is the literal textual "mutual cycle" `const a = b;
+    /// const b = a;`. Verified (by inspection of
+    /// `resolve::collect_scope_bindings`'s `BLOCK` arm) that block-local
+    /// `const` visibility is *sequential*: a binding is only in scope at a
+    /// *later* offset than its own statement's end. So `b`'s reference inside
+    /// `a`'s initializer sits textually BEFORE `const b`'s own declaration
+    /// and is never visible there — this construction actually bottoms out
+    /// via ordinary unresolved-name suppression (depth 1), not the depth
+    /// counter. Kept as a regression fixture anyway (a mutual-looking cycle
+    /// must never panic/hang), but it does NOT alone exercise the cap.
+    ///
+    /// Construction 2 is a genuine 39-hop acyclic chain (`const a0 = 0; const
+    /// a1 = a0; ... const a39 = a38;`), which — since each hop resolves
+    /// successfully (every reference is to a *prior*, in-scope binding) —
+    /// actually drives `depth` past `MAX_NOMINAL_DEPTH` (32) and hits the cap
+    /// directly. This is the real regression for the guard: sequential local
+    /// scoping alone cannot produce a resolvable local cycle, so a long chain
+    /// is the only way to reach the cap through this path (mirrors how
+    /// self-referential *struct* cycles — reachable, since named-type lookup
+    /// is order-independent — are covered separately by `named_type_ty`'s own
+    /// `visited` guard).
+    #[test]
+    fn expr_ty_local_chain_and_pseudo_cycle_terminate_via_depth_cap() {
+        let db = CompactDatabase::default();
+        let (fd, ws) = empty_ctx(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+
+        // 1. Textual "mutual cycle" — never visible both ways, but must not
+        // panic/hang, and must suppress to Unknown.
+        let text = "export circuit c(): Field { const a = b; const b = a; return a; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let off = text.find("return a").unwrap() + "return ".len();
+        assert_eq!(
+            expr_ty(&db, file, src, fd, ws, (off as u32).into()),
+            crate::ty::TyKind::Unknown
+        );
+
+        // 2. Genuine 39-hop chain (> MAX_NOMINAL_DEPTH = 32): every hop
+        // resolves, so this actually drives `depth` into the cap.
+        let mut chain = String::from("export circuit c2(): Field { const a0 = 0; ");
+        for i in 1..40 {
+            chain.push_str(&format!("const a{i} = a{}; ", i - 1));
+        }
+        chain.push_str("return a39; }");
+        let src2 = SourceText::new(&db, Arc::from(chain.clone()));
+        let off2 = chain.find("return a39").unwrap() + "return ".len();
+        assert_eq!(
+            expr_ty(&db, file, src2, fd, ws, (off2 as u32).into()),
+            crate::ty::TyKind::Unknown
+        );
+    }
+
+    #[test]
+    fn expr_ty_identifier_param_types_to_struct() {
+        let db = CompactDatabase::default();
+        let text =
+            "struct S { a: Field; b: Boolean; }\nexport circuit c(s: S): Field { return s.a; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let (fd, ws) = empty_ctx(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+        // Receiver `s` in `return s.a`: a NAME_EXPR referencing the param.
+        let off = text.find("return s.a").unwrap() + "return ".len();
+        assert_eq!(
+            expr_ty(&db, file, src, fd, ws, (off as u32).into()),
+            s_struct()
+        );
+    }
+
+    #[test]
+    fn expr_ty_member_types_to_field() {
+        let db = CompactDatabase::default();
+        let text =
+            "struct S { a: Field; b: Boolean; }\nexport circuit c(s: S): Field { return s.a; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let (fd, ws) = empty_ctx(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+        // The `a` in `s.a`: MEMBER_EXPR -> field `a` of struct S -> Field.
+        let off = text.find("return s.a").unwrap() + "return ".len() + 2;
+        assert_eq!(
+            expr_ty(&db, file, src, fd, ws, (off as u32).into()),
+            crate::ty::TyKind::Field
+        );
+        // The `b` field would be Boolean; sanity-check field selection is real.
+        let text2 =
+            "struct S { a: Field; b: Boolean; }\nexport circuit c(s: S): Boolean { return s.b; }";
+        let src2 = SourceText::new(&db, Arc::from(text2));
+        let off2 = text2.find("return s.b").unwrap() + "return ".len() + 2;
+        assert_eq!(
+            expr_ty(&db, file, src2, fd, ws, (off2 as u32).into()),
+            crate::ty::TyKind::Boolean
+        );
+    }
+
+    #[test]
+    fn expr_ty_call_result_types_to_return_and_flows_through_const() {
+        let db = CompactDatabase::default();
+        let text = "struct S { a: Field; b: Boolean; }\n\
+             circuit mk(): S { return S { a: 0, b: false }; }\n\
+             export circuit c(): Field { const s = mk(); return s.a; }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let (fd, ws) = empty_ctx(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+        // `mk()` call result -> declared return type S.
+        let off = text.find("= mk()").unwrap() + 2;
+        assert_eq!(
+            expr_ty(&db, file, src, fd, ws, (off as u32).into()),
+            s_struct()
+        );
+        // const-flow + member: `s.a` where `const s = mk()` (S) -> field a -> Field.
+        let off2 = text.find("return s.a").unwrap() + "return ".len() + 2;
+        assert_eq!(
+            expr_ty(&db, file, src, fd, ws, (off2 as u32).into()),
+            crate::ty::TyKind::Field
+        );
+    }
+
+    #[test]
+    fn expr_ty_unmodeled_is_unknown() {
+        let db = CompactDatabase::default();
+        // A generic-circuit call: its declared return type is `T` (a generic
+        // param), so native must suppress to Unknown (never guess).
+        let text = "circuit gen<T>(x: T): T { return x; }\n\
+             export circuit c(): Field { return gen<Field>(0); }";
+        let src = SourceText::new(&db, Arc::from(text));
+        let (fd, ws) = empty_ctx(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+        let off = text.find("gen<Field>").unwrap();
+        assert_eq!(
+            expr_ty(&db, file, src, fd, ws, (off as u32).into()),
+            crate::ty::TyKind::Unknown
+        );
+        // A binary expression is not modeled -> Unknown. The offset targets the
+        // `+` operator so the enclosing expr is the BINARY_EXPR itself (an offset
+        // on the `1` operand would correctly type that *literal*, not the sum).
+        let text2 = "export circuit c(): Field { return 1 + 2; }";
+        let src2 = SourceText::new(&db, Arc::from(text2));
+        let off2 = text2.find("+ 2").unwrap();
+        assert_eq!(
+            expr_ty(&db, file, src2, fd, ws, (off2 as u32).into()),
+            crate::ty::TyKind::Unknown
+        );
+    }
+
+    /// CARRIED-FORWARD (Task 2 review): first real coverage of `named_type_ty`'s
+    /// cross-file struct-field lowering. The struct `S` is declared in a
+    /// DIFFERENT file (`Lib.compact`), imported into `main.compact`, and a member
+    /// access `s.a` (where `s: S`) must type to `Field` — exercising cross-file
+    /// resolution + field lowering end-to-end through the host `type_at` bridge.
+    #[test]
+    fn expr_ty_cross_file_struct_member_types_to_field() {
+        use crate::ty::TyKind;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Lib.compact"),
+            "module Lib { export struct S { a: Field; b: Boolean; } }",
+        )
+        .unwrap();
+        let main_src = "import Lib;\nexport circuit c(s: S): Field { return s.a; }";
+        let main_path = dir.path().join("main.compact");
+        std::fs::write(&main_path, main_src).unwrap();
+
+        let mut host = crate::AnalysisHost::new();
+        let file = host.vfs_mut().file_id(&main_path);
+        host.vfs_mut().set_overlay(file, main_src.to_string(), 1);
+
+        // Sanity: the cross-file type reference resolves at all.
+        let s_off = main_src.find("s: S").unwrap() + 3;
+        assert!(
+            host.resolve(crate::FilePosition {
+                file,
+                offset: (s_off as u32).into(),
+            })
+            .is_some(),
+            "cross-file struct reference `S` must resolve"
+        );
+
+        // The member `s.a` -> field `a` of the cross-file struct S -> Field.
+        let off = main_src.find("return s.a").unwrap() + "return ".len() + 2;
+        assert_eq!(
+            host.type_at(file, (off as u32).into()),
+            Some(TyKind::Field),
+            "cross-file struct member `s.a` must type to Field"
+        );
+    }
+
+    /// CARRIED-FORWARD (Task 3 review): the `include`-based cross-file arm,
+    /// with a *nested* named field — a struct field whose own type is itself
+    /// a struct reached across the include boundary. The prior cross-file
+    /// test above (Task 3) used `import` and an all-primitive struct, so its
+    /// `dfd = deps_for(...)` in `named_type_ty` (db.rs) was computed but
+    /// never actually dereferenced (`lower_type_in`'s `Type::Ref` arm, the
+    /// only consumer, is never reached by a primitive field). `include` is
+    /// required here, not `import`: `AnalysisHost::ensure_indexed` only
+    /// walks `is_include` edges to index a target file (publishing its own
+    /// `FileDeps` into the workspace map), so only an `include`d target gets
+    /// an entry `deps_for`'s cross-file branch (`ws.file_deps(db).get(&target)`)
+    /// can find; a plain `import` target is never indexed this way and
+    /// `deps_for` would return `None` there, suppressing the nested field to
+    /// `Unknown` instead.
+    ///
+    /// `T` (struct, in `Lib.compact`, `include`d from `main.compact`) has a
+    /// field `s: S` where `S` is itself a struct (also in `Lib.compact`).
+    /// Building `T`'s fields recurses into `lower_named_at` for `S`, which
+    /// calls `deps_for` a SECOND time (this time with `target == this_file`,
+    /// the same-file `Some` arm) — so this test exercises `deps_for`'s
+    /// cross-file `Some` branch at the *outer* hop (resolving `T` itself from
+    /// `main.compact`) in a way that is actually load-bearing for the result,
+    /// unlike Task 3's primitive-only fixture.
+    #[test]
+    fn expr_ty_cross_file_include_nested_struct_member_types_to_field() {
+        use crate::ty::TyKind;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Lib.compact"),
+            "struct S { a: Field; }\nstruct T { s: S; }",
+        )
+        .unwrap();
+        let main_src = "include \"Lib\";\nexport circuit c(t: T): Field { return t.s.a; }";
+        let main_path = dir.path().join("main.compact");
+        std::fs::write(&main_path, main_src).unwrap();
+
+        let mut host = crate::AnalysisHost::new();
+        let file = host.vfs_mut().file_id(&main_path);
+        host.vfs_mut().set_overlay(file, main_src.to_string(), 1);
+
+        // Sanity: the cross-file (include) type reference resolves at all.
+        let t_off = main_src.find("t: T").unwrap() + 3;
+        assert!(
+            host.resolve(crate::FilePosition {
+                file,
+                offset: (t_off as u32).into(),
+            })
+            .is_some(),
+            "include-based cross-file struct reference `T` must resolve"
+        );
+
+        // `t.s` -> the nested cross-file struct field -> Struct S.
+        let s_off = main_src.find("return t.s.a").unwrap() + "return t.".len();
+        assert_eq!(
+            host.type_at(file, (s_off as u32).into()),
+            Some(TyKind::Struct {
+                name: Arc::from("S"),
+                fields: Arc::from(vec![(Arc::<str>::from("a"), TyKind::Field)]),
+            }),
+            "include-based nested field `t.s` must type to Struct S"
+        );
+
+        // `t.s.a` -> field `a` of the nested cross-file struct S -> Field.
+        let a_off = main_src.find("return t.s.a").unwrap() + "return t.s.".len();
+        assert_eq!(
+            host.type_at(file, (a_off as u32).into()),
+            Some(TyKind::Field),
+            "include-based nested cross-file struct member `t.s.a` must type to Field"
         );
     }
 }

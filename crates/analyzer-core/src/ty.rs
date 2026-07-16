@@ -43,6 +43,21 @@ pub enum TyKind {
     /// to the homogeneous n-element tuple. A non-literal or overflowing size
     /// lowers to `Unknown` upstream, so `n` is always a real `u32` here.
     Vector(u32, Arc<TyKind>),
+    /// A nominal `struct` type: its declared name plus its ordered
+    /// `(field-name, field-type)` list. Assignability is nominal (same name),
+    /// verified against compactc — a differently-named struct of identical
+    /// shape is NOT assignable. Fields carry types so member access can type
+    /// `s.field` (v2c). An unresolvable struct reference lowers to `Unknown`.
+    Struct {
+        name: Arc<str>,
+        fields: Arc<[(Arc<str>, TyKind)]>,
+    },
+    /// A nominal `enum` type: its declared name plus its ordered variant names.
+    /// Displays as `Enum<Name, V0, V1, …>` (verified). Nominal assignability.
+    Enum {
+        name: Arc<str>,
+        variants: Arc<[Arc<str>]>,
+    },
 }
 
 /// A salsa-interned type id. Under `#[salsa::interned]` this is `Ty<'db>` with
@@ -88,6 +103,16 @@ pub(crate) fn display_kind(kind: &TyKind) -> String {
             format!("[{inner}]")
         }
         TyKind::Vector(n, elem) => format!("Vector<{n}, {}>", display_kind(elem)),
+        TyKind::Struct { name, .. } => name.to_string(),
+        TyKind::Enum { name, variants } => {
+            let mut out = format!("Enum<{name}");
+            for v in variants.iter() {
+                out.push_str(", ");
+                out.push_str(v);
+            }
+            out.push('>');
+            out
+        }
     }
 }
 
@@ -110,6 +135,10 @@ pub(crate) fn is_subtype(sub: &TyKind, sup: &TyKind) -> bool {
         (TyKind::Tuple(_) | TyKind::Vector(_, _), TyKind::Tuple(_) | TyKind::Vector(_, _)) => {
             seq_subtype(sub, sup)
         }
+        // Nominal: structs assignable iff same name (compactc is nominal — a
+        // differently-named struct of identical shape is not assignable, Step 1).
+        (TyKind::Struct { name: a, .. }, TyKind::Struct { name: b, .. }) => a == b,
+        (TyKind::Enum { name: a, .. }, TyKind::Enum { name: b, .. }) => a == b,
         // Everything else (Boolean/Field/Uint cross, Field->Uint, Bytes
         // cross-kind) is unrelated.
         _ => false,
@@ -407,5 +436,54 @@ mod tests {
         // A sequence is unrelated to a scalar.
         assert!(!is_subtype(&tup(vec![u8k()]), &u8k()));
         assert!(!is_subtype(&u8k(), &vec(1, u8k())));
+    }
+
+    #[test]
+    fn struct_display_is_its_name() {
+        let s = TyKind::Struct {
+            name: Arc::from("S"),
+            fields: Arc::from([(Arc::<str>::from("a"), TyKind::Field)]),
+        };
+        assert_eq!(display_kind(&s), "S");
+    }
+
+    #[test]
+    fn enum_display_lists_variants() {
+        let e = TyKind::Enum {
+            name: Arc::from("E"),
+            variants: Arc::from([Arc::<str>::from("A"), Arc::<str>::from("B")]),
+        };
+        assert_eq!(display_kind(&e), "Enum<E, A, B>");
+    }
+
+    #[test]
+    fn struct_subtype_is_nominal_same_name() {
+        let s1 = TyKind::Struct {
+            name: Arc::from("S"),
+            fields: Arc::from([(Arc::<str>::from("a"), TyKind::Field)]),
+        };
+        let s2 = s1.clone();
+        let other = TyKind::Struct {
+            name: Arc::from("T"),
+            fields: Arc::from([(Arc::<str>::from("a"), TyKind::Field)]),
+        };
+        assert!(is_subtype(&s1, &s2));
+        assert!(!is_subtype(&s1, &other)); // nominal: different name -> not assignable
+        assert!(is_subtype(&s1, &TyKind::Unknown)); // Unknown always suppresses
+    }
+
+    #[test]
+    fn enum_subtype_is_nominal_same_name() {
+        let e1 = TyKind::Enum {
+            name: Arc::from("E"),
+            variants: Arc::from([Arc::<str>::from("A")]),
+        };
+        let e2 = e1.clone();
+        let f = TyKind::Enum {
+            name: Arc::from("F"),
+            variants: Arc::from([Arc::<str>::from("A")]),
+        };
+        assert!(is_subtype(&e1, &e2));
+        assert!(!is_subtype(&e1, &f));
     }
 }

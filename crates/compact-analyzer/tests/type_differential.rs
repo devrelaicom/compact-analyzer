@@ -260,7 +260,71 @@ const FIXTURES: &[Fixture] = &[
         native_rejects: false,
         rule: "witness-circuit-signature",
     },
+    Fixture {
+        name: "nom_field_access_ok.compact",
+        native_rejects: false,
+        rule: "nominal-expr-typing",
+    },
+    Fixture {
+        name: "nom_nested_field_ok.compact",
+        native_rejects: false,
+        rule: "nominal-expr-typing",
+    },
+    Fixture {
+        name: "nom_enum_value_ok.compact",
+        native_rejects: false,
+        rule: "nominal-expr-typing",
+    },
 ];
+
+/// Fixtures whose live `compactc` verdict is REJECT but the native checker
+/// currently stays silent — documented, corpus-safe false negatives, NOT
+/// entries in [`FIXTURES`]. `expr_ty`/`type_at` (v2b.9) type a struct member
+/// access like `s.a`, but that query is IDE-only: `type_diagnostics_query`'s
+/// return-mismatch check (`E3001`, `infer::circuit_returns`) only models
+/// `return` operands that are a literal, cast, or array — a `Member` or
+/// identifier operand is skipped entirely, so a mismatched/bad-field member
+/// access flowing through a `return` (directly or via a `const`) is never
+/// flagged. `FIXTURES`' `native_rejects` flag drives BOTH the native
+/// assertion and (when the toolchain is present) the live bidirectional
+/// cross-check, so it cannot express this asymmetric (native: accept,
+/// compactc: reject) case — pinned in its own test instead. Wiring member-
+/// access typing into the diagnostics surface is out of scope for v2b.9 (the
+/// plan delivers the typing *query* for v2c, not new diagnostic surface);
+/// these are new inference surface for a future task, and a false negative
+/// is always safe (never breaks the `corpus_no_false_positives` gate).
+const NOMINAL_SAFE_FALSE_NEGATIVES: &[&str] = &[
+    "nom_field_access_mismatch.compact",
+    "nom_const_flow_mismatch.compact",
+    "nom_bad_field.compact",
+];
+
+#[test]
+fn nominal_safe_false_negatives_native_silent_compactc_rejects() {
+    let dir = fixtures_dir();
+    let tc = Toolchain::discover(None);
+    for name in NOMINAL_SAFE_FALSE_NEGATIVES {
+        let path = dir.join(name);
+        let text = std::fs::read_to_string(&path).expect("fixture readable");
+
+        assert!(
+            !native_rejects(&text, &path),
+            "[nominal-expr-typing] expected native to stay silent (documented false \
+             negative) on {name}"
+        );
+
+        if let Some(tc) = &tc {
+            let verdict = compiler_verdict(tc, &path);
+            assert_eq!(
+                verdict,
+                CompilerVerdict::RejectPostParse,
+                "[nominal-expr-typing] compactc verdict for {name}"
+            );
+        } else {
+            eprintln!("type_differential: compactc absent; skipped live cross-check for {name}");
+        }
+    }
+}
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/type")

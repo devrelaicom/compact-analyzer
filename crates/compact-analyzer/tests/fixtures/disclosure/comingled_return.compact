@@ -1,0 +1,7 @@
+pragma language_version >= 0.23;
+
+witness getW(): Uint<8>;
+
+export circuit f(x: Uint<8>): [Uint<8>, Uint<8>] {
+  return [x, getW()];
+}

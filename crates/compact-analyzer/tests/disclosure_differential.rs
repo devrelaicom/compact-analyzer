@@ -8,11 +8,15 @@
 //! gate over the corpus. Both self-skip cleanly when the toolchain / corpus
 //! is absent.
 //!
-//! This is a **no-op baseline** (Task R1): the native side
-//! (`AnalysisHost::disclosure_diagnostics`) is stubbed to always return empty
-//! until Task A1 lands the interpreter, and `FIXTURES` is empty until Task R2
-//! adds fixtures. The harness must still compile and pass green so v3a has a
-//! stable RED/GREEN gate to work against.
+//! This is a **green pending-flip baseline** (Task R2): the native side
+//! (`AnalysisHost::disclosure_diagnostics`) is still stubbed to always return
+//! empty until Task A1 lands the interpreter, but `FIXTURES` now carries one
+//! compiler-validated fixture per WPP rule from the R0 index. Each fixture
+//! tracks two verdicts: `discloses` (compactc's ground truth, validated here
+//! against real `compactc`) and `native_confirms` (the current native
+//! verdict, `false` for every fixture until each v3a task flips its own).
+//! The harness must compile and pass green so v3a has a stable RED->GREEN
+//! gate to work against.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -66,16 +70,75 @@ fn compiler_discloses(tc: &Toolchain, source: &Path) -> Option<bool> {
 
 struct Fixture {
     name: &'static str,
-    /// Expected native verdict (rule-tagged expectation, captured from compactc).
-    native_discloses: bool,
-    /// The rule this fixture pins.
     rule: &'static str,
+    /// compactc's ground-truth WPP verdict (validated against real compactc).
+    discloses: bool,
+    /// Whether the CURRENT native analyzer emits a confirmed E-leak.
+    /// Starts false (native is a no-op); each v3a task flips its fixtures.
+    native_confirms: bool,
 }
 
-/// Empty until Task R2 lands fixtures. The native side is a deliberate
-/// no-op (Task R1's whole point): the fixtures are what v3a then turns
-/// RED -> GREEN.
-const FIXTURES: &[Fixture] = &[];
+/// Rule-tagged fixtures pinning each WPP rule from the R0 index
+/// (`docs/superpowers/plans/2026-07-16-v3-wpp-rules-index.md`), authored and
+/// compiler-validated by Task R2. `discloses` is compactc's real WPP
+/// verdict; `native_confirms` is `false` for every fixture (native is still
+/// a no-op) until v3a's interpreter tasks flip them one by one.
+const FIXTURES: &[Fixture] = &[
+    Fixture {
+        name: "ledger_leak.compact",
+        rule: "K1 ledger sink",
+        discloses: true,
+        native_confirms: false,
+    },
+    Fixture {
+        name: "ledger_disclosed.compact",
+        rule: "K1 ledger sink + D1 disclose sanitizer",
+        discloses: false,
+        native_confirms: false,
+    },
+    Fixture {
+        name: "return_witness_leak.compact",
+        rule: "K7 return asymmetry (witness-return leaks)",
+        discloses: true,
+        native_confirms: false,
+    },
+    Fixture {
+        name: "return_arg_ok.compact",
+        rule: "K7 return asymmetry (circuit-arg does not leak)",
+        discloses: false,
+        native_confirms: false,
+    },
+    Fixture {
+        name: "implicit_flow_leak.compact",
+        rule: "K2 implicit flow at ledger sink",
+        discloses: true,
+        native_confirms: false,
+    },
+    Fixture {
+        name: "implicit_flow_disclosed.compact",
+        rule: "K2 implicit flow + D1 disclose sanitizer",
+        discloses: false,
+        native_confirms: false,
+    },
+    Fixture {
+        name: "hash_then_leak.compact",
+        rule: "D2 hashing is not a sanitizer",
+        discloses: true,
+        native_confirms: false,
+    },
+    Fixture {
+        name: "constructor_arg_leak.compact",
+        rule: "S2 constructor-argument source",
+        discloses: true,
+        native_confirms: false,
+    },
+    Fixture {
+        name: "comingled_return.compact",
+        rule: "K7 asymmetry edge case (co-mingled return)",
+        discloses: true,
+        native_confirms: false,
+    },
+];
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/disclosure")
@@ -100,24 +163,24 @@ fn rule_tagged_disclosure_fixtures() {
         let path = dir.join(fx.name);
         let text = std::fs::read_to_string(&path).expect("fixture readable");
 
-        // Native side: must match the captured expectation.
+        // Native side: must match the CURRENT native-confirms expectation.
         let got = native_discloses(&text, &path);
         assert_eq!(
             got,
-            fx.native_discloses,
+            fx.native_confirms,
             "[{}] native verdict for {} (rule {})",
-            if got { "disclose" } else { "silent" },
+            if got { "confirm" } else { "silent" },
             fx.name,
             fx.rule
         );
 
-        // Live cross-check (only when the toolchain is present): the native
-        // disclose/silent verdict must match compactc's WPP-banner verdict.
+        // Live cross-check (only when the toolchain is present): compactc's
+        // real WPP verdict must match the fixture's validated `discloses`.
         // Wording/span are NOT compared.
         if let Some(tc) = &tc {
             match compiler_discloses(tc, &path) {
                 Some(discloses) => assert_eq!(
-                    discloses, fx.native_discloses,
+                    discloses, fx.discloses,
                     "compactc disclosure verdict for {} (rule {})",
                     fx.name, fx.rule
                 ),

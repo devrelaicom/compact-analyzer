@@ -1,13 +1,45 @@
 # v3 — Native Disclosure Analysis (program design)
 
-> **Status:** Committed + decomposed (2026-07-16). **Revision 2** (2026-07-16) — incorporates a
+> **Status:** Committed + decomposed (2026-07-16). **Revision 2.1** (2026-07-16, version
+> correction) — see the banner immediately below. **Revision 2** (2026-07-16) incorporated a
 > four-agent design review (2× compact-dev, 2× security-reviewer) and a five-agent source
-> verification pass. Every WPP claim below was CONFIRMED against `LFDT-Minokawa/compact`
-> `compiler/analysis-passes.ss` `track-witness-data` at commit `03da643` (main, file last
-> modified 2026-07-06); the review-driven corrections are folded in and marked. See §10.
+> verification pass.
+>
+> ---
+>
+> > ### ⚠️ Revision 2.1 — pinned-commit correction (2026-07-16)
+> >
+> > Revision 2 was verified against commit **`03da643`**, which is in fact **Toolchain 0.33.107 /
+> > language 0.25.102** — an unreleased dev revision ~2 minor versions AHEAD of the **0.31.1** the
+> > analyzer actually targets and differential-tests against. The correct 0.31.1 source is tag
+> > **`compactc-v0.31.1`** = commit **`0da5b0452eb0c1053d42418bf34b12cc29c7d63e`** (`compiler 0 31 1`
+> > / `language 0 23 0`, confirmed via `compiler-version.ss`/`language-version.ss` at that ref).
+> >
+> > **Authoritative 0.31.1 ground truth is now the extracted rule index:**
+> > `docs/superpowers/plans/2026-07-16-v3-wpp-rules-index.md` (Task R0, ~40 rules, each with a
+> > `0da5b045` source anchor + verbatim nature string). Where a §3 table below carries a `03da643`
+> > line number, that anchor is 0.33-derived — **trust the R0 index's line anchors, not the table's**,
+> > for implementation.
+> >
+> > **Three substantive 0.31.1 differences from Rev-2 (decided: target 0.31.1):**
+> > 1. **`emit` sink does NOT exist in 0.31.1.** Events/`emit` landed in PR #470 the day *after* the
+> >    0.31.1 release. Every "emit" sink row below is a **version-gated FUTURE sink** — spec'd, but
+> >    out of scope for v3 until the analyzer targets a compiler with events. Not implemented, not
+> >    fixture-pinned in v3-R/v3a.
+> > 2. **`contract-call` is NOT gated on `pure?`** in the 0.31.1 WPP: it records leaks
+> >    unconditionally (`analysis-passes.ss:5542`); purity only marks the *calling* circuit in the
+> >    earlier `identify-pure-circuits` pass — it does not gate the sink. (Low impact: v3a defers
+> >    contract-call to a v3b amber advisory regardless.)
+> > 3. A ledger op-arg with **no** `discloses` clause defaults to `""`, which is **truthy** in the
+> >    WPP's `when discloses?` test (`ledger.ss:147`) — so ordinary Cell/Counter/Map/Set/List/
+> >    MerkleTree writes leak witnesses despite carrying no annotation. (This confirms, not
+> >    contradicts, §3.2's "Public ledger" row.)
+>
+> ---
 >
 > This is the program-level design for the full v3 flagship. It supersedes the lean context in
-> `.superpowers/milestones/v3-disclosure-analysis.md` — treat this document as truth.
+> `.superpowers/milestones/v3-disclosure-analysis.md` — treat this document as truth (as corrected
+> by the Revision 2.1 banner above and the R0 index).
 >
 > **Decomposed** (research-first, then vertical) into: **v3-R** (extract the compiler's
 > disclosure pass + build the `compactc`-differential harness) → **v3a** (intraprocedural
@@ -55,8 +87,9 @@ delegating semantics to the compiler.
 ## 2. Why
 
 Disclosure errors are Compact's hardest and most privacy-critical error class: witness-derived
-data reaching a public sink (ledger write/update, exported-circuit return, **event `emit`**,
-impure cross-contract call) must be explicitly acknowledged with `disclose()`, or the compiler
+data reaching a public sink (ledger write/update, exported-circuit return, cross-contract call —
+plus **event `emit`** once the analyzer targets a compiler with events, §Rev-2.1) must be
+explicitly acknowledged with `disclose()`, or the compiler
 rejects the program. Today a developer discovers these only at compile-on-save (M4), one save at
 a time, as a textual path in an error message. Live analysis with clickable source→sink paths and
 a one-click `disclose()` fix turns the language's most confusing error into its best-supported one.
@@ -70,9 +103,11 @@ Disclosure analysis depends on the two prior programs, which is why it is sequen
 
 ## 3. Ground truth — the compiler's WPP (extracted from source; every claim source-verified)
 
-**Source of truth:** `compiler/analysis-passes.ss`, pass `track-witness-data` (defined ~L4974), in
-`LFDT-Minokawa/compact` at commit `03da643` (compiler 0.31.x / language 0.23.0 — the tag v2/v2b
-pin; v3-R re-confirms the exact tag before any rule is trusted). Cross-referenced with
+**Source of truth:** `compiler/analysis-passes.ss`, pass `track-witness-data`, in
+`LFDT-Minokawa/compact` at tag **`compactc-v0.31.1`** = commit **`0da5b045`** (compiler 0.31.1 /
+language 0.23.0 — re-confirmed by v3-R/Task R0; the earlier `03da643` pin was 0.33.107, see the
+Rev-2.1 banner). The extracted **R0 rule index** carries the authoritative per-rule line anchors
+for this commit; the line numbers in the tables below are pre-correction 0.33 anchors. Cross-referenced with
 `compiler/natives.ss`, `compiler/ledger.ss`, `compiler/midnight-natives.ss`,
 `doc/compact-reference.mdx`, and `CHANGELOG_compactc.md` (PM-15585). Line numbers below are
 anchors as of that commit.
@@ -108,14 +143,15 @@ reaches one of these. Note there are **two independent leaks at every sink**: on
 | Sink | Gate | Data nature-string | Control nature-string | Source note |
 |---|---|---|---|---|
 | **Public ledger** write/update/op | per-arg `discloses?` on the ledger ADT op (§3.6) | "ledger operation" | "performing this ledger operation" | all 3 sources |
-| **Event `emit`** (`(emit src type abs)`, ~L5612-5619) | **unconditional** | "emit operation" | "performing this emit operation" | all 3 sources |
-| **Exported-circuit return** (`(return …)`, ~L5860-5881) | only when the enclosing fn is a disclosing root | "the value returned from exported circuit `<f>`" | "returning this value from exported circuit `<f>`" | **witness-returns only** (asymmetry below) |
-| **Cross-contract call** (`(contract-call …)`, ~L5837-5858) | **`(unless pure? …)`** — only *impure* calls | "contract call contract reference" (the callee ref) + "contract call argument `<n>`" (each arg) | "making this contract call" | all 3 sources |
+| **Event `emit`** — ⚠️ **NOT PRESENT in 0.31.1** (Rev-2.1); version-gated future sink | *(n/a in 0.31.1)* | "emit operation" | "performing this emit operation" | all 3 sources |
+| **Exported-circuit return** (`(return …)`, R0 anchor `5561`/`5573`) | only when the enclosing fn is a disclosing root | "the value returned from exported circuit `<f>`" | "returning this value from exported circuit `<f>`" | **witness-returns only** (asymmetry below) |
+| **Cross-contract call** (`(contract-call …)`, R0 anchor `5542`-`5550`) | **unconditional** in 0.31.1 (Rev-2.1: NOT `pure?`-gated); v3a defers this sink → amber advisory | "contract call contract reference" (the callee ref) + "contract call argument `<n>`" (each arg) | "making this contract call" | all 3 sources |
 
-**Rev-2 corrections vs Rev-1:** `emit` was **missing** (a whole sink class → guaranteed false
-negative); cross-contract calls are **conditional on `pure?`** (a pure call is *not* a sink — Rev-1
-said unconditional, a false-positive risk); the **contract reference itself** is a distinct sink,
-separate from each argument.
+**Corrections history:** Rev-2 vs Rev-1 flagged `emit` as a missing sink and the contract
+reference as a distinct sink separate from each argument. **Rev-2.1 (0.31.1 target)** then
+established: `emit` does not exist in 0.31.1 (version-gated future sink, out of scope for v3);
+and cross-contract calls are **unconditional**, NOT `pure?`-gated (the Rev-2 "unless pure?" claim
+was 0.33-era / incorrect for the WPP sink — purity is a separate pass). See the Rev-2.1 banner.
 
 **Source-dependent return asymmetry (verified faithful).** At the exported-circuit-return sink,
 `filter-witnesses` keeps only `Witness-Return-Value` witnesses and drops `Constructor-Argument`
@@ -338,7 +374,7 @@ contract (compile is authoritative).
 | Phase | Scope | Done-bar (all include: every unanalyzable point emits an amber advisory, never silent green) |
 |---|---|---|
 | **v3-R** | Extract the full WPP: exact per-expression rules, the native + ledger disclosure-flag **tables**, control-witness leak wording, stdlib-entry collapse, leak dedup keying. Build the `compactc`-disclosure differential harness on the corpus. **No feature/UX code.** | Harness runs green as a baseline (native absent ⇒ fixtures record only `compactc` truth); every source/sink/sanitizer/flag rule captured in a rule-tagged fixture. |
-| **v3a** | **Intraprocedural** interpreter over a single circuit body: 3 sources; **ledger + emit + exported-return sinks** (cross-contract deferred → amber advisory in v3a); `disclose()` sanitizer; §3.4 granularity; implicit-flow control-witness leaks (§3.3); native conduit vs ledger sink flags (§3.6); **intraprocedural `fold`/`abs-equal?` fixpoint** (Rev-2: this is v3a, not v3b); diagnostics + related-info path. Any call to a non-exported helper it cannot interpret through, and any unhandled form → amber advisory. | Differential agreement with `compactc` on the single-circuit corpus subset; each rule fixture-pinned; fail-closed verified (deferred sinks / unknown callees / `Unknown` types all surface amber, never green). |
+| **v3a** | **Intraprocedural** interpreter over a single circuit body: 3 sources; **ledger + exported-return sinks** (`emit` version-gated / absent in 0.31.1 per Rev-2.1; cross-contract deferred → amber advisory in v3a); `disclose()` sanitizer; §3.4 granularity; implicit-flow control-witness leaks (§3.3); native conduit vs ledger sink flags (§3.6); **intraprocedural `fold`/`abs-equal?` fixpoint** (Rev-2: this is v3a, not v3b); diagnostics + related-info path. Any call to a non-exported helper it cannot interpret through, and any unhandled form → amber advisory. | Differential agreement with `compactc` on the single-circuit corpus subset; each rule fixture-pinned; fail-closed verified (deferred sinks / unknown callees / `Unknown` types all surface amber, never green). |
 | **v3b** | **Interprocedural**: the per-call-site memoized `circuit_abstract` query (§4.2), cross-circuit propagation, the disclosing-context gate, cross-contract-call sinks. Resolve the §8 summary-shape open question (replicate per-call-site memoization or prove a coarser equivalent). | Full ~486-file corpus differential agreement (WPP verdict parity). |
 | **v3c** | **UX**: compiler-wording parity; path rendering + stdlib-collapse (display-only); `disclose()` **minimal-scope quick-fix**; `disclosureDiagnostics` toggle + one-directional merge; advisory-UX contract + transient-parse retention + version check; in-editor e2e. | e2e green (real VS Code host); toggle/merge parity; quick-fix places minimally + differential-verified; advisory wording present. |
 | **v3-M6** | The deferred M6 heavy automation tail — now **also** mirroring v3's disclosure-flag tables + WPP rule constants (with a version-compat check feeding §4.3), alongside v2b's type tables and the stdlib/ADT/stderr surfaces. | Per `m6-upstream-automation.md`; nothing auto-merges. |
@@ -372,8 +408,9 @@ contract (compile is authoritative).
 6. **Salsa staleness / async-LSP window** — the recompute-lag amber/stale state must be honestly
    surfaced (§4.3); confirm cross-file invalidation covers source-**identity** changes (a function
    flipping witness↔circuit, an added exported-circuit/constructor parameter re-seeds sources).
-7. **Pinned-tag confirmation** — v3-R re-confirms the exact compiler tag/commit and pins all
-   extraction + the §4.3 version check to it.
+7. **Pinned-tag confirmation** — ✅ **DONE by Task R0 (Rev-2.1):** the Rev-2 pin `03da643` was
+   0.33.107; corrected to tag `compactc-v0.31.1` = `0da5b045`. All extraction + the §4.3 version
+   check pin to it. This risk materialized — the confirmation caught a real mismatch.
 
 ## 9. References
 
@@ -403,10 +440,15 @@ Revision 2 folds in a four-agent design review — 2× `compact-core:compact-dev
   parse-state blanking; real-time framing eroding compile-reliance.
 - **Source verification** (4 agents via `/midnight-verify:verify-by-source`, against `03da643`):
   **all claims CONFIRMED, zero refutations**, with the nuance that the disclosing-context axis is a
-  post-lookup reprocessing gate (not a hash-key member).
+  post-lookup reprocessing gate (not a hash-key member). ⚠️ **Rev-2.1 caveat:** this pass verified
+  against `03da643` = **0.33.107**, not the 0.31.1 target — so it validated the *model shape* but
+  not the *version*. Task R0 re-extracted against the true 0.31.1 (`0da5b045`); its rule index
+  supersedes this pass for per-rule anchors, and surfaced the three 0.31.1 deltas (no `emit`;
+  contract-call unconditional; ledger empty-`discloses`⇒truthy). The model structure held.
 - **VS Code research** (1 agent): amber = `DiagnosticSeverity::WARNING`, already wired; color is
   bound to severity (4 colors max), so error-vs-unverified is red-vs-amber + `source`/`code` text.
 
-All of the above are incorporated: §0 (fail-closed), §3.2 (emit + pure gate + contract-ref),
+All of the above are incorporated: §0 (fail-closed), §3.2 (sinks + contract-ref; emit version-gated
+& contract-call unconditional per Rev-2.1),
 §3.3 (implicit-flow rewrite), §3.6 (two flag mechanisms), §3.9/§4.2 (memoization redesign),
 §4.3 (amber advisory + advisory contract + retention + minimal quick-fix + version check).

@@ -10,9 +10,11 @@
 
 ## Global Constraints
 
-- **Spec is authoritative:** `docs/superpowers/specs/2026-07-16-v3-disclosure-analysis-design.md` (Revision 2). Every §-reference below points there.
+- **Spec is authoritative:** `docs/superpowers/specs/2026-07-16-v3-disclosure-analysis-design.md` (Revision 2.1). Every §-reference below points there.
+- **Ground truth is the R0 index:** `docs/superpowers/plans/2026-07-16-v3-wpp-rules-index.md` (extracted from the true 0.31.1 source). Interpreter tasks consume it, NOT the spec's 0.33-era table line numbers.
+- **Rev-2.1 version correction (applied 2026-07-16):** target is **0.31.1** = tag `compactc-v0.31.1` = commit `0da5b045` (the earlier `03da643` pin was 0.33.107). **`emit` is OUT OF SCOPE** for v3-R/v3a — it does not exist in 0.31.1 (version-gated future sink). **`contract-call` is unconditional** (not `pure?`-gated) but is deferred to a v3a amber advisory regardless.
 - **FAIL CLOSED (spec §0):** every unanalyzable point (unhandled expr, un-interpreted callee, unknown native/ledger op, `Unknown` v2b type, deferred sink class) MUST emit an amber advisory, NEVER silent green. This is the primary correctness bar; every v3a task's done-bar includes it.
-- **Verify-first (spec §5):** every rule is extracted from `LFDT-Minokawa/compact` `compiler/analysis-passes.ss` `track-witness-data` at the pinned tag (`03da643`, re-confirm in R0) and pinned by a `compactc`-differential fixture BEFORE it is implemented. Never from training data (the training-data-unreliability rule applies doubly to disclosure).
+- **Verify-first (spec §5):** every rule is extracted from `LFDT-Minokawa/compact` `compiler/analysis-passes.ss` `track-witness-data` at the pinned tag (`compactc-v0.31.1` = `0da5b045`, confirmed in R0) and pinned by a `compactc`-differential fixture BEFORE it is implemented. Never from training data (the training-data-unreliability rule applies doubly to disclosure).
 - **No independent soundness claim:** agrees-with-`compactc` only; the differential harness is the arbiter. Wording/spans are not differentially compared (verdict only), matching `type_differential.rs`.
 - **Compact/language version:** compiler 0.31.x / language 0.23.0; `pragma language_version >= 0.23;` in new fixtures.
 - **Diagnostic code families:** confirmed disclosure leaks → `E3100`+ (`E` code family, red). Advisories → new `U3100`+ (`U` family, amber). Keep codes stable once assigned.
@@ -135,7 +137,7 @@ git commit -m "test(v3-R): compactc-disclosure differential harness (no-op basel
 
 - [ ] **Step 1: Write one accept + one reject fixture per source/sink/sanitizer rule.** Each is minimal and derived from the R0 index / corpus `examples/`. Examples (verify each expected verdict against local `compactc` in Step 2):
   - `ledger_leak.compact` (reject) / `ledger_disclosed.compact` (accept, `disclose()` added) — ledger sink, from spec §3.8's `setf` example.
-  - `emit_leak.compact` (reject) / `emit_disclosed.compact` (accept) — the emit sink (spec §3.2).
+  - ~~`emit_leak`/`emit_disclosed`~~ — **DROPPED (Rev-2.1):** `emit` does not exist in 0.31.1. Do not create these fixtures.
   - `return_witness_leak.compact` (reject) / `return_arg_ok.compact` (accept — returning a circuit arg is NOT a disclosure, §3.2 asymmetry).
   - `impure_call_leak.compact` (reject) / `pure_call_ok.compact` (accept — pure cross-contract call is not a sink, §3.2).
   - `implicit_flow_leak.compact` (reject — `if (w) { F.increment(1); }`) / `implicit_flow_disclosed.compact` (accept).
@@ -195,7 +197,7 @@ pub struct Witness {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathPoint {
     pub src: text_size::TextRange,
-    pub description: String, // e.g. "the argument to emit"
+    pub description: String, // e.g. "the argument to the ledger write"
     pub exposure: String,    // e.g. "a hash of"; "" if unmodified
 }
 
@@ -279,22 +281,23 @@ git commit -m "feat(v3a): disclosure module scaffold + Abs lattice + empty query
 - [ ] **Step 5: Run → PASS.**
 - [ ] **Step 6: Commit.** `feat(v3a): intraprocedural expr/stmt interpreter + disclose sanitizer (unhandled⇒advisory)`
 
-### Task A4: Sinks — ledger, emit, return (with asymmetry filter); confirmed-leak diagnostics
+### Task A4: Sinks — ledger, return (with asymmetry filter); confirmed-leak diagnostics
+> **Rev-2.1:** `emit` is dropped (absent in 0.31.1). This task implements the ledger and return sinks only. The `PathPoint` example wording "the argument to emit" (A1) becomes e.g. "the argument to the ledger write".
 
 **Files:** Modify: `crates/analyzer-core/src/disclosure/interp.rs`, `leaks.rs`, `mod.rs`
 
 **Interfaces:**
 - Consumes: A3 interpreter, the R0 sink rows + nature strings, the root-drained leak table.
-- Produces: `record_leak(table, src, nature, witnesses)`; sink handling for ledger write/update, `emit`, `return`; `filter_witnesses` (return asymmetry, §3.2); `LeakTable::drain() -> Vec<DisclosureLeak>`; `leak_to_diagnostic(leak) -> Diagnostic` (E3100, wording per §3.8, `secondary_spans` = source + path points).
+- Produces: `record_leak(table, src, nature, witnesses)`; sink handling for ledger write/update and `return`; `filter_witnesses` (return asymmetry, §3.2); `LeakTable::drain() -> Vec<DisclosureLeak>`; `leak_to_diagnostic(leak) -> Diagnostic` (E3100, wording per §3.8, `secondary_spans` = source + path points).
 
-- [ ] **Step 1: Read** how ledger writes / `emit` / `return` appear in the AST (statement vs expr position).
-- [ ] **Step 2: Write failing differential-backed tests:** wire `disclosure_diagnostics_query` to run the interpreter from each root and drain the table; assert the R2 fixtures `ledger_leak`, `emit_leak`, `return_witness_leak` now produce an E3100, and `return_arg_ok` does NOT (asymmetry).
+- [ ] **Step 1: Read** how ledger writes / `return` appear in the AST (statement vs expr position).
+- [ ] **Step 2: Write failing differential-backed tests:** wire `disclosure_diagnostics_query` to run the interpreter from each root and drain the table; assert the R2 fixtures `ledger_leak`, `return_witness_leak` now produce an E3100, and `return_arg_ok` does NOT (asymmetry).
 - [ ] **Step 3: Run → FAIL.**
 - [ ] **Step 4: Implement** `record_leak` (dedup by `(src, nature)`, union witnesses — §4.2), the three sinks, `filter_witnesses` (keep only `WitnessReturn` at the return sink), the leak table drain in the query, and `leak_to_diagnostic` with related-info `secondary_spans`.
 - [ ] **Step 5: Run the interpreter tests + the differential fixtures.**
 Run: `cargo test -p analyzer-core disclosure && cargo test -p compact-analyzer --test disclosure_differential --locked rule_tagged`
-Expected: `ledger_leak`/`emit_leak`/`return_witness_leak`/`constructor_arg_leak`/`hash_then_leak` GREEN; `*_ok`/`*_disclosed` accept.
-- [ ] **Step 6: Commit.** `feat(v3a): ledger/emit/return sinks + confirmed-leak diagnostics with path related-info`
+Expected: `ledger_leak`/`return_witness_leak`/`constructor_arg_leak`/`hash_then_leak` GREEN; `*_ok`/`*_disclosed` accept.
+- [ ] **Step 6: Commit.** `feat(v3a): ledger/return sinks + confirmed-leak diagnostics with path related-info`
 
 ### Task A5: Implicit flow — threaded control witnesses + separate control-leaks
 
@@ -375,7 +378,7 @@ Expected: all green.
 ## Self-Review (against spec Revision 2)
 
 - **§0 fail-closed:** A2 (Unknown type), A3 (unhandled expr), A6 (unknown native/ledger), A8 (deferred cross-contract) all emit advisories — covered. Corpus gate counts only E-family ⇒ advisories never cause false positives.
-- **§3.1 sources:** A2 seeds all three. **§3.2 sinks:** A4 (ledger/emit/return + asymmetry), A8 (cross-contract deferred⇒advisory). **§3.3 implicit flow:** A5. **§3.4 granularity:** A1/A2 `Abs`. **§3.5 sanitizer:** A1/A3 `disclose`. **§3.6 flags:** A6. **§3.9 fold fixpoint:** A7.
+- **§3.1 sources:** A2 seeds all three. **§3.2 sinks:** A4 (ledger/return + asymmetry; emit out of scope per Rev-2.1), A8 (cross-contract deferred⇒advisory). **§3.3 implicit flow:** A5. **§3.4 granularity:** A1/A2 `Abs`. **§3.5 sanitizer:** A1/A3 `disclose`. **§3.6 flags:** A6. **§3.9 fold fixpoint:** A7.
 - **§4.3 amber channel:** A8. (Advisory-UX hover copy, quick-fix, toggle, version check, transient-parse retention are **v3c** — not in this plan; correct per decomposition.)
 - **§5 differential:** R1/R2 + gates in A4/A8.
 - **Placeholder scan:** interpreter tasks (A3–A7) intentionally pin implementation to the R0 index + a fixture + an "read the as-merged AST API" step rather than inlining fabricated match arms over an unread AST — this is the repo's verify-first just-in-time discipline, not a placeholder. Every task has a concrete failing test, a named source clause, and a commit.

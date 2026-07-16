@@ -1,5 +1,6 @@
 {
   "exclude": [
-    "crates/compact-analyzer/tests/fixtures/type/"
+    "crates/compact-analyzer/tests/fixtures/type/",
+    "editors/vscode/src/test/e2e/fixture/type-error.compact"
   ]
 }

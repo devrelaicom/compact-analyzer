@@ -17,9 +17,10 @@
 //!
 //! `disclosure_diagnostics_query` (below) runs the interpreter from every root
 //! (A4): it seeds sources, walks each body, drains the leak table, and renders
-//! each confirmed leak as an `E3100` diagnostic. Accumulated advisories are NOT
-//! rendered here — that amber U-family channel is A8; the query returns only
-//! confirmed E-leaks.
+//! each confirmed leak as an `E3100` diagnostic. It also drains the
+//! accumulated fail-closed advisories (deduped by `(src, reason)`) into amber
+//! `U3100` diagnostics (A8) — so the query returns BOTH confirmed E-leaks and
+//! unverified U-advisories.
 
 mod abs;
 mod interp;
@@ -32,13 +33,16 @@ use compactp_diagnostics::{Diagnostic, DiagnosticCode};
 
 use crate::db::{Db, FileDeps, SourceText, Workspace, item_tree};
 use interp::InterpCtx;
-use leaks::{DisclosureLeak, DisclosureSink};
+use leaks::{DisclosureLeak, DisclosureSink, advisory_to_diagnostic};
 
 /// Disclosure (WPP) diagnostics for `src`: the confirmed witness-disclosure
-/// leaks (`E3100`) the intraprocedural interpreter finds. Discovers the roots
-/// (exported circuits + constructor), seeds each one's sources, walks its body
-/// into a shared leak table, then drains the table into diagnostics. Advisories
-/// are recorded but not rendered (A8).
+/// leaks (`E3100`) the intraprocedural interpreter finds, PLUS the amber
+/// fail-closed advisories (`U3100`, spec §0) it couldn't fully decide.
+/// Discovers the roots (exported circuits + constructor), seeds each one's
+/// sources, walks its body into a shared leak table + advisory set, then
+/// drains both: leaks render as `E3100` diagnostics, advisories (deduped by
+/// `(src, reason)`) render as `U3100` diagnostics. Advisories NEVER replace a
+/// confirmed leak — both channels are appended to the same returned set.
 #[salsa::tracked(returns(clone), no_eq)]
 pub fn disclosure_diagnostics_query(
     db: &dyn Db,
@@ -61,11 +65,12 @@ pub fn disclosure_diagnostics_query(
     for root in &roots {
         interp::interp_root(&base, &mut sink, root);
     }
-    let diags: Vec<Diagnostic> = sink
+    let mut diags: Vec<Diagnostic> = sink
         .drain_leaks()
         .into_iter()
         .map(leak_to_diagnostic)
         .collect();
+    diags.extend(sink.drain_advisories().iter().map(advisory_to_diagnostic));
     Arc::from(diags)
 }
 
@@ -122,5 +127,74 @@ impl crate::AnalysisHost {
         let fd = self.file_deps(file);
         let ws = self.workspace();
         disclosure_diagnostics_query(self.db_ref(), file, src, fd, ws).to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::db::CompactDatabase;
+
+    fn empty_ws(db: &CompactDatabase) -> Workspace {
+        Workspace::new(
+            db,
+            None,
+            Arc::new(std::collections::BTreeMap::new()),
+            Arc::new(std::collections::BTreeMap::new()),
+        )
+    }
+
+    /// End-to-end (A8): a module-nested `export circuit` is a fail-closed
+    /// point (A-MOD) — excluded from the root set, recording an amber
+    /// advisory rather than silently reporting no leak. The query must
+    /// render that advisory as a `U3100` diagnostic, and must NOT emit any
+    /// confirmed `E3100` leak for the ledger write inside it: an advisory
+    /// never manufactures a false E-leak, so the differential harness's
+    /// `native_discloses` (which only counts `E`-family >= 3100) stays
+    /// `false` for this file.
+    #[test]
+    fn module_nested_circuit_renders_amber_advisory_not_a_leak() {
+        let db = CompactDatabase::default();
+        let text = "import CompactStandardLibrary;\n\
+                     module M {\n\
+                     export ledger c: Field;\n\
+                     export circuit leak(x: Field): Field { c = x; return x; }\n\
+                     }\n";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = empty_ws(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+
+        let diags = disclosure_diagnostics_query(&db, file, src, fd, ws);
+
+        let e_leaks: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code.prefix == "E" && d.code.number >= 3100)
+            .collect();
+        assert!(
+            e_leaks.is_empty(),
+            "advisory must not manufacture a confirmed E-leak: {e_leaks:?}"
+        );
+
+        let advisories: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code.prefix == "U" && d.code.number == 3100)
+            .collect();
+        assert_eq!(
+            advisories.len(),
+            1,
+            "expected exactly one deduped U3100 advisory, got {diags:?}"
+        );
+        assert_eq!(
+            advisories[0].severity,
+            compactp_diagnostics::Severity::Warning
+        );
+        assert!(
+            advisories[0]
+                .message
+                .contains("module-nested circuit `leak`")
+        );
     }
 }

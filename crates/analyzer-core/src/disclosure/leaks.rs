@@ -15,6 +15,9 @@
 //! has a live non-test caller, and the A2-era file-level dead-code marker is
 //! gone.
 
+use std::collections::HashSet;
+
+use compactp_diagnostics::{Diagnostic, DiagnosticCode};
 use text_size::TextRange;
 
 use super::abs::{Witness, merge_witnesses};
@@ -71,13 +74,25 @@ impl DisclosureSink {
         });
     }
 
-    // Consumed by A8's amber advisory rendering (and this module's tests); the
-    // walk only *records* advisories (`emit_advisory`) — nothing reads them back
-    // out of a live query until A8, so this getter is dead in the non-test build
-    // until then (mirrors `abs_equal`'s A7 deferral).
+    /// A read-only peek at the accumulated advisories. Production code
+    /// (A8's query) drains via [`Self::drain_advisories`] instead; this
+    /// getter is test-only, hence dead in the non-test build.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn advisories(&self) -> &[Advisory] {
         &self.advisories
+    }
+
+    /// Drains the accumulated advisories, deduped by `(src, reason)`, leaving
+    /// the set empty. The interpreter may record the same fail-closed
+    /// advisory repeatedly at one span (e.g. re-walking a loop body) — a
+    /// flood of identical advisories at one point is noise, not signal, so
+    /// A8's query drains through here rather than `advisories()` directly.
+    pub fn drain_advisories(&mut self) -> Vec<Advisory> {
+        let mut seen = HashSet::new();
+        std::mem::take(&mut self.advisories)
+            .into_iter()
+            .filter(|a| seen.insert((a.src, a.reason.clone())))
+            .collect()
     }
 
     /// Records a confirmed leak at a sink (spec §4.2, `record-leak!`). Deduped
@@ -123,6 +138,21 @@ impl DisclosureSink {
         self.next_uid += 1;
         uid
     }
+}
+
+/// Renders one fail-closed advisory as an amber `U3100` diagnostic (spec §0).
+/// `compactp_diagnostics::Severity` has no dedicated "advisory" variant (it's
+/// an external published crate we don't own), so an advisory is
+/// `Severity::Warning` under a `U`-family code — the `U` prefix plus the
+/// distinct LSP source string (`lsp_utils::diagnostic_to_lsp`) is what marks
+/// it "unverified" rather than a real warning. No secondary spans: an
+/// advisory is a single "couldn't decide" point, not a multi-span leak trail.
+pub fn advisory_to_diagnostic(a: &Advisory) -> Diagnostic {
+    Diagnostic::warning(
+        DiagnosticCode::new("U", 3100),
+        format!("unverified: {}", a.reason),
+        a.src,
+    )
 }
 
 #[cfg(test)]
@@ -187,5 +217,42 @@ mod tests {
 
         // Drained: the table is now empty.
         assert!(sink.drain_leaks().is_empty());
+    }
+
+    #[test]
+    fn drain_advisories_dedups_by_src_and_reason() {
+        let mut sink = DisclosureSink::new();
+        let src = TextRange::empty(5.into());
+        // Same (src, reason) recorded twice (e.g. a loop body re-walked)
+        // collapses to one advisory.
+        sink.emit_advisory(src, "Unknown declared type".to_string());
+        sink.emit_advisory(src, "Unknown declared type".to_string());
+        // A different reason at the same src is a distinct advisory.
+        sink.emit_advisory(src, "unhandled expression form".to_string());
+
+        let mut advisories = sink.drain_advisories();
+        advisories.sort_by(|a, b| a.reason.cmp(&b.reason));
+        assert_eq!(advisories.len(), 2);
+        assert_eq!(advisories[0].reason, "Unknown declared type");
+        assert_eq!(advisories[1].reason, "unhandled expression form");
+
+        // Drained: the set is now empty.
+        assert!(sink.drain_advisories().is_empty());
+    }
+
+    #[test]
+    fn advisory_to_diagnostic_is_u3100_warning() {
+        let src = TextRange::empty(7.into());
+        let advisory = Advisory {
+            src,
+            reason: "Unknown declared type".to_string(),
+        };
+        let diag = advisory_to_diagnostic(&advisory);
+        assert_eq!(diag.severity, compactp_diagnostics::Severity::Warning);
+        assert_eq!(diag.code.prefix, "U");
+        assert_eq!(diag.code.number, 3100);
+        assert_eq!(diag.primary_span, src);
+        assert!(diag.message.contains("Unknown declared type"));
+        assert!(diag.secondary_spans.is_empty());
     }
 }

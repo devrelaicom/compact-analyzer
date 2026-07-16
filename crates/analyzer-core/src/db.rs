@@ -1051,6 +1051,20 @@ pub(crate) struct CalleeSig {
 /// check overload- and cross-file-safe: with a single same-file candidate there
 /// is no overload set to disambiguate, so native's verdict cannot diverge from
 /// compactc's on any accepted file.
+///
+/// Known limitation: the uniqueness check below only counts `name`-matching
+/// callables in `file`'s own `item_tree` — it does not see an
+/// import-visible callable of the same name declared in another file. So a
+/// local circuit `f` plus an *imported* `f` of a different signature is
+/// undercounted as unique here even though it is really part of a
+/// cross-file overload set. If a call site's literal argument happens to
+/// fit only the imported overload (and not the local one this function
+/// picks), native could emit a false `E3006`. This has not been shown to
+/// occur on any `compactc`-accepted input and the differential corpus (491
+/// files) is clean, so it is believed unreachable in practice — but it is
+/// unproven. Should it ever surface, the fix is to make this uniqueness
+/// check import-aware (count same-name callables visible via the file's
+/// resolved imports too, not just its own `item_tree`).
 fn callee_sig(
     db: &dyn Db,
     file: crate::FileId,

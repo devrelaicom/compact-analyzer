@@ -439,8 +439,8 @@ fn circuit_param_name(param: &compactp_ast::Param) -> Option<(String, text_size:
 }
 
 /// Push an `E3005` for the first duplicate among `params` (name, range) pairs,
-/// in declaration order. Only the first repeat is reported per signature
-/// (matches compactc, which stops at the first duplicate).
+/// in declaration order. Reports only the first duplicate per signature —
+/// whether this matches `compactc`'s own stopping behavior is unverified.
 fn check_duplicate_params(
     params: impl Iterator<Item = (String, text_size::TextRange)>,
     diags: &mut Vec<Diagnostic>,
@@ -1232,6 +1232,102 @@ mod tests {
             h3.type_diagnostics(f3)
                 .iter()
                 .all(|d| d.code.number != 3006)
+        );
+    }
+
+    /// Locks in two of `call_arg_diagnostics_query`'s (`db.rs`) safety-critical
+    /// `E3006` suppression branches — both guard the "never a false positive"
+    /// rule and were previously untested.
+    #[test]
+    fn call_arg_e3006_suppression_branches() {
+        use crate::AnalysisHost;
+        use std::path::Path;
+
+        // Branch 1 (db.rs: `actual == TyKind::Unknown -> continue`): a
+        // non-literal (param-ref) argument. `g` declares `Boolean`; the call
+        // site passes `p`, a `Uint<8>` *parameter reference* — a literal `5`
+        // here would mismatch and emit E3006, but `expr_ty_kind` on a
+        // `NAME_EXPR` (anything that isn't a literal/cast/array) returns
+        // `Unknown`, and native must suppress on `Unknown` rather than guess.
+        // Reading db.rs's `call_arg_diagnostics_query`: if the `if actual ==
+        // TyKind::Unknown { continue; }` guard (immediately after `let actual
+        // = crate::infer::expr_ty_kind(arg);`) were deleted, `actual` would
+        // stay `TyKind::Unknown` and fall into `is_subtype(&actual, param)` —
+        // `is_subtype(Unknown, Boolean)` is `false` (`Unknown` is not a
+        // declared subtype of anything in the lattice), so the diagnostic
+        // would fire and this assertion would fail.
+        let mut h1 = AnalysisHost::new();
+        let f1 = h1.vfs_mut().file_id(Path::new("/t/e3006-paramref.compact"));
+        h1.vfs_mut().set_overlay(
+            f1,
+            "circuit g(x: Boolean): Boolean { return x; }\n\
+             export circuit c(p: Uint<8>): Boolean { return g(p); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            h1.type_diagnostics(f1)
+                .iter()
+                .all(|d| d.code.number != 3006),
+            "non-literal (param-ref) argument must suppress E3006, got {:?}",
+            h1.type_diagnostics(f1)
+                .iter()
+                .map(|d| d.code.number)
+                .collect::<Vec<_>>()
+        );
+
+        // Branch 2 (db.rs: spread-in-argument-list -> suppress the whole
+        // call): a `SPREAD_EXPR` anywhere in the call's argument list makes
+        // arity indeterminate, so native must not even attempt the
+        // arg-count/per-arg checks.
+        //
+        // NOTE: a bare `...expr` cannot be written as a *direct* positional
+        // call argument under the current `compactp_parser` grammar — its
+        // `call_arg` production (`grammar/expressions.rs`) only accepts a
+        // plain `expr` or a `NAMED_ARG` (`id = expr`); the `...expr` ->
+        // `SPREAD_EXPR` production (`array_element`) is wired up only for
+        // array- and `Bytes[...]`-literal elements. Verified empirically:
+        // `g(...xs)` does not parse into a `CALL_EXPR` holding a `SPREAD_EXPR`
+        // child — `call_arg`'s `expr(p)` hits `lhs()`'s `_ => { p.error(...);
+        // None }` fallback on the leading `...` and the surrounding call
+        // recovers as a 0-argument `CALL_EXPR`, which would instead (wrongly)
+        // exercise the arg-*count*-mismatch branch, not the spread guard.
+        // So db.rs's direct `args.iter().any(|e| e.syntax().kind() ==
+        // SPREAD_EXPR)` check (over the call's *direct* argument `Expr`
+        // children) is defense-in-depth for a shape this parser's grammar
+        // does not currently produce there; it is exercised below via the
+        // one construction that *does* parse and *does* place a `SPREAD_EXPR`
+        // node under a call argument: a spread inside an array-literal
+        // argument (`h(...)` -> `h([...xs])`). This is nested one level
+        // deeper than db.rs's direct-child check, so it is actually caught by
+        // the sibling suppression in `infer::expr_ty_kind`'s `Expr::Array`
+        // arm (`arr.syntax().children().any(|c| c.kind() == SPREAD_EXPR) ->
+        // Unknown`, `infer.rs`), which then hits the same `actual ==
+        // TyKind::Unknown -> continue` as branch 1 above. If *that* array-arm
+        // spread check were deleted, `expr_ty_kind` would instead type the
+        // array as `TyKind::Tuple([Unknown])` and, since `h`'s declared
+        // `Vector<2, Boolean>` param is concretely modeled, the per-arg
+        // `is_subtype` check would very likely fail and emit E3006 — so this
+        // assertion still fails closed if that suppression regresses, even
+        // though it is not literally db.rs's whole-call `SPREAD_EXPR` guard.
+        let mut h2 = AnalysisHost::new();
+        let f2 = h2.vfs_mut().file_id(Path::new("/t/e3006-spread.compact"));
+        h2.vfs_mut().set_overlay(
+            f2,
+            "circuit h(v: Vector<2, Boolean>): Boolean { return true; }\n\
+             export circuit c(xs: Vector<2, Boolean>): Boolean { return h([...xs]); }"
+                .to_string(),
+            1,
+        );
+        assert!(
+            h2.type_diagnostics(f2)
+                .iter()
+                .all(|d| d.code.number != 3006),
+            "spread-containing argument must suppress E3006, got {:?}",
+            h2.type_diagnostics(f2)
+                .iter()
+                .map(|d| d.code.number)
+                .collect::<Vec<_>>()
         );
     }
 

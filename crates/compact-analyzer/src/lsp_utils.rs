@@ -4,8 +4,8 @@
 
 use analyzer_core::{Diagnostic, LineIndex, Severity, TextRange, TextSize};
 use lsp_types::{
-    DiagnosticRelatedInformation, DiagnosticSeverity, Location, NumberOrString, Position, Range,
-    Url,
+    CodeDescription, DiagnosticRelatedInformation, DiagnosticSeverity, Location, NumberOrString,
+    Position, Range, Url,
 };
 
 /// Extracts an absolute filesystem path from a `file://` URI.
@@ -58,6 +58,17 @@ pub(crate) fn nav_target_to_location(
     })
 }
 
+/// Stable "why unverified" href for U-family `codeDescription` — the
+/// advisory contract (spec §0: a clean editor is not a proof of privacy;
+/// compile is the authoritative gate) explained in full, one click from the
+/// diagnostic. `LazyLock` because `Url::parse` isn't `const`.
+static DISCLOSURE_ADVISORY_DOCS_URL: std::sync::LazyLock<Url> = std::sync::LazyLock::new(|| {
+    Url::parse(
+        "https://github.com/devrelaicom/compact-analyzer/blob/main/docs/disclosure-advisories.md",
+    )
+    .expect("hardcoded advisory docs URL is valid")
+});
+
 pub(crate) fn diagnostic_to_lsp(
     d: &Diagnostic,
     li: &LineIndex,
@@ -99,10 +110,19 @@ pub(crate) fn diagnostic_to_lsp(
     // analyzer-core's disclosure module A8) — a `Severity::Warning` under a
     // distinct source string, so amber advisories read visibly different
     // from a real warning even though both render as `WARNING` severity.
-    let source = if d.code.prefix == "U" {
-        "compact-analyzer (unverified)"
+    // It also gets a `codeDescription` href: the "why unverified" advisory
+    // contract (clean editor != proof of privacy; compile is authoritative)
+    // is one click away, rather than crammed into the message. E-family
+    // diagnostics are confirmed leaks, not advisories, so they carry none.
+    let (source, code_description) = if d.code.prefix == "U" {
+        (
+            "compact-analyzer (unverified)",
+            Some(CodeDescription {
+                href: DISCLOSURE_ADVISORY_DOCS_URL.clone(),
+            }),
+        )
     } else {
-        "compact-analyzer"
+        ("compact-analyzer", None)
     };
 
     lsp_types::Diagnostic {
@@ -110,6 +130,7 @@ pub(crate) fn diagnostic_to_lsp(
         severity: Some(severity),
         code: Some(NumberOrString::String(d.code.to_string())),
         source: Some(source.to_string()),
+        code_description,
         message,
         related_information,
         ..Default::default()
@@ -392,6 +413,12 @@ mod tests {
         let lsp = diagnostic_to_lsp(&advisory, &li, &uri);
         assert_eq!(lsp.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(lsp.source.as_deref(), Some("compact-analyzer (unverified)"));
+        // U-family carries a "why unverified" href so the advisory contract
+        // (clean editor != proof of privacy) is one click away.
+        let code_description = lsp
+            .code_description
+            .expect("U-family needs a codeDescription");
+        assert!(code_description.href.as_str().starts_with("https://"));
     }
 
     #[test]
@@ -406,5 +433,8 @@ mod tests {
         let lsp = diagnostic_to_lsp(&leak, &li, &uri);
         assert_eq!(lsp.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(lsp.source.as_deref(), Some("compact-analyzer"));
+        // Confirmed leaks are real errors, not advisories: no "why
+        // unverified" href to attach.
+        assert!(lsp.code_description.is_none());
     }
 }

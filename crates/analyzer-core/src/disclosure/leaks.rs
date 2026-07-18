@@ -150,7 +150,11 @@ impl DisclosureSink {
 pub fn advisory_to_diagnostic(a: &Advisory) -> Diagnostic {
     Diagnostic::warning(
         DiagnosticCode::new("U", 3100),
-        format!("unverified: {}", a.reason),
+        format!(
+            "unverified (advisory — a clean editor is not a proof of privacy; \
+             compile is authoritative): {}",
+            a.reason
+        ),
         a.src,
     )
 }
@@ -252,6 +256,10 @@ mod tests {
         assert_eq!(diag.code.prefix, "U");
         assert_eq!(diag.code.number, 3100);
         assert_eq!(diag.primary_span, src);
+        // The wrapper conveys the advisory contract: a clean editor is not a
+        // proof of privacy, compile is authoritative — not just "unverified".
+        assert!(diag.message.contains("advisory"));
+        assert!(diag.message.contains("compile is authoritative"));
         assert!(diag.message.contains("Unknown declared type"));
         assert!(diag.secondary_spans.is_empty());
     }

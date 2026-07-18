@@ -4031,4 +4031,45 @@ mod tests {
             "the leak must carry top's `secret`, flowed through the whole chain: {leaks:?}"
         );
     }
+
+    /// Ground truth (v3c C4): pins that `merge_witnesses` (R0 F2) genuinely
+    /// produces a CONSECUTIVE DUPLICATE path point in the raw leak table when
+    /// the exact same already-pathed witness is joined with itself -- here, a
+    /// `const y = getW();` used unchanged in BOTH arms of a non-constant
+    /// ternary (`1 == 2` interprets as `Abs::Atomic`, not `Abs::Boolean`, so
+    /// `interp_ternary` takes the `combine_abs` join, not the constant-fold
+    /// shortcut). Both arms are literal clones of the SAME env binding (same
+    /// uid, same one-entry path `["the binding of y"]`); `merge_witnesses`
+    /// concatenates `w1.path` with `w2.path` on the uid collision, so the
+    /// result is the exact PathPoint appearing twice, back to back.
+    ///
+    /// This is a REAL leak-table artifact of the interpreter's merge
+    /// semantics, not a rendering bug -- so the fix belongs in the DISPLAY
+    /// layer (`leak_to_diagnostic`'s consecutive-duplicate collapse), never
+    /// here: collapsing at the interp level would touch `record_leak`/the
+    /// leak table, which spec §0 forbids (display-only).
+    #[test]
+    fn ternary_same_witness_both_branches_yields_duplicate_path_point() {
+        let (leaks, _adv) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Bytes<32>;\n\
+             witness getW(): Bytes<32>;\n\
+             export circuit f(): [] {\n\
+               const y = getW();\n\
+               c = 1 == 2 ? y : y;\n\
+             }\n",
+        );
+        assert_eq!(leaks.len(), 1);
+        let path = &leaks[0].witnesses[0].path;
+        assert_eq!(
+            path.len(),
+            2,
+            "the raw leak table carries the duplicate -- collapsing it is the renderer's job: {path:?}"
+        );
+        assert_eq!(
+            path[0], path[1],
+            "the two entries are byte-for-byte identical: {path:?}"
+        );
+        assert_eq!(path[0].description, "the binding of y");
+    }
 }

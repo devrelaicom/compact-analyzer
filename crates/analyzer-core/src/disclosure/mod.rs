@@ -76,8 +76,21 @@ pub fn disclosure_diagnostics_query(
 
 /// Renders one confirmed leak as an `E3100` diagnostic (spec §3.7). The primary
 /// span is the sink; each witness contributes a secondary span at its origin,
-/// plus one per `PathPoint` on its witness->sink trail (source anchor +
-/// intermediate exposures), so the editor can walk the disclosure path.
+/// plus one per (deduped, see below) `PathPoint` on its witness->sink trail
+/// (source anchor + intermediate exposures), so the editor can walk the
+/// disclosure path. Entirely DISPLAY-ONLY: nothing here touches
+/// `record_leak`/the leak table, so the confirmed `E3100` COUNT this produces
+/// is always identical to the raw leak table's (§0).
+///
+/// Native/stdlib-collapse (v3c C4) is achieved BY CONSTRUCTION, not by any
+/// code here: stdlib/builtin primitives classify as `CalleeClass::Native`
+/// (`interp.rs`) and their bodies are NEVER walked -- natives are conduits
+/// looked up by name in a static table (`tables::native_conduit`), not
+/// interpreted ASTs -- so every `PathPoint::src` this function ever sees is
+/// already a range in the file under analysis; there is no stdlib-internal
+/// location to collapse. The plan's projected R0 K8 stdlib-entry-site
+/// remapping only becomes necessary if a future change makes the interpreter
+/// walk stdlib circuit bodies -- add that remapping here if it ever does.
 fn leak_to_diagnostic(leak: DisclosureLeak) -> Diagnostic {
     let mut diag = Diagnostic::error(
         DiagnosticCode::new("E", 3100),
@@ -86,13 +99,28 @@ fn leak_to_diagnostic(leak: DisclosureLeak) -> Diagnostic {
     );
     for w in &leak.witnesses {
         diag = diag.with_secondary(w.src, Some(witness_origin_label(&w.info)));
+        // Collapse CONSECUTIVE DUPLICATE path points (same src+description+
+        // exposure): `merge_witnesses` (abs.rs, R0 F2) concatenates two
+        // accumulated paths on a same-uid collision, which can legitimately
+        // repeat the exact same point back to back in the RAW leak table --
+        // e.g. a `const`-bound witness used unchanged in BOTH arms of a
+        // non-constant ternary joins with itself, doubling its one-entry
+        // path (pinned by
+        // `interp::tests::ternary_same_witness_both_branches_yields_duplicate_path_point`).
+        // Collapsing it here is purely cosmetic: `leak.src`/`leak.nature`/the
+        // witness SET are untouched.
+        let mut prev: Option<&abs::PathPoint> = None;
         for pp in &w.path {
+            if prev == Some(pp) {
+                continue;
+            }
             let label = if pp.exposure.is_empty() {
                 pp.description.clone()
             } else {
                 format!("{} {}", pp.exposure, pp.description)
             };
             diag = diag.with_secondary(pp.src, Some(label));
+            prev = Some(pp);
         }
     }
     diag
@@ -294,6 +322,176 @@ mod tests {
             leaks_b.len(),
             1,
             "the new CircuitArg source `p` written to the ledger must confirm a leak on recompute: {diags_b:?}"
+        );
+    }
+
+    /// Pins path-rendering fidelity + the display-only property (v3c C4) for
+    /// a multi-hop leak: the same program as
+    /// `crates/compact-analyzer/tests/fixtures/disclosure/hash_then_leak.compact`
+    /// (compiler-validated: compactc 0.31.1 REJECTs, WPP banner naming
+    /// `getW`) -- witness `getW` -> `persistentHash` N2 conduit ("a hash
+    /// of") -> ledger-write K1 sink.
+    ///
+    /// As-merged drift from the plan (see `.superpowers/sdd/task-C4-brief.md`):
+    /// the plan projected a "stdlib-collapse" of stdlib-INTERNAL path points
+    /// (R0 K8) onto their stdlib entry site. That collapse target does not
+    /// exist in the merged interpreter -- stdlib/builtin primitives classify
+    /// as `CalleeClass::Native` (see `interp::classify_callee`) and their
+    /// bodies are NEVER walked (natives are conduits looked up by name in
+    /// `tables::native_conduit`, not interpreted ASTs), so a native path
+    /// point's `src` is always the CALLING expression's own range in the file
+    /// under analysis -- there is no stdlib-internal location to ever
+    /// collapse. This test pins that property directly, plus that rendering
+    /// the path (`leak_to_diagnostic`) never changes the confirmed leak
+    /// COUNT (§0).
+    #[test]
+    fn multi_hop_path_renders_at_user_call_site_display_only() {
+        let text = "import CompactStandardLibrary;\n\
+                     export ledger c: Bytes<32>;\n\
+                     witness getW(): Bytes<32>;\n\
+                     export circuit f(): [] { c = persistentHash<Bytes<32>>(getW()); }\n";
+        let db = CompactDatabase::default();
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = empty_ws(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+
+        // -- 1. Ground truth: drain the leak table straight off the
+        // interpreter, bypassing `leak_to_diagnostic` (the rendering layer)
+        // entirely -- the same walk `disclosure_diagnostics_query` runs
+        // before it renders anything.
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let mut raw_sink = DisclosureSink::new();
+        let roots = interp::discover_roots(&base, &tree, &mut raw_sink);
+        for root in &roots {
+            interp::interp_root(&base, &mut raw_sink, root);
+        }
+        let raw_leaks = raw_sink.drain_leaks();
+        assert_eq!(
+            raw_leaks.len(),
+            1,
+            "ground-truth leak count straight off the interpreter, pre-rendering"
+        );
+
+        // -- 2. Full pipeline through `leak_to_diagnostic`: DISPLAY-ONLY
+        // (§0) means this must render the SAME count, never more or fewer.
+        let diags = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        let e_leaks: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code.prefix == "E" && d.code.number >= 3100)
+            .collect();
+        assert_eq!(
+            e_leaks.len(),
+            raw_leaks.len(),
+            "leak_to_diagnostic must not change the leak count -- rendering is display-only: {diags:?}"
+        );
+        let leak = e_leaks[0];
+
+        // -- 3. Path-rendering fidelity: one secondary span per witness
+        // ORIGIN (spec §3.7's "source anchor")...
+        assert!(
+            leak.secondary_spans
+                .iter()
+                .any(|s| s.label.as_deref() == Some("the return value of witness getW")),
+            "missing witness-origin secondary span: {:?}",
+            leak.secondary_spans
+        );
+        // ...and one per PATH POINT -- here the `persistentHash` native
+        // conduit's "a hash of" exposure.
+        let hop = leak
+            .secondary_spans
+            .iter()
+            .find(|s| {
+                s.label
+                    .as_deref()
+                    .is_some_and(|l| l.starts_with("a hash of"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing 'a hash of' native-conduit hop: {:?}",
+                    leak.secondary_spans
+                )
+            });
+        assert_eq!(
+            hop.label.as_deref(),
+            Some("a hash of the argument to persistentHash")
+        );
+
+        // -- 4. Stdlib-collapse is INHERENT: the hop's `src` resolves (once
+        // trimmed of surrounding trivia the untrimmed call-expr range may
+        // carry) to the exact user-code call expression, never a
+        // stdlib-internal location.
+        let call_text = "persistentHash<Bytes<32>>(getW())";
+        assert!(
+            text.contains(call_text),
+            "fixture must contain the call: {text:?}"
+        );
+        let hop_text = &text[usize::from(hop.span.start())..usize::from(hop.span.end())];
+        assert_eq!(
+            hop_text.trim(),
+            call_text,
+            "the conduit hop must be anchored at the user call site -- stdlib-collapse is \
+             already inherent (natives are never walked), no K8 remapping needed"
+        );
+    }
+
+    /// Pins the display-layer consecutive-duplicate-path-point collapse (v3c
+    /// C4 minimal polish). Ground truth: `const y = getW(); c = 1 == 2 ? y :
+    /// y;` -- a non-constant ternary (`1 == 2` interprets as `Abs::Atomic`,
+    /// not `Abs::Boolean`, so `interp_ternary` takes the `combine_abs` join)
+    /// joining the SAME already-pathed witness with itself. `merge_witnesses`
+    /// concatenates the two identical one-entry paths, so the RAW leak table
+    /// genuinely carries `["the binding of y", "the binding of y"]` back to
+    /// back (pinned directly in
+    /// `interp::tests::ternary_same_witness_both_branches_yields_duplicate_path_point`).
+    /// `leak_to_diagnostic` must collapse that pair to a SINGLE secondary
+    /// span while leaving the confirmed leak COUNT untouched -- rendering is
+    /// display-only (§0).
+    #[test]
+    fn consecutive_duplicate_path_point_collapses_to_one_secondary_span() {
+        let text = "import CompactStandardLibrary;\n\
+                     export ledger c: Bytes<32>;\n\
+                     witness getW(): Bytes<32>;\n\
+                     export circuit f(): [] {\n\
+                       const y = getW();\n\
+                       c = 1 == 2 ? y : y;\n\
+                     }\n";
+        let db = CompactDatabase::default();
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = empty_ws(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+
+        let diags = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        let e_leaks: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code.prefix == "E" && d.code.number >= 3100)
+            .collect();
+        assert_eq!(
+            e_leaks.len(),
+            1,
+            "the leak COUNT must be exactly one leak regardless of the duplicate path: {diags:?}"
+        );
+        let leak = e_leaks[0];
+
+        let binding_hops: Vec<_> = leak
+            .secondary_spans
+            .iter()
+            .filter(|s| s.label.as_deref() == Some("the binding of y"))
+            .collect();
+        assert_eq!(
+            binding_hops.len(),
+            1,
+            "the duplicate 'the binding of y' path point must collapse to ONE secondary span: {:?}",
+            leak.secondary_spans
         );
     }
 }

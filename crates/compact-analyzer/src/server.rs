@@ -922,18 +922,20 @@ impl GlobalState {
         }
     }
 
-    /// Assembles the full native diagnostic set for `file` — parser, resolution,
-    /// disclosure (WPP), and (when the `typeDiagnostics` config toggle is on)
-    /// type diagnostics — each converted to LSP and source-tagged (E-family
-    /// disclosure leaks and everything else get `"compact-analyzer"`; U-family
-    /// fail-closed advisories get `"compact-analyzer (unverified)"`, per
-    /// `lsp_utils::diagnostic_to_lsp`). This is the SINGLE place native
-    /// diagnostics are built, shared by the live publish path
-    /// (`publish_file_diagnostics`) and the on-save path (`did_save`), so the
-    /// two can never drift apart. Parser, resolution, and disclosure
-    /// diagnostics are always published; only the type contribution is gated.
-    /// `type_diagnostics` is already corpus-gate-green and is forwarded
-    /// verbatim (never re-filtered here) when the gate is open.
+    /// Assembles the full native diagnostic set for `file` — parser,
+    /// resolution, and (when the respective config toggle is on) disclosure
+    /// (WPP) and type diagnostics — each converted to LSP and source-tagged
+    /// (E-family disclosure leaks and everything else get
+    /// `"compact-analyzer"`; U-family fail-closed advisories get
+    /// `"compact-analyzer (unverified)"`, per `lsp_utils::diagnostic_to_lsp`).
+    /// This is the SINGLE place native diagnostics are built, shared by the
+    /// live publish path (`publish_file_diagnostics`) and the on-save path
+    /// (`did_save`), so the two can never drift apart. Parser and resolution
+    /// diagnostics are always published; the disclosure and type
+    /// contributions are each gated by their own toggle. Both
+    /// `disclosure_diagnostics` and `type_diagnostics` are already
+    /// corpus-gate-green and are forwarded verbatim (never re-filtered here)
+    /// when their gate is open.
     fn build_native_diagnostics(
         &mut self,
         file: FileId,
@@ -953,8 +955,10 @@ impl GlobalState {
         for d in self.host.resolution_diagnostics(file) {
             native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
         }
-        for d in self.host.disclosure_diagnostics(file) {
-            native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+        if self.toolchain_config.disclosure_diagnostics {
+            for d in self.host.disclosure_diagnostics(file) {
+                native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+            }
         }
         if self.toolchain_config.type_diagnostics {
             for d in self.host.type_diagnostics(file) {
@@ -1473,6 +1477,11 @@ pub(crate) struct ToolchainConfig {
     /// live native type checking; `false` = suppress them and rely on
     /// compile-on-save's `compactc` type errors. Read once at startup.
     pub type_diagnostics: bool,
+    /// Whether native disclosure (WPP) diagnostics are published. `true` =
+    /// live native disclosure analysis; `false` = suppress the channel
+    /// entirely and rely on compile-on-save's `compactc` disclosure errors.
+    /// Read once at startup.
+    pub disclosure_diagnostics: bool,
 }
 
 impl Default for ToolchainConfig {
@@ -1482,6 +1491,7 @@ impl Default for ToolchainConfig {
             compile_on_save: true,
             formatting: true,
             type_diagnostics: true,
+            disclosure_diagnostics: true,
         }
     }
 }
@@ -1502,6 +1512,9 @@ fn toolchain_config_from(options: Option<&serde_json::Value>) -> ToolchainConfig
     }
     if let Some(flag) = opts.get("typeDiagnostics").and_then(|v| v.as_bool()) {
         config.type_diagnostics = flag;
+    }
+    if let Some(flag) = opts.get("disclosureDiagnostics").and_then(|v| v.as_bool()) {
+        config.disclosure_diagnostics = flag;
     }
     config
 }
@@ -1576,6 +1589,19 @@ mod tests {
     fn toolchain_config_type_diagnostics_defaults_true() {
         assert!(toolchain_config_from(Some(&json!({}))).type_diagnostics);
         assert!(toolchain_config_from(None).type_diagnostics);
+    }
+
+    #[test]
+    fn toolchain_config_reads_disclosure_diagnostics_flag() {
+        let opts = json!({ "disclosureDiagnostics": false });
+        let config = toolchain_config_from(Some(&opts));
+        assert!(!config.disclosure_diagnostics);
+    }
+
+    #[test]
+    fn toolchain_config_disclosure_diagnostics_defaults_true() {
+        assert!(toolchain_config_from(Some(&json!({}))).disclosure_diagnostics);
+        assert!(toolchain_config_from(None).disclosure_diagnostics);
     }
 
     #[test]

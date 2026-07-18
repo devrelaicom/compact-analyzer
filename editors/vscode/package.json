@@ -97,6 +97,11 @@
           "default": true,
           "markdownDescription": "Publish native type diagnostics (as-you-type type checking) in the Problems panel, sent to the server as `initializationOptions.typeDiagnostics`. When disabled, only parse and name-resolution diagnostics are shown live and type errors are surfaced by the compiler on save (via `compileOnSave`). Changing this setting requires restarting the language server."
         },
+        "compact-analyzer.disclosureDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Publish native disclosure (WPP) diagnostics (as-you-type witness-disclosure analysis) in the Problems panel, sent to the server as `initializationOptions.disclosureDiagnostics`. When disabled, disclosure is surfaced by the compiler on save (via `compileOnSave`). Changing this setting requires restarting the language server."
+        },
         "compact-analyzer.trace.server": {
           "type": "string",
           "enum": [

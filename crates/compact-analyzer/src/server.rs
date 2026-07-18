@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use analyzer_core::{AnalysisHost, FileId, LineIndex, TextRange, TextSize, version_mismatch};
+use analyzer_core::{
+    AnalysisHost, Diagnostic, DiagnosticCode, FileId, LineIndex, TextRange, TextSize,
+    version_mismatch,
+};
 use analyzer_toolchain::{CompileOutcome, CompileStatus, Toolchain};
 use crossbeam_channel::RecvTimeoutError;
 use lsp_server::{Connection, Message, Notification, Request, Response};
@@ -988,7 +991,13 @@ impl GlobalState {
     ) -> Vec<lsp_types::Diagnostic> {
         // Cache-hit: the caller already called `self.host.analyze(file)` for
         // this same revision, so salsa returns the memoized result here.
-        let mut native: Vec<lsp_types::Diagnostic> = match self.host.analyze(file) {
+        let analysis = self.host.analyze(file);
+        // v3c C6: whether the current parse has syntax errors — drives the
+        // disclosure "paused" advisory below. `FileAnalysis::diagnostics` is
+        // exactly `compactp_parser`'s error list (see `db::parsed`), so a
+        // non-empty set here means the source doesn't parse cleanly.
+        let has_parse_errors = analysis.as_ref().is_some_and(|a| !a.diagnostics.is_empty());
+        let mut native: Vec<lsp_types::Diagnostic> = match analysis {
             Some(analysis) => analysis
                 .diagnostics
                 .iter()
@@ -1000,8 +1009,24 @@ impl GlobalState {
             native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
         }
         if self.toolchain_config.disclosure_diagnostics {
-            for d in self.host.disclosure_diagnostics(file) {
-                native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+            // §0 fail-closed applied to mid-edit: an unparseable source makes
+            // the disclosure query return an empty root set, which would
+            // otherwise blank this channel to green — read as "safe" exactly
+            // when the analysis is actually blind. Publish one stateless
+            // "paused" U-family advisory instead of the (would-be-empty)
+            // disclosure set. Retain-and-replay of the last-known
+            // diagnostics was rejected: their ranges would drift off the
+            // edited source, which is dishonest in a different way.
+            if has_parse_errors {
+                native.push(lsp_utils::diagnostic_to_lsp(
+                    &disclosure_paused_diagnostic(),
+                    line_index,
+                    uri,
+                ));
+            } else {
+                for d in self.host.disclosure_diagnostics(file) {
+                    native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+                }
             }
         }
         if self.toolchain_config.type_diagnostics {
@@ -1371,6 +1396,22 @@ fn build_compiler_diagnostics(
 /// to a specific span in the saved file.
 fn file_top_compiler_diagnostic(message: String, line_index: &LineIndex) -> lsp_types::Diagnostic {
     lsp_utils::compiler_diagnostic_to_lsp(TextRange::empty(TextSize::new(0)), message, line_index)
+}
+
+/// v3c C6's "disclosure analysis paused" advisory: a `U3100` `Diagnostic`
+/// (the same fail-closed advisory family `disclosure::leaks::advisory_to_diagnostic`
+/// uses), anchored at a zero-width range at offset 0 like
+/// [`file_top_compiler_diagnostic`] — a parse failure isn't attributable to
+/// one span, and there is nothing stale to point at (this is a fresh,
+/// stateless advisory, not a replayed prior diagnostic).
+fn disclosure_paused_diagnostic() -> Diagnostic {
+    Diagnostic::warning(
+        DiagnosticCode::new("U", 3100),
+        "disclosure analysis paused (source has syntax errors; disclosure results \
+         unavailable until fixed — compile is authoritative)"
+            .to_string(),
+        TextRange::empty(TextSize::new(0)),
+    )
 }
 
 /// Merges native diagnostics with compiler ones: all native, then every
@@ -2008,6 +2049,125 @@ mod tests {
         assert_eq!(
             merged, compiler,
             "native absence must not drop the compile-on-save diagnostic"
+        );
+    }
+
+    // --- Transient-parse retention (v3c C6) ---------------------------------
+
+    /// Pulls the single queued `textDocument/publishDiagnostics` notification's
+    /// params off `rx`, panicking if the queue holds anything else. Mirrors
+    /// `expect_show_message` above.
+    fn expect_publish(rx: &crossbeam_channel::Receiver<Message>) -> PublishDiagnosticsParams {
+        let msg = rx
+            .try_recv()
+            .expect("expected a queued publish notification");
+        let Message::Notification(not) = msg else {
+            panic!("expected a Notification, got {msg:?}");
+        };
+        assert_eq!(not.method, "textDocument/publishDiagnostics");
+        serde_json::from_value(not.params).unwrap()
+    }
+
+    /// Opens `text` as a fresh in-memory file and publishes its diagnostics
+    /// directly (bypassing the debounce timer `did_open` would otherwise
+    /// schedule), returning the published params.
+    fn open_and_publish(
+        state: &mut GlobalState,
+        rx: &crossbeam_channel::Receiver<Message>,
+        name: &str,
+        text: &str,
+    ) -> PublishDiagnosticsParams {
+        let uri = Url::from_file_path(std::env::temp_dir().join(name)).unwrap();
+        let path = lsp_utils::abs_path_from_uri(&uri).unwrap();
+        let file = state.host.vfs_mut().file_id(&path);
+        state.host.vfs_mut().set_overlay(file, text.to_string(), 1);
+        state.open_files.insert(uri, file);
+        state.host.index_file(file);
+        state.publish_file_diagnostics(file);
+        expect_publish(rx)
+    }
+
+    /// Verified leak fixture (mirrors `LEAK_FIXTURE` in the LSP integration
+    /// tests): `c = getW();` writes a witness value straight to a ledger
+    /// `Cell` -> a confirmed `E3100`.
+    const LEAK_FIXTURE: &str = "import CompactStandardLibrary;\n\
+         export ledger c: Uint<8>;\n\
+         witness getW(): Uint<8>;\n\
+         export circuit f(): [] { c = getW(); }\n";
+
+    #[test]
+    fn disclosure_paused_advisory_replaces_blank_on_parse_error() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Message>();
+        let (_keep_tx, keep_rx) = crossbeam_channel::unbounded::<Message>();
+        let mut state = GlobalState::new(tx, keep_rx);
+        assert!(state.toolchain_config.disclosure_diagnostics);
+
+        // Unparseable garbage: no valid item, so `parsed(db, src).errors` is
+        // non-empty and the disclosure query would otherwise find no roots
+        // and silently report an empty (falsely "clean") set.
+        let params = open_and_publish(&mut state, &rx, "c6_broken.compact", "@@@");
+
+        assert!(
+            !params.diagnostics.is_empty(),
+            "the channel must not blank to an empty/green set on a parse error"
+        );
+        assert!(
+            params.diagnostics.iter().any(|d| d.source.as_deref()
+                == Some("compact-analyzer (unverified)")
+                && d.message.contains("disclosure analysis paused")),
+            "expected the paused disclosure advisory, got {:#?}",
+            params.diagnostics
+        );
+    }
+
+    #[test]
+    fn disclosure_paused_advisory_absent_when_disclosure_toggle_off() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Message>();
+        let (_keep_tx, keep_rx) = crossbeam_channel::unbounded::<Message>();
+        let mut state = GlobalState::new(tx, keep_rx);
+        state.toolchain_config.disclosure_diagnostics = false;
+
+        let params = open_and_publish(&mut state, &rx, "c6_broken_off.compact", "@@@");
+
+        assert!(
+            params
+                .diagnostics
+                .iter()
+                .all(|d| d.source.as_deref() != Some("compact-analyzer (unverified)")),
+            "toggle off: no paused advisory should publish, got {:#?}",
+            params.diagnostics
+        );
+        // Parser diagnostics are never suppressed by the disclosure toggle:
+        // the real parse error still publishes.
+        assert!(
+            !params.diagnostics.is_empty(),
+            "the parse error itself must still publish with the toggle off"
+        );
+    }
+
+    #[test]
+    fn disclosure_diagnostics_unaffected_by_well_formed_source() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Message>();
+        let (_keep_tx, keep_rx) = crossbeam_channel::unbounded::<Message>();
+        let mut state = GlobalState::new(tx, keep_rx);
+
+        let params = open_and_publish(&mut state, &rx, "c6_leak.compact", LEAK_FIXTURE);
+
+        assert!(
+            params
+                .diagnostics
+                .iter()
+                .any(|d| d.code == Some(lsp_types::NumberOrString::String("E3100".to_string()))),
+            "expected the normal E3100 leak diagnostic, got {:#?}",
+            params.diagnostics
+        );
+        assert!(
+            params
+                .diagnostics
+                .iter()
+                .all(|d| !d.message.contains("disclosure analysis paused")),
+            "a well-formed source must never show the paused advisory, got {:#?}",
+            params.diagnostics
         );
     }
 }

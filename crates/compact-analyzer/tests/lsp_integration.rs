@@ -27,13 +27,18 @@ fn publishes_diagnostics_then_clears_after_fix() {
     assert_eq!(params["uri"], json!(uri));
     assert_eq!(params["version"], 1);
     let diags = params["diagnostics"].as_array().unwrap();
-    assert_eq!(diags.len(), 1);
-    assert_eq!(diags[0]["message"], "expected COLON");
-    assert_eq!(diags[0]["source"], "compact-analyzer");
-    assert_eq!(diags[0]["severity"], 1); // Error
-    assert_eq!(diags[0]["code"], "E0001");
+    // A parse error also has disclosure results unavailable (v3c C6), so this
+    // publishes alongside a paused U3100 advisory — find the parse error
+    // itself rather than assume it's the only diagnostic.
+    let parse_err = diags
+        .iter()
+        .find(|d| d["code"] == "E0001")
+        .unwrap_or_else(|| panic!("expected an E0001 parse error, got {diags:#?}"));
+    assert_eq!(parse_err["message"], "expected COLON");
+    assert_eq!(parse_err["source"], "compact-analyzer");
+    assert_eq!(parse_err["severity"], 1); // Error
     assert_eq!(
-        diags[0]["range"]["start"],
+        parse_err["range"]["start"],
         json!({"line": 0, "character": 12})
     );
 
@@ -61,9 +66,15 @@ fn positions_are_utf16_code_units() {
     did_open(&mut client, &uri, 1, "/* \u{1F600} */ ledger count Field;");
     let params = client.wait_for_notification("textDocument/publishDiagnostics");
     let diags = params["diagnostics"].as_array().unwrap();
-    assert_eq!(diags.len(), 1);
+    // A parse error also has disclosure results unavailable (v3c C6), so this
+    // publishes alongside a paused U3100 advisory — find the parse error
+    // itself rather than assume it's the only diagnostic.
+    let parse_err = diags
+        .iter()
+        .find(|d| d["code"] == "E0001")
+        .unwrap_or_else(|| panic!("expected an E0001 parse error, got {diags:#?}"));
     assert_eq!(
-        diags[0]["range"]["start"],
+        parse_err["range"]["start"],
         json!({"line": 0, "character": 21})
     );
 

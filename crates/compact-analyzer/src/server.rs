@@ -101,6 +101,15 @@ pub(crate) fn run() -> anyhow::Result<()> {
             work_done_progress_options: Default::default(),
         }),
         inlay_hint_provider: Some(lsp_types::OneOf::Left(true)),
+        // v3c C3: the `disclose()` minimal-scope quick-fix. Advertising the
+        // `QUICKFIX` kind explicitly (rather than `Simple(true)`) lets a
+        // client that only shows a chosen subset of kinds still surface it.
+        code_action_provider: Some(lsp_types::CodeActionProviderCapability::Options(
+            lsp_types::CodeActionOptions {
+                code_action_kinds: Some(vec![lsp_types::CodeActionKind::QUICKFIX]),
+                ..Default::default()
+            },
+        )),
         semantic_tokens_provider: Some(
             lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
                 lsp_types::SemanticTokensOptions {
@@ -577,6 +586,32 @@ impl GlobalState {
                                 .filter_map(|chain| build_selection(&li, &chain))
                                 .collect::<Vec<_>>(),
                         )
+                    });
+                self.respond_ok(req.id, result);
+            }
+            "textDocument/codeAction" => {
+                // v3c C3: the `disclose()` minimal-scope quick-fix. Respects
+                // the `disclosureDiagnostics` toggle (C1) — off means no
+                // disclosure diagnostics are published, so offering a fix
+                // for one would be actively misleading; empty array (not
+                // null) mirrors `format_document`'s toggle-off idiom.
+                let result = serde_json::from_value::<lsp_types::CodeActionParams>(req.params)
+                    .ok()
+                    .and_then(|params| {
+                        if !self.toolchain_config.disclosure_diagnostics {
+                            return Some(Vec::new());
+                        }
+                        let file = *self.open_files.get(&params.text_document.uri)?;
+                        let li = self.host.analyze(file)?.line_index.clone();
+                        let start = lsp_utils::offset_from_position(&li, params.range.start)?;
+                        let end = lsp_utils::offset_from_position(&li, params.range.end)?;
+                        let leaks = self.host.disclosure_diagnostics(file);
+                        Some(crate::code_action::disclosure_quickfixes(
+                            &leaks,
+                            TextRange::new(start, end),
+                            &li,
+                            &params.text_document.uri,
+                        ))
                     });
                 self.respond_ok(req.id, result);
             }

@@ -1770,14 +1770,33 @@ pub fn interp_stmt(
             [target, value] => {
                 let value_abs = interp_expr(ctx, sink, state, env, control, value);
                 if is_ledger_field(ctx, target) {
-                    let range = a.syntax().text_range();
-                    sink.record_leak(range, "ledger operation", witnesses_of(&value_abs));
+                    // v3c C3 (minimal-scope `disclose()` quick-fix): the DATA
+                    // leak's primary span is the RHS EXPRESSION's own range —
+                    // NOT `a.syntax().text_range()` (the whole `lhs = rhs;`
+                    // statement, LHS and `;` included). Differential-verified
+                    // against `compactc` 0.31.1: `c = disclose(getW());`
+                    // compiles clean; `disclose(c = getW());` (a wrap of the
+                    // whole statement) is REJECTED — the compiler re-locates
+                    // the same undisclosed value at the inner RHS. A wider
+                    // span here would let a quick-fix built on it silently
+                    // sanitize a second, unrelated leak in the same statement.
+                    let value_range = trimmed_range(value.syntax());
+                    sink.record_leak(value_range, "ledger operation", witnesses_of(&value_abs));
                     // A5 (K2): conditioning a ledger op on a witness discloses
                     // that witness as a SEPARATE control-flow leak — a distinct
                     // nature ⇒ a distinct table entry (never merged into the data
                     // leak, never tainting the written value). `record_leak`
                     // no-ops when `control` is empty (fires only when gated).
-                    sink.record_leak(range, "performing this ledger operation", control.to_vec());
+                    // Kept at the statement range: this leak has no single
+                    // wrappable value expression (the gating witness lives in
+                    // the branch condition elsewhere), so it is never offered
+                    // the `disclose()` quick-fix.
+                    let stmt_range = a.syntax().text_range();
+                    sink.record_leak(
+                        stmt_range,
+                        "performing this ledger operation",
+                        control.to_vec(),
+                    );
                 }
             }
             // Defensive (unexpected shape): realize taint, record no sink.
@@ -1808,10 +1827,25 @@ pub fn interp_stmt(
                 state.ret_ws = merge_witnesses(&state.ret_ws, &witnesses_of(val));
             }
             if let (Some(fname), Some(val)) = (ctx.disclosing_fn, &val) {
-                let range = stmt.syntax().text_range();
+                let stmt_range = stmt.syntax().text_range();
+                // v3c C3 (minimal-scope `disclose()` quick-fix): the DATA
+                // leak's primary span is the returned EXPRESSION's own range
+                // — not the whole `return expr;` statement (`return` keyword
+                // and `;` included), which is not a valid `disclose()` target
+                // and would over-wrap a second leak in the same statement.
+                // Differential-verified against `compactc` 0.31.1:
+                // `return disclose(getW());` compiles clean. Falls back to
+                // `stmt_range` only if `r.value()` is somehow `None` here,
+                // which cannot happen (this arm requires `val: Some`, and
+                // `val` is derived from `r.value()`), kept only to avoid an
+                // unreachable `unwrap`.
+                let value_range = r
+                    .value()
+                    .map(|e| trimmed_range(e.syntax()))
+                    .unwrap_or(stmt_range);
                 let filtered = filter_witnesses(&witnesses_of(val));
                 sink.record_leak(
-                    range,
+                    value_range,
                     format!("the value returned from exported circuit {fname}"),
                     filtered,
                 );
@@ -1820,8 +1854,11 @@ pub fn interp_stmt(
                 // applies (`filter_witnesses`) — being gated on the circuit's own
                 // argument is not a disclosure, only a `WitnessReturn` control
                 // witness leaks. `record_leak` no-ops on an empty (filtered) set.
+                // Kept at the statement range (no single wrappable value
+                // expression fixes a control-flow disclosure): never offered
+                // the `disclose()` quick-fix.
                 sink.record_leak(
-                    range,
+                    stmt_range,
                     format!("returning this value from exported circuit {fname}"),
                     filter_witnesses(control),
                 );
@@ -2117,6 +2154,31 @@ fn child_exprs(node: &SyntaxNode) -> Vec<Expr> {
     node.children().filter_map(Expr::cast).collect()
 }
 
+/// `node`'s range with leading/trailing trivia (whitespace, comments)
+/// stripped. This `rowan` 0.16 tree attaches a token's leading whitespace as
+/// the FIRST child of the token/node that follows it (see the parser's
+/// snapshot tests: `WHITESPACE@21..22` nested inside the following
+/// `NAME_EXPR`, not a preceding sibling) — so a bare `node.text_range()` on
+/// an expression can include a stray leading space from the operator before
+/// it. That extra byte is harmless for most callers (diagnostics render a
+/// snippet either way), but it matters here (v3c C3): the disclosure
+/// interpreter's DATA-sink leaks use this to record the MINIMAL tainted
+/// expression, which a `disclose()` quick-fix later wraps verbatim — an
+/// untrimmed span would insert `disclose(` one byte too early (`c
+/// =disclose( getW())`), which is cosmetically wrong even though it isn't a
+/// security issue (extra whitespace, not extra scope).
+fn trimmed_range(node: &SyntaxNode) -> TextRange {
+    let mut tokens = node
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia());
+    let Some(first) = tokens.next() else {
+        return node.text_range();
+    };
+    let last = tokens.last().unwrap_or_else(|| first.clone());
+    TextRange::new(first.text_range().start(), last.text_range().end())
+}
+
 /// A call's argument expressions: the `Expr` children after the `(` (excludes
 /// a method-call receiver, which appears before the `(`).
 fn arg_exprs(call: &CallExpr) -> Vec<Expr> {
@@ -2343,6 +2405,8 @@ fn add_path_point(abs: Abs, pp: &PathPoint) -> Abs {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use text_size::TextSize;
 
     use super::super::leaks::DisclosureLeak;
     use super::*;
@@ -3175,11 +3239,10 @@ mod tests {
     fn return_sink_records_only_witness_return_taint() {
         // K7 asymmetry: a witness-return leaks on `return`; a circuit argument
         // does not. Drive `interp_root` (which arms the return sink).
-        let (db, src, fd, ws, file) = walk_setup(
-            "witness getW(): Uint<8>;\n\
+        let text = "witness getW(): Uint<8>;\n\
              export circuit leaky(): Uint<8> { return getW(); }\n\
-             export circuit ok(x: Uint<8>): Uint<8> { return x; }\n",
-        );
+             export circuit ok(x: Uint<8>): Uint<8> { return x; }\n";
+        let (db, src, fd, ws, file) = walk_setup(text);
         let base = InterpCtx {
             db: &db,
             file,
@@ -3203,17 +3266,30 @@ mod tests {
             "the value returned from exported circuit leaky"
         );
         assert_eq!(leaks[0].witnesses.len(), 1);
+        // v3c C3 (minimal-scope `disclose()` quick-fix, differential-verified
+        // against `compactc` 0.31.1): the leak's primary span must be the
+        // MINIMAL returned expression `getW()` — not the whole `return
+        // getW();` statement (which includes the `return` keyword and `;`
+        // and is not a valid `disclose()` target).
+        let call_start = text.find("return getW()").unwrap() + "return ".len();
+        let expected = TextRange::new(
+            TextSize::new(call_start as u32),
+            TextSize::new((call_start + "getW()".len()) as u32),
+        );
+        assert_eq!(
+            leaks[0].src, expected,
+            "K7 leak's primary span must be the minimal return expression, not the whole return statement"
+        );
     }
 
     #[test]
     fn ledger_cell_write_records_leak() {
         // K1 ledger sink: `c = getW()` writes a witness value to a ledger Cell.
-        let (db, src, fd, ws, file) = walk_setup(
-            "import CompactStandardLibrary;\n\
+        let text = "import CompactStandardLibrary;\n\
              export ledger c: Uint<8>;\n\
              witness getW(): Uint<8>;\n\
-             export circuit f(): [] { c = getW(); }\n",
-        );
+             export circuit f(): [] { c = getW(); }\n";
+        let (db, src, fd, ws, file) = walk_setup(text);
         let base = InterpCtx {
             db: &db,
             file,
@@ -3232,6 +3308,26 @@ mod tests {
         assert_eq!(leaks.len(), 1, "the ledger write leaks the witness");
         assert_eq!(leaks[0].nature, "ledger operation");
         assert_eq!(leaks[0].witnesses.len(), 1);
+        // v3c C3 (minimal-scope `disclose()` quick-fix, differential-verified
+        // against `compactc` 0.31.1): the leak's primary span must be the
+        // MINIMAL RHS expression `getW()` — not the whole `c = getW();`
+        // statement. Confirmed empirically: `c = disclose(getW());` compiles
+        // clean under 0.31.1; `disclose(c = getW());` (a broader wrap) is
+        // REJECTED (the compiler re-locates the same undisclosed value at
+        // the inner RHS) — so a broader wrap is not just imprecise, it is
+        // actively rejected by the compiler.
+        // (NOT `text.find("getW()")`: that would match the earlier `witness
+        // getW(): Uint<8>;` declaration, which also contains `getW()` as a
+        // substring — anchor on the assignment itself instead.)
+        let call_start = text.find("c = getW()").unwrap() + "c = ".len();
+        let expected = TextRange::new(
+            TextSize::new(call_start as u32),
+            TextSize::new((call_start + "getW()".len()) as u32),
+        );
+        assert_eq!(
+            leaks[0].src, expected,
+            "K1 leak's primary span must be the minimal RHS expression, not the whole assignment statement"
+        );
     }
 
     // -- A5 implicit-flow (control-witness) tests -----------------------

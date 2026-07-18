@@ -179,6 +179,117 @@ fn publishes_disclosure_leak_diagnostic_on_open() {
     client.shutdown();
 }
 
+const LEAK_FIXTURE: &str = "import CompactStandardLibrary;\n\
+     export ledger c: Uint<8>;\n\
+     witness getW(): Uint<8>;\n\
+     export circuit f(): [] { c = getW(); }\n";
+
+/// v3c C3 (security-sensitive): a `textDocument/codeAction` at the
+/// confirmed leak's range returns exactly one `quickfix` that wraps the
+/// MINIMAL tainted expression (`getW()`) in `disclose(...)` — never the
+/// whole `c = getW();` statement. Differential-verified separately (see the
+/// task report) that applying this exact edit produces source `compactc`
+/// 0.31.1 accepts.
+#[test]
+fn code_action_offers_minimal_scope_disclose_quickfix() {
+    let (_dir, uri) = temp_doc();
+    let mut client = Client::start();
+    client.initialize();
+
+    did_open(&mut client, &uri, 1, LEAK_FIXTURE);
+    let params = client.wait_for_notification("textDocument/publishDiagnostics");
+    let diags = params["diagnostics"].as_array().unwrap();
+    let leak = diags
+        .iter()
+        .find(|d| d["code"] == "E3100")
+        .unwrap_or_else(|| panic!("expected an E3100 disclosure leak, got {diags:#?}"));
+    let leak_range = leak["range"].clone();
+
+    let response = client.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri},
+            "range": leak_range,
+            "context": {"diagnostics": [leak]},
+        }),
+    );
+    let actions = response["result"].as_array().expect("actions array");
+    assert_eq!(
+        actions.len(),
+        1,
+        "expected exactly one quickfix, got {actions:#?}"
+    );
+    let action = &actions[0];
+    assert_eq!(action["title"], "Reveal this value with disclose()");
+    assert_eq!(action["kind"], "quickfix");
+    assert_eq!(action["isPreferred"], false);
+
+    let edits = action["edit"]["changes"][uri.as_str()]
+        .as_array()
+        .expect("edits for the document");
+    assert_eq!(edits.len(), 2, "an insert-open + insert-close pair");
+    assert_eq!(edits[0]["newText"], "disclose(");
+    assert_eq!(edits[1]["newText"], ")");
+    assert_eq!(
+        edits[0]["range"]["start"], edits[0]["range"]["end"],
+        "the open-paren insertion must be zero-width"
+    );
+    assert_eq!(
+        edits[1]["range"]["start"], edits[1]["range"]["end"],
+        "the close-paren insertion must be zero-width"
+    );
+
+    // The COMBINED range the edit touches (earliest start, latest end)
+    // must equal the diagnostic's own range EXACTLY — not the whole
+    // statement. This is the security property the quick-fix exists to
+    // uphold: a wider wrap could silently sanitize a second, unrelated leak
+    // sharing the same statement.
+    assert_eq!(edits[0]["range"]["start"], leak_range["start"]);
+    assert_eq!(edits[1]["range"]["end"], leak_range["end"]);
+
+    client.shutdown();
+}
+
+/// The C1 `disclosureDiagnostics` toggle governs the quick-fix too: with
+/// disclosure diagnostics off, no disclosure quick-fix is ever offered
+/// (there's no published leak to attach it to, and offering one anyway
+/// would contradict the toggle).
+#[test]
+fn code_action_respects_disclosure_diagnostics_toggle_off() {
+    let (_dir, uri) = temp_doc();
+    let mut client = Client::start();
+    client.initialize_with_options(json!({ "disclosureDiagnostics": false }));
+
+    did_open(&mut client, &uri, 1, LEAK_FIXTURE);
+    let params = client.wait_for_notification("textDocument/publishDiagnostics");
+    let diags = params["diagnostics"].as_array().unwrap();
+    assert!(
+        diags.iter().all(|d| d["code"] != "E3100"),
+        "toggle off: no E3100 should publish, got {diags:#?}"
+    );
+
+    // Request a code action over the (unpublished) leak's source range.
+    let (line, col) = lsp_position(LEAK_FIXTURE, "getW(); }");
+    let response = client.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri},
+            "range": {
+                "start": {"line": line, "character": col},
+                "end": {"line": line, "character": col + 6},
+            },
+            "context": {"diagnostics": []},
+        }),
+    );
+    let actions = response["result"].as_array().expect("actions array");
+    assert!(
+        actions.is_empty(),
+        "no disclosure quickfix with the toggle off, got {actions:#?}"
+    );
+
+    client.shutdown();
+}
+
 #[test]
 fn publishes_disclosure_advisory_diagnostic_on_open() {
     let (_dir, uri) = temp_doc();

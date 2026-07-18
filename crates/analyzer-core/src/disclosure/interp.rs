@@ -810,6 +810,12 @@ fn interp_circuit_call(
     // pathological non-cyclic nesting. Either ⇒ amber + clean, never a loop.
     let key = (callee_file, callee_symbol);
     if state.depth >= MAX_CALL_DEPTH || state.active.contains(&key) {
+        // Fail-closed WITHOUT dropping a leak nested in an argument (§0): a
+        // sub-call inside an arg (e.g. `f(helper(secret))` where `helper` writes
+        // `secret` to a ledger) must still record its own sink even though THIS
+        // call is un-walkable. Interpret args for effect before the advisory,
+        // exactly as the sibling `DeferredCircuit` arm does.
+        interp_args_for_effect(ctx, sink, state, env, control, call);
         sink.emit_advisory(
             src,
             "recursive or deeply-nested circuit call not analyzed".to_string(),
@@ -818,6 +824,9 @@ fn interp_circuit_call(
     }
     // Locate the callee's params + body (same-file for B2; cross-module is B4).
     let Some(callee) = resolve_circuit_def(ctx, callee_file, callee_symbol) else {
+        // Same §0 guard as the recursion branch: realize any sink nested in an
+        // argument before failing closed (this cross-file path activates in B4).
+        interp_args_for_effect(ctx, sink, state, env, control, call);
         sink.emit_advisory(
             src,
             "cross-circuit call target could not be resolved (cross-module deferred to v3b)"
@@ -3488,6 +3497,39 @@ mod tests {
         assert!(
             leaks.is_empty(),
             "the disclosed result must not leak; recursion guard stays fail-closed (got {leaks:?})"
+        );
+    }
+
+    #[test]
+    fn arg_side_leak_survives_recursion_guard_fail_closed() {
+        // §0 regression (B2 review): the recursion-guard early-return must STILL
+        // interpret the call's ARGUMENTS for effect, so a leak nested inside an
+        // argument is not silently dropped when THIS call is un-walkable. Here
+        // self-recursive `recurse` trips the guard on its inner call, but that
+        // inner call's argument `leaky(getW())` runs a same-file helper that
+        // writes a witness to the ledger — that inner E3100 must still be
+        // confirmed, not dropped. Deterministic: the guard trips exactly once
+        // (on the second `recurse`), and `leaky` is walked via the arg. Before
+        // the fix, the guard bailed before interpreting the argument, silently
+        // losing this leak (a §0 silent-green).
+        let (leaks, had_advisory) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger store: Field;\n\
+             witness getW(): Field;\n\
+             circuit leaky(x: Field): Field { store = x; return x; }\n\
+             circuit recurse(v: Field): [] { recurse(leaky(getW())); }\n\
+             export circuit f(): [] { recurse(0); }\n",
+        );
+        assert!(
+            had_advisory,
+            "the recursion guard must record a fail-closed amber advisory (§0)"
+        );
+        assert!(
+            leaks.iter().flat_map(|l| &l.witnesses).any(|w| matches!(
+                &w.info,
+                WitnessInfo::WitnessReturn { function } if function == "getW"
+            )),
+            "the leak nested in the recursive call's argument must NOT be dropped: {leaks:?}"
         );
     }
 }

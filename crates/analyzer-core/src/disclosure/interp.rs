@@ -35,10 +35,12 @@ use super::tables;
 pub type Env = HashMap<String, Abs>;
 
 /// The interprocedural memo cache key + value (B0 Q2, walk-local `call-ht` per
-/// the memoization ADR). The key is `((callee_file, callee_symbol), arg_shapes,
-/// control)`; the value is the callee body's returned `Abs`. B2 threads this
-/// field through `WalkState` but does NOT populate it — the lookup/insert is
-/// Task B3. Left present-but-unused so B3 is a pure fill-in.
+/// the memoization ADR). The key is the 3 axes the compiler's `key-equal?`
+/// compares — `(callee_file, callee_symbol, arg_shapes, control)` — and the
+/// value is the callee body's returned `Abs` (B3 `interp_circuit_call`). `Abs`
+/// and `Witness` derive `Hash`/`Eq` structurally; that is STRICTER than
+/// `abs-equal?`/`same-witnesses?`, which only ever costs extra (idempotent)
+/// re-walks, never a wrong reuse (see `Witness` in `abs.rs`).
 pub type CallCache = HashMap<(crate::FileId, u32, Vec<Abs>, Vec<Witness>), Abs>;
 
 /// Hard bound on cross-circuit recursion depth (spec §0, fail-closed). Recursion
@@ -55,10 +57,11 @@ const MAX_CALL_DEPTH: u32 = 256;
 /// (`analysis-passes.ss` ~5013-5116, B0 Q1/Q2/Q4).
 #[derive(Default)]
 pub struct WalkState {
-    /// The B3 memo cache (`call-ht`): B2 leaves this empty; B3 wires the
-    /// lookup/insert in `interp_circuit_call`. Present-but-unread in B2 by design
-    /// (memoization ADR) so B3 is a pure fill-in with no signature churn.
-    #[allow(dead_code)]
+    /// The walk-local memo cache (`call-ht`, B0 Q2): `interp_circuit_call`
+    /// looks up on a HIT (return cached `Abs`, no re-walk) and inserts on a MISS
+    /// (after walking the callee body). Keyed on the 3 axes `key-equal?` uses
+    /// `(callee_file, callee_symbol, arg_shapes, control)`; scoped to one root
+    /// walk (memoization ADR, Option A).
     pub cache: CallCache,
     /// The `Call-inprocess` recursion guard (B0 Q4): the `(file, symbol)` of
     /// every circuit currently on the active call stack. A callee already in
@@ -844,11 +847,44 @@ fn interp_circuit_call(
         sink.emit_advisory(src, "circuit call arity mismatch not analyzed".to_string());
         return Abs::Atomic(Vec::new());
     }
-    // (B3 inserts the `call-ht` memo lookup HERE, keyed (key, arg_shapes, control).)
-    // Bind a FRESH env: param -> arg_shape — NO caller-env inheritance (B0 Q1).
+    // B3 walk-local `call-ht` memo (B0 Q2, memoization ADR Option A). Key on the
+    // three axes `key-equal?` compares: callee identity `(file, symbol)`, the
+    // evaluated arg shapes `abs*`, and the threaded `control` witness set. The
+    // key uses the RAW `arg_shapes` — BEFORE this call's argument path points —
+    // exactly as the source keys on raw `abs*` and adds path points only in the
+    // miss/walk branch (`analysis-passes.ss` ~5066, B0 Q2/Q5).
+    let memo_key = (
+        callee_file,
+        callee_symbol,
+        arg_shapes.clone(),
+        control.to_vec(),
+    );
+    if let Some(cached) = state.cache.get(&memo_key) {
+        // HIT (B0 Q2): this exact `(uid, abs*, control)` was already walked; its
+        // sinks are already recorded, and because `record_leak` dedups by
+        // `(src, nature)` a re-walk could only re-derive the same rows (ADR case
+        // (c)) — so returning the cached `Abs` WITHOUT re-walking is
+        // observationally identical on the leak table (fail-closed, §0). A
+        // non-root callee always runs with `disclosing_fn = None` (B0 Q3), so
+        // there is no disclosing-context re-entry a hit could wrongly skip.
+        return cached.clone();
+    }
+    // MISS: bind a FRESH env `param -> arg_shape` — NO caller-env inheritance
+    // (B0 Q1, `extend-env empty-env var-name* abs*`). Attach the cross-circuit
+    // argument path point to each bound arg (B0 Q5: the SAME `add_path_point` +
+    // "the [Nth] argument to <callee>" template the native conduit uses, exposure
+    // ""), so a witness passed to the helper renders a secondary span at the call
+    // site on its witness->sink trail. Single-arg ⇒ no ordinal; multi-arg ⇒
+    // 1-based ordinals — `arg_description` handles both.
     let mut callee_env: Env = HashMap::new();
-    for (p, a) in callee.params.iter().zip(arg_shapes.iter()) {
-        callee_env.insert(p.clone(), a.clone());
+    let arg_count = arg_shapes.len();
+    for (i, (p, a)) in callee.params.iter().zip(arg_shapes.iter()).enumerate() {
+        let pp = PathPoint {
+            src,
+            description: arg_description(&callee.name, i, arg_count),
+            exposure: String::new(),
+        };
+        callee_env.insert(p.clone(), add_path_point(a.clone(), &pp));
     }
     // Non-root callee: `disclosing_fn = None` (K7 disarmed, B0 Q3). `callee_file`
     // is `ctx.file` for B2 (guaranteed by `resolve_circuit_def`'s same-file gate);
@@ -870,12 +906,19 @@ fn interp_circuit_call(
     );
     state.depth -= 1;
     state.active.remove(&key);
+    // Cache the callee's return `Abs` under the 3-axis key so a later call with
+    // identical `(uid, abs*, control)` HITs (above) instead of re-walking — the
+    // performance bound (ADR Option A), leak-set-invariant by ADR case (c).
+    state.cache.insert(memo_key, ret.clone());
     ret
 }
 
 /// A callee circuit's parameter names + body block (B2). Located by the symbol's
 /// `name_range` the same way `seed_sources`/`root_body` find a root's def.
 struct CircuitDef {
+    /// The callee circuit's name (`id-sym function-name`), used to render the
+    /// B3 cross-circuit argument path point ("the [Nth] argument to <name>").
+    name: String,
     /// Parameter names, in declaration order — bound positionally to the call's
     /// interpreted `arg_shapes`.
     params: Vec<String>,
@@ -909,7 +952,11 @@ fn resolve_circuit_def(
         .filter_map(|p| param_name_and_type(p).map(|(name, _, _)| name))
         .collect();
     let body = cd.body()?;
-    Some(CircuitDef { params, body })
+    Some(CircuitDef {
+        name: sym.name.clone(),
+        params,
+        body,
+    })
 }
 
 /// Walks a callee circuit body (B2) and returns the `Abs` that flows back to the
@@ -3530,6 +3577,136 @@ mod tests {
                 WitnessInfo::WitnessReturn { function } if function == "getW"
             )),
             "the leak nested in the recursive call's argument must NOT be dropped: {leaks:?}"
+        );
+    }
+
+    // -- B3: cross-circuit argument path points (B0 Q5) -----------------
+
+    #[test]
+    fn cross_circuit_arg_attaches_path_point() {
+        // B0 Q5: passing a value as an argument to a helper attaches the SAME
+        // path point natives use — `add-path-point` + "the [Nth] argument to
+        // <callee>", exposure "". Ground truth: the local compactc 0.31.1
+        // REJECTs `interproc_path.compact` with the WPP banner and renders the
+        // path "the argument to stash at line 10 char 31" — the single-arg,
+        // no-ordinal form this asserts.
+        let (leaks, _adv) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger store: Field;\n\
+             witness getSecret(): Field;\n\
+             circuit stash(v: Field): [] { store = v; }\n\
+             export circuit reveal(): [] { stash(getSecret()); }\n",
+        );
+        assert!(
+            !leaks.is_empty(),
+            "witness -> helper -> ledger must confirm a leak"
+        );
+        // The single-arg call renders "the argument to stash" (NO ordinal),
+        // exposure "" — the cross-circuit arg path point rides the witness trail.
+        assert!(
+            leaks.iter().flat_map(|l| &l.witnesses).any(|w| w
+                .path
+                .iter()
+                .any(|pp| pp.description == "the argument to stash" && pp.exposure.is_empty())),
+            "the leaked witness must carry the single-arg cross-circuit path point: {leaks:?}"
+        );
+    }
+
+    #[test]
+    fn cross_circuit_multi_arg_path_point_uses_ordinal() {
+        // B0 Q5: a MULTI-arg call carries 1-based ordinals ("the second argument
+        // to <callee>"), via the same `arg_description` the native conduit uses.
+        let (leaks, _adv) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger store: Field;\n\
+             witness getSecret(): Field;\n\
+             circuit sink2(a: Field, b: Field): [] { store = b; }\n\
+             export circuit reveal(): [] { sink2(0, getSecret()); }\n",
+        );
+        assert!(
+            leaks.iter().flat_map(|l| &l.witnesses).any(|w| w
+                .path
+                .iter()
+                .any(|pp| pp.description == "the second argument to sink2")),
+            "the second-arg witness must carry a 1-based-ordinal path point: {leaks:?}"
+        );
+    }
+
+    // -- B3: walk-local call-ht memo (B0 Q2, memoization ADR Option A) ---
+
+    #[test]
+    fn memo_helper_called_twice_yields_one_leak_row() {
+        // §0 fail-closed invariant / ADR case (c): the memo must NOT change the
+        // leak verdict. A helper called twice with IDENTICAL (arg_shapes,
+        // control) leaks at one ledger-write (src, nature); whether the second
+        // call HITs the memo or re-walks, `(src,nature)` dedup makes the two
+        // observationally identical — exactly ONE leak row either way. This is
+        // an OBSERVABLE assertion on the leak table, not private-counter peeking.
+        let (leaks, _adv) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger store: Field;\n\
+             circuit stash(v: Field): [] { store = v; }\n\
+             export circuit leak(secret: Field): [] { stash(secret); stash(secret); }\n",
+        );
+        assert_eq!(
+            leaks.len(),
+            1,
+            "a helper called twice identically must dedup to ONE leak row: {leaks:?}"
+        );
+        assert_eq!(leaks[0].nature, "ledger operation");
+        // And the leaked witness is still `leak`'s `secret` (flowed through the
+        // helper both times) — the verdict is unchanged by memoization.
+        assert!(
+            leaks.iter().flat_map(|l| &l.witnesses).any(|w| matches!(
+                &w.info,
+                WitnessInfo::CircuitArg { function, arg }
+                    if function == "leak" && arg == "secret"
+            )),
+            "the deduped leak must still carry leak's `secret`: {leaks:?}"
+        );
+    }
+
+    #[test]
+    fn memo_collapses_exponential_fanout() {
+        // OBSERVABLE reuse proof (resolves the B2-review exponential-re-walk
+        // termination concern). A doubling call chain — each helper calls the
+        // next TWICE with the SAME (arg_shapes, control) — is 2^depth walks
+        // WITHOUT the memo (this test would never return) and O(depth) walks
+        // WITH it (each key walked once, sibling calls HIT). Completion at
+        // depth 40 (~1.1e12 un-memoized walks) is itself the assertion that the
+        // memo reuses cached results rather than re-walking. The leak verdict is
+        // still exactly one row (ADR case (c)), unchanged from a single walk.
+        const DEPTH: usize = 40;
+        let mut src = String::from(
+            "import CompactStandardLibrary;\n\
+             export ledger store: Field;\n\
+             circuit h0(x: Field): [] { store = x; }\n",
+        );
+        for i in 1..=DEPTH {
+            src.push_str(&format!(
+                "circuit h{i}(x: Field): [] {{ h{prev}(x); h{prev}(x); }}\n",
+                prev = i - 1
+            ));
+        }
+        src.push_str(&format!(
+            "export circuit top(secret: Field): [] {{ h{DEPTH}(secret); }}\n"
+        ));
+
+        let (leaks, _adv) = walk_leaks(&src);
+        // Reaching here at all proves the memo collapsed the 2^DEPTH fan-out.
+        assert_eq!(
+            leaks.len(),
+            1,
+            "the doubling chain must still yield exactly one leak row: {leaks:?}"
+        );
+        assert_eq!(leaks[0].nature, "ledger operation");
+        assert!(
+            leaks.iter().flat_map(|l| &l.witnesses).any(|w| matches!(
+                &w.info,
+                WitnessInfo::CircuitArg { function, arg }
+                    if function == "top" && arg == "secret"
+            )),
+            "the leak must carry top's `secret`, flowed through the whole chain: {leaks:?}"
         );
     }
 }

@@ -1,0 +1,10 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+export ledger store: Field;
+
+witness getSecret(): Field;
+
+circuit stash(v: Field): [] { store = v; }
+
+export circuit reveal(): [] { stash(getSecret()); }

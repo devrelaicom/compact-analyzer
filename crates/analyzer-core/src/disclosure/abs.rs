@@ -40,7 +40,18 @@ pub enum WitnessInfo {
 }
 
 /// One tracked witness value: where it entered + the path it has taken.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Hash` (with the already-derived `Eq`) makes `Witness` usable inside the
+/// B3 walk-local `call-ht` memo key (`(FileId, symbol, Vec<Abs>, Vec<Witness>)`,
+/// interp.rs). No field blocks it: `TextRange`/`u32` are `Hash`, `WitnessInfo`
+/// derives it, `Vec<PathPoint>` is `Hash` once `PathPoint` is. The derived
+/// `Eq`/`Hash` are structural and order-dependent — STRICTER than the compiler's
+/// order-independent `abs-equal?`/`same-witnesses?` (B0 Q2), so a derived-equal
+/// key implies an `abs-equal?`-equal key: the memo can only ever MISS where the
+/// compiler would HIT, never the reverse. A surplus miss re-walks, which the
+/// `(src,nature)` leak dedup makes idempotent (memoization ADR case (c)), so the
+/// stricter key is leak-set-invariant (fail-closed, §0).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Witness {
     pub uid: u32,
     pub src: text_size::TextRange,
@@ -48,8 +59,10 @@ pub struct Witness {
     pub path: Vec<PathPoint>, // spec §3.7
 }
 
-/// A point on the witness->sink trail (spec §3.7).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A point on the witness->sink trail (spec §3.7). `Hash` so `Witness` (which
+/// carries `Vec<PathPoint>`) is hashable for the B3 memo key; all fields
+/// (`TextRange`, `String`) are `Hash`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PathPoint {
     pub src: text_size::TextRange,
     pub description: String, // e.g. "the argument to the ledger write"
@@ -57,8 +70,12 @@ pub struct PathPoint {
 }
 
 /// The abstract value lattice (spec §3.4). Struct/tuple fields individual;
-/// arrays aggregate; booleans only for compile-time constants.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// arrays aggregate; booleans only for compile-time constants. `Hash` (over the
+/// derived, structural `Eq`) makes `Vec<Abs>` usable as an arg-shape axis of the
+/// B3 memo key; every variant's payload (`Vec<Witness>`, `bool`, `Box<Abs>`) is
+/// `Hash`. NOTE: this derived `Eq`/`Hash` is order-dependent and distinct from
+/// the order-independent `abs_equal` used by the fold fixpoint — see `Witness`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Abs {
     Atomic(Vec<Witness>),
     /// AB2 (spec §3.4): only a compile-time `true`/`false` literal produces

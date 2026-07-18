@@ -182,6 +182,12 @@ const FIXTURES: &[Fixture] = &[
         discloses: false,
         native_confirms: false,
     },
+    Fixture {
+        name: "interproc_path.compact",
+        rule: "B3 cross-circuit argument path point (witness → helper arg → ledger sink)",
+        discloses: true,
+        native_confirms: true,
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

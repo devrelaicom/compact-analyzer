@@ -197,4 +197,103 @@ mod tests {
                 .contains("module-nested circuit `leak`")
         );
     }
+
+    /// Regression pin (v3b B6, spec §8 risk #6): `disclosure_diagnostics_query`
+    /// is `#[salsa::tracked]` keyed on `(file, src, fd, ws)`. Editing `src`'s
+    /// text via `set_text` (the same salsa input, a new revision) must
+    /// recompute rather than serve a stale memo when the edit changes a
+    /// source's IDENTITY -- here, `getW` flips from a `witness` (a taint
+    /// source: its return value is witness-controlled) to a plain `circuit`
+    /// (clean). Ground truth validated against `compact compile` 0.5.1
+    /// (compactc 0.31.1): program A REJECTs ("potential witness-value
+    /// disclosure... the return value of witness getW"), program B ACCEPTs.
+    #[test]
+    fn witness_to_circuit_flip_clears_leak_on_recompute() {
+        use salsa::Setter as _;
+
+        let mut db = CompactDatabase::default();
+        let text_a = "import CompactStandardLibrary;\n\
+                       export ledger c: Uint<8>;\n\
+                       witness getW(): Uint<8>;\n\
+                       export circuit f(): [] { c = getW(); }\n";
+        let src = SourceText::new(&db, Arc::from(text_a));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = empty_ws(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+
+        let diags_a = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        let leaks_a: Vec<_> = diags_a
+            .iter()
+            .filter(|d| d.code.prefix == "E" && d.code.number >= 3100)
+            .collect();
+        assert_eq!(
+            leaks_a.len(),
+            1,
+            "witness getW() written to the ledger must confirm a leak: {diags_a:?}"
+        );
+
+        // Edit: `witness getW(): Uint<8>;` -> `circuit getW(): Uint<8> { return 0; }`.
+        let text_b = "import CompactStandardLibrary;\n\
+                       export ledger c: Uint<8>;\n\
+                       circuit getW(): Uint<8> { return 0; }\n\
+                       export circuit f(): [] { c = getW(); }\n";
+        src.set_text(&mut db).to(Arc::from(text_b));
+
+        let diags_b = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        let leaks_b: Vec<_> = diags_b
+            .iter()
+            .filter(|d| d.code.prefix == "E" && d.code.number >= 3100)
+            .collect();
+        assert!(
+            leaks_b.is_empty(),
+            "getW flipped to a plain circuit must clear the leak on recompute (not serve a stale memo): {diags_b:?}"
+        );
+    }
+
+    /// Regression pin (v3b B6, spec §8 risk #6): adding an exported-circuit
+    /// parameter re-seeds a fresh `CircuitArg` source on recompute, turning a
+    /// previously-clean ledger write into a confirmed leak. Ground truth
+    /// validated against `compact compile` 0.5.1 (compactc 0.31.1): program A
+    /// (writes a constant) ACCEPTs, program B (writes the new parameter)
+    /// REJECTs ("the value of parameter p of exported circuit f").
+    #[test]
+    fn added_circuit_param_introduces_leak_on_recompute() {
+        use salsa::Setter as _;
+
+        let mut db = CompactDatabase::default();
+        let text_a = "import CompactStandardLibrary;\n\
+                       export ledger store: Field;\n\
+                       export circuit f(): [] { store = 0; }\n";
+        let src = SourceText::new(&db, Arc::from(text_a));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = empty_ws(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+
+        let diags_a = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        let leaks_a: Vec<_> = diags_a
+            .iter()
+            .filter(|d| d.code.prefix == "E" && d.code.number >= 3100)
+            .collect();
+        assert!(
+            leaks_a.is_empty(),
+            "writing a constant to the ledger must not leak: {diags_a:?}"
+        );
+
+        // Edit: add parameter `p` and write it instead of the constant.
+        let text_b = "import CompactStandardLibrary;\n\
+                       export ledger store: Field;\n\
+                       export circuit f(p: Field): [] { store = p; }\n";
+        src.set_text(&mut db).to(Arc::from(text_b));
+
+        let diags_b = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        let leaks_b: Vec<_> = diags_b
+            .iter()
+            .filter(|d| d.code.prefix == "E" && d.code.number >= 3100)
+            .collect();
+        assert_eq!(
+            leaks_b.len(),
+            1,
+            "the new CircuitArg source `p` written to the ledger must confirm a leak on recompute: {diags_b:?}"
+        );
+    }
 }

@@ -202,19 +202,46 @@ fn reexported_module_circuits(
                 {
                     out.insert(index);
                 }
-            } else if item_symbol(ctx.db, ctx.file, ctx.src, ctx.fd, df, index)
-                .is_some_and(|s| s.kind == SymbolKind::Circuit)
-            {
-                // Cross-file re-exported circuit: a root we cannot seed/walk here
-                // (needs the target file's SourceText + params). §0 fail-closed —
-                // never silently skip a potential disclosing root.
-                sink.emit_advisory(
-                    name_tok.text_range(),
-                    format!(
-                        "re-exported circuit `{name}` is defined in another module/file; not \
-                         analyzed as a disclosing root here",
-                    ),
-                );
+            } else {
+                // Cross-file re-export. §0 fail-closed — never silently skip a
+                // potential disclosing root.
+                match item_symbol(ctx.db, ctx.file, ctx.src, ctx.fd, df, index) {
+                    Some(s) if s.kind == SymbolKind::Circuit => {
+                        // Cross-file re-exported circuit: a root we cannot
+                        // seed/walk here (needs the target file's SourceText +
+                        // params).
+                        sink.emit_advisory(
+                            name_tok.text_range(),
+                            format!(
+                                "re-exported circuit `{name}` is defined in another module/file; \
+                                 not analyzed as a disclosing root here",
+                            ),
+                        );
+                    }
+                    // Defensive §0 insurance (fix-wave #3): the cross-file
+                    // target resolved to a `Definition::Item` but its symbol
+                    // could not be read (`item_symbol` returned `None`). A
+                    // degenerate but real silent-skip — if that item is in fact
+                    // a circuit we would drop a disclosing root. Never skip it
+                    // silently. Unexercised on the 0.31.1 corpus
+                    // (silent_on_reject=0), so there is no dedicated fixture;
+                    // this is pure fail-closed insurance against version/tree
+                    // drift.
+                    None => {
+                        sink.emit_advisory(
+                            name_tok.text_range(),
+                            format!(
+                                "re-exported `{name}` resolves to another module/file but its \
+                                 target symbol could not be read; not analyzed as a disclosing \
+                                 root (fail-closed §0)",
+                            ),
+                        );
+                    }
+                    // A cross-file re-export of a non-circuit item (const,
+                    // struct, …) is not a disclosing root — correctly nothing
+                    // to seed, no advisory.
+                    Some(_) => {}
+                }
             }
         }
     }
@@ -1126,25 +1153,40 @@ fn interp_ledger_op(
 
     // K2 (A5): performing a ledger op under witness control leaks the gating
     // witnesses (no-op when `control` is empty ⇒ a top-level op records none).
+    // The CONTROL leak stays at the whole-call `src` (it is not wrappable — the
+    // gating witness lives in a branch condition elsewhere, not in this call).
     sink.record_leak(src, "performing this ledger operation", control.to_vec());
+
+    // Fix-wave #1: the per-arg DATA leaks record at EACH flagged arg's own
+    // trimmed expression range — NOT the whole-call `src` — so C3's
+    // `disclose()` quick-fix wraps the ARG (`s.insert(disclose(getW()))`,
+    // which `compactc` accepts) rather than the whole call
+    // (`disclose(s.insert(getW()))`, which discloses the op's `[]` result and
+    // is rejected). Index-aligned with `args` (both derive from
+    // `arg_exprs(call)`); falls back to `src` if the counts ever diverge.
+    let arg_srcs: Vec<TextRange> = arg_exprs(call)
+        .iter()
+        .map(|e| trimmed_range(e.syntax()))
+        .collect();
 
     match known {
         // L2 container op: every argument leaks with exposure "" (L1 default).
         Some(tables::LedgerOp::AllArgsLeak) => {
-            leak_all_ledger_args(sink, name, args, src);
+            leak_all_ledger_args(sink, name, args, &arg_srcs, src);
         }
         // L3 Kernel op: per-arg `discloses?` flags (Some ⇒ leak; None ⇒ hidden).
         Some(tables::LedgerOp::PerArg(flags)) => {
             for (i, (flag, arg_abs)) in flags.iter().zip(args).enumerate() {
                 if let Some(exposure) = flag {
-                    leak_ledger_arg(sink, name, i, flags.len(), exposure, arg_abs, src);
+                    let data_src = arg_srcs.get(i).copied().unwrap_or(src);
+                    leak_ledger_arg(sink, name, i, flags.len(), exposure, arg_abs, data_src, src);
                 }
             }
         }
         // Unknown ledger op on a ledger field: fail-closed leak of every
         // witness arg (matches the L1 default: no clause ⇒ leaks) + advisory.
         None => {
-            leak_all_ledger_args(sink, name, args, src);
+            leak_all_ledger_args(sink, name, args, &arg_srcs, src);
             sink.emit_advisory(
                 src,
                 format!("unknown ledger op `{name}`; leaking all witness args (fail-closed, may be stale)"),
@@ -1156,16 +1198,32 @@ fn interp_ledger_op(
 
 /// Records a K1 DATA leak for every argument of a container op (L2): each arg
 /// carries the default `discloses? = ""` (exposure ""), so every witness-bearing
-/// arg leaks. `record_leak` no-ops on a clean (witness-free) arg.
-fn leak_all_ledger_args(sink: &mut DisclosureSink, op: &str, args: &[Abs], src: TextRange) {
+/// arg leaks. `record_leak` no-ops on a clean (witness-free) arg. `arg_srcs` is
+/// index-aligned with `args` (each arg's own trimmed expression range, fix-wave
+/// #1); `src` is the whole-call range, used only for the exposure path point.
+fn leak_all_ledger_args(
+    sink: &mut DisclosureSink,
+    op: &str,
+    args: &[Abs],
+    arg_srcs: &[TextRange],
+    src: TextRange,
+) {
     for (i, arg_abs) in args.iter().enumerate() {
-        leak_ledger_arg(sink, op, i, args.len(), "", arg_abs, src);
+        let data_src = arg_srcs.get(i).copied().unwrap_or(src);
+        leak_ledger_arg(sink, op, i, args.len(), "", arg_abs, data_src, src);
     }
 }
 
 /// Records one K1 ledger-op DATA leak: tags the arg's witnesses with the
 /// `discloses?` exposure path point (`the [Nth] argument to <op>`) and records
 /// them under nature `"ledger operation"` (no-op when the arg is witness-free).
+///
+/// Fix-wave #1: the leak's PRIMARY span is `data_src` — the flagged arg's own
+/// trimmed expression range — so C3's `disclose()` quick-fix wraps exactly that
+/// arg (`s.insert(disclose(getW()))`, which `compactc` accepts). The exposure
+/// path point still anchors at the whole-call `src` (the established secondary
+/// span for a call-argument trail point, matching `native_conduit_result`).
+#[allow(clippy::too_many_arguments)]
 fn leak_ledger_arg(
     sink: &mut DisclosureSink,
     op: &str,
@@ -1173,6 +1231,7 @@ fn leak_ledger_arg(
     arg_count: usize,
     exposure: &str,
     arg_abs: &Abs,
+    data_src: TextRange,
     src: TextRange,
 ) {
     let pp = PathPoint {
@@ -1181,7 +1240,7 @@ fn leak_ledger_arg(
         exposure: exposure.to_string(),
     };
     let witnesses = witnesses_of(&add_path_point(arg_abs.clone(), &pp));
-    sink.record_leak(src, "ledger operation", witnesses);
+    sink.record_leak(data_src, "ledger operation", witnesses);
 }
 
 /// N2 native conduit result: a native records NO leak — it folds each flagged
@@ -3591,6 +3650,35 @@ mod tests {
             }
         );
         assert!(!had_advisory, "known ledger op emits no advisory");
+    }
+
+    #[test]
+    fn container_op_leak_span_is_the_arg_not_the_whole_call() {
+        // Fix-wave #1 (v3c C3 minimal-scope `disclose()` quick-fix): a
+        // container/Kernel ledger-op's DATA leak primary span must be the
+        // flagged ARG expression `getW()` — NOT the whole `s.insert(getW())`
+        // call. The quick-fix wraps this span, so it must produce
+        // `s.insert(disclose(getW()))` (which `compactc` 0.31.1 ACCEPTS), not
+        // `disclose(s.insert(getW()))` (which discloses the op's `[]` RESULT
+        // and is REJECTED). Differential-verified in the fix-wave report.
+        // Detection-invariant with `container_op_witness_arg_leaks`: same one
+        // leak, same nature, same witness — this pins the SPAN only.
+        let text = "import CompactStandardLibrary;\n\
+             export ledger s: Set<Uint<8>>;\n\
+             witness getW(): Uint<8>;\n\
+             export circuit f(): [] { s.insert(getW()); }\n";
+        let (leaks, _had_advisory) = walk_leaks(text);
+        assert_eq!(leaks.len(), 1, "the container op leaks its witness arg");
+        assert_eq!(leaks[0].nature, "ledger operation");
+        let arg_start = text.find("s.insert(getW())").unwrap() + "s.insert(".len();
+        let expected = TextRange::new(
+            TextSize::new(arg_start as u32),
+            TextSize::new((arg_start + "getW()".len()) as u32),
+        );
+        assert_eq!(
+            leaks[0].src, expected,
+            "container-op DATA leak span must be the arg expression `getW()`, not the whole `s.insert(getW())` call"
+        );
     }
 
     // -- A7 fold/map fixpoint over aggregates ---------------------------

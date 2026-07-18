@@ -14,6 +14,10 @@
 //!   interpreter walk (A3), and the ledger/return SINKS (A4).
 //! - `leaks` — the `Advisory`/`DisclosureSink` fail-closed primitive (A2) plus
 //!   the leak table (A4).
+//! - `version` — the pinned-compiler-version drift check (v3c C5, spec §4.3):
+//!   the tables above are only valid for the compactc release they were
+//!   extracted from, so a mismatched installed compiler gets its own
+//!   surfaced advisory (wired by `compact-analyzer`'s server, not here).
 //!
 //! `disclosure_diagnostics_query` (below) runs the interpreter from every root
 //! (A4): it seeds sources, walks each body, drains the leak table, and renders
@@ -26,6 +30,7 @@ mod abs;
 mod interp;
 mod leaks;
 mod tables;
+mod version;
 
 use std::sync::Arc;
 
@@ -34,6 +39,7 @@ use compactp_diagnostics::{Diagnostic, DiagnosticCode};
 use crate::db::{Db, FileDeps, SourceText, Workspace, item_tree};
 use interp::InterpCtx;
 use leaks::{DisclosureLeak, DisclosureSink, advisory_to_diagnostic};
+pub use version::{PINNED_COMPILER_VERSION, version_mismatch};
 
 /// Disclosure (WPP) diagnostics for `src`: the confirmed witness-disclosure
 /// leaks (`E3100`) the intraprocedural interpreter finds, PLUS the amber

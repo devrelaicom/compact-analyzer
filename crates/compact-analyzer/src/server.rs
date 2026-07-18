@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use analyzer_core::{AnalysisHost, FileId, LineIndex, TextRange, TextSize};
+use analyzer_core::{AnalysisHost, FileId, LineIndex, TextRange, TextSize, version_mismatch};
 use analyzer_toolchain::{CompileOutcome, CompileStatus, Toolchain};
 use crossbeam_channel::RecvTimeoutError;
 use lsp_server::{Connection, Message, Notification, Request, Response};
@@ -167,6 +167,10 @@ pub(crate) fn run() -> anyhow::Result<()> {
         ),
         None => eprintln!("compact-analyzer: no compact toolchain found; compile-on-save disabled"),
     }
+    // v3c C5: a discovered toolchain whose version drifts from the pinned
+    // disclosure-tables extraction target gets one startup advisory (spec
+    // §4.3). A no-op when no toolchain was discovered above.
+    state.notify_version_drift_once();
     eprintln!(
         "compact-analyzer: indexing {} workspace root(s)",
         state.workspace_roots.len()
@@ -276,6 +280,10 @@ struct GlobalState {
     /// has been sent, so a later toolchain-requiring feature use no-ops
     /// without sending it again. Never reset within a session.
     toolchain_notice_shown: bool,
+    /// Set once the one-time compiler-version-drift `window/showMessage`
+    /// (v3c C5) has been sent, so a later call this session no-ops. Never
+    /// reset within a session.
+    version_notice_shown: bool,
     /// A clone of the connection receiver, used only to test emptiness for
     /// cooperative cancellation (single-threaded — no concurrent consumer).
     cancel_receiver: crossbeam_channel::Receiver<Message>,
@@ -301,6 +309,7 @@ impl GlobalState {
             save_generations: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             toolchain_notice_shown: false,
+            version_notice_shown: false,
             cancel_receiver,
             next_request_id: 0,
         }
@@ -1067,6 +1076,37 @@ impl GlobalState {
         );
     }
 
+    /// Sends the one-time `window/showMessage` (WARNING) that flags a
+    /// discovered toolchain whose version doesn't match
+    /// `analyzer_core::PINNED_COMPILER_VERSION` (v3c C5, spec §4.3): the
+    /// disclosure WPP rules + native/ledger flag tables were extracted for
+    /// one specific `compactc` release, so a drifted installed compiler
+    /// means those tables may be stale (a drifted flag is a §0 unknown that
+    /// the analyzer has no way to detect on its own). `version_mismatch`
+    /// matches at MAJOR.MINOR granularity — see its doc comment for why. A
+    /// no-op when no toolchain is discovered (that's the separate,
+    /// already-handled condition covered by
+    /// [`GlobalState::notify_toolchain_missing_once`]), and never more than
+    /// once per session.
+    fn notify_version_drift_once(&mut self) {
+        if self.version_notice_shown {
+            return;
+        }
+        let Some(toolchain) = &self.toolchain else {
+            return;
+        };
+        let Some(reason) = version_mismatch(&toolchain.tool_version) else {
+            return;
+        };
+        self.version_notice_shown = true;
+        self.send_notification::<lsp_types::notification::ShowMessage>(
+            lsp_types::ShowMessageParams {
+                typ: lsp_types::MessageType::WARNING,
+                message: format!("compact-analyzer: {reason}"),
+            },
+        );
+    }
+
     fn respond(&self, response: Response) {
         let _ = self.sender.send(Message::Response(response));
     }
@@ -1744,6 +1784,87 @@ mod tests {
         // this close is superseded and reopen sees no stale compiler set.
         assert_eq!(lock(&state.save_generations).get(&file).copied(), Some(4));
         assert!(!lock(&state.compiler_diagnostics).contains_key(&file));
+    }
+
+    // --- Compiler-version drift advisory (v3c C5) ---------------------------
+
+    fn toolchain_with_version(tool_version: &str) -> Toolchain {
+        Toolchain {
+            compact_bin: PathBuf::from("/usr/bin/compact"),
+            tool_version: tool_version.to_string(),
+            language_version: "0.23.0".to_string(),
+        }
+    }
+
+    /// Pulls the single queued `window/showMessage` notification's params off
+    /// `rx`, panicking if the queue holds anything else. Asserts nothing else
+    /// is queued behind it.
+    fn expect_show_message(
+        rx: &crossbeam_channel::Receiver<Message>,
+    ) -> lsp_types::ShowMessageParams {
+        let msg = rx.try_recv().expect("expected a queued notification");
+        let Message::Notification(not) = msg else {
+            panic!("expected a Notification, got {msg:?}");
+        };
+        assert_eq!(not.method, "window/showMessage");
+        assert!(
+            rx.try_recv().is_err(),
+            "expected exactly one queued notification"
+        );
+        serde_json::from_value(not.params).unwrap()
+    }
+
+    #[test]
+    fn notify_version_drift_once_warns_on_mismatch() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Message>();
+        let (_keep_tx, keep_rx) = crossbeam_channel::unbounded::<Message>();
+        let mut state = GlobalState::new(tx, keep_rx);
+        state.toolchain = Some(toolchain_with_version("0.33.0"));
+
+        state.notify_version_drift_once();
+
+        let params = expect_show_message(&rx);
+        assert_eq!(params.typ, lsp_types::MessageType::WARNING);
+        assert!(params.message.contains("0.31.1"), "{}", params.message);
+        assert!(params.message.contains("0.33.0"), "{}", params.message);
+        assert!(params.message.contains("stale"), "{}", params.message);
+
+        // At most once per session: a second call is a silent no-op.
+        state.notify_version_drift_once();
+        assert!(
+            rx.try_recv().is_err(),
+            "must not send a second advisory this session"
+        );
+    }
+
+    #[test]
+    fn notify_version_drift_once_is_silent_on_matching_version() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Message>();
+        let (_keep_tx, keep_rx) = crossbeam_channel::unbounded::<Message>();
+        let mut state = GlobalState::new(tx, keep_rx);
+        state.toolchain = Some(toolchain_with_version("0.31.1"));
+
+        state.notify_version_drift_once();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a matching toolchain version must not send anything"
+        );
+    }
+
+    #[test]
+    fn notify_version_drift_once_is_silent_with_no_toolchain() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Message>();
+        let (_keep_tx, keep_rx) = crossbeam_channel::unbounded::<Message>();
+        let mut state = GlobalState::new(tx, keep_rx);
+        // state.toolchain defaults to None (no discovery in this test).
+
+        state.notify_version_drift_once();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no discovered toolchain must not send anything"
+        );
     }
 
     // --- Per-file diagnostic cap (CR-4) -------------------------------------

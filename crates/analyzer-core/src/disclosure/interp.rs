@@ -19,7 +19,9 @@ use compactp_syntax::{SyntaxKind, SyntaxNode};
 use text_size::TextRange;
 
 use crate::Definition;
-use crate::db::{Db, FileDeps, SourceText, Workspace, item_symbol, item_tree, resolve_query};
+use crate::db::{
+    Db, FileDeps, SourceText, Workspace, item_symbol, item_tree, resolve_in_file, resolve_query,
+};
 use crate::item_tree::{ItemTree, SymbolKind};
 use crate::ty::TyKind;
 
@@ -103,33 +105,44 @@ pub enum Root {
 /// plus the file's constructor (R0 S2/S3). Non-exported circuits are excluded;
 /// they are analyzed only through call sites (v3b).
 ///
-/// A circuit defined inside a `module { }` (`is_module_nested`) is ALSO
-/// excluded — and, unlike a non-exported circuit, it records an amber advisory
-/// via `sink` (spec §0, fail-closed). The compiler does NOT treat a
-/// module-nested `export circuit` as a disclosing root (it is reached only
-/// through its import/export chain); whether one is genuinely re-exported to the
-/// top level needs import-chain resolution (v3b). Seeding it as a root here
-/// flags its arg→ledger writes as false-positive `E3100` leaks on
+/// A circuit defined inside a `module { }` (`is_module_nested`) is a root ONLY
+/// when it is re-exported to the top level (B4). The compiler treats a module
+/// `export circuit` as a disclosing `id-exported?` root iff a top-level
+/// `export { name }` list names it (through the import/export chain); a module
+/// `export circuit` that is merely module-exported, or imported-without-export,
+/// is NOT a root (compactc ACCEPTs such a file — verified against
+/// `compact 0.31.1`, task-B4-findings.md probes a/c/d). `reexported_module_circuits`
+/// computes exactly that set (same-file resolution); a member of it becomes a
+/// real `Root::Circuit` and is walked like any other exported circuit.
+///
+/// A module-nested exported circuit that is NOT in that set stays EXCLUDED and
+/// records an amber advisory via `sink` (spec §0, fail-closed). Seeding one as a
+/// root would flag its arg→ledger writes as false-positive `E3100` leaks on
 /// compiler-accepted module programs (corpus FP #2). Excluding it fails CLOSED
 /// to amber — never a false-positive red, and never silent green (the advisory
-/// records the deferral).
-pub fn discover_roots(tree: &ItemTree, sink: &mut DisclosureSink) -> Vec<Root> {
+/// records the exclusion).
+pub fn discover_roots(ctx: &InterpCtx, tree: &ItemTree, sink: &mut DisclosureSink) -> Vec<Root> {
+    let reexported = reexported_module_circuits(ctx, tree, sink);
     tree.symbols
         .iter()
         .enumerate()
         .filter_map(|(i, s)| match s.kind {
             SymbolKind::Circuit if s.exported => {
-                if is_module_nested(tree, i as u32) {
+                if is_module_nested(tree, i as u32) && !reexported.contains(&(i as u32)) {
+                    // Module-exported but not re-exported to the top level: not a
+                    // root (compactc ACCEPTs it there). Fail closed to amber.
                     sink.emit_advisory(
                         s.name_range,
                         format!(
-                            "module-nested circuit `{}` not analyzed as a disclosing root in \
-                             v3a; deferred to v3b (import/export-chain resolution)",
+                            "module-nested circuit `{}` is not re-exported to the top level, so \
+                             it is not analyzed as a disclosing root",
                             s.name
                         ),
                     );
                     None
                 } else {
+                    // A top-level exported circuit, OR a module circuit the top
+                    // level re-exports (B4): a real `id-exported?` disclosing root.
                     Some(Root::Circuit {
                         name: s.name.clone(),
                         symbol: i as u32,
@@ -140,6 +153,72 @@ pub fn discover_roots(tree: &ItemTree, sink: &mut DisclosureSink) -> Vec<Root> {
             _ => None,
         })
         .collect()
+}
+
+/// The set of symbol indices of module-nested circuits that a TOP-LEVEL
+/// `export { ... }` list re-exports — the module circuits the compiler roots as
+/// `id-exported?` disclosing roots (B4). For each name in each top-level export
+/// list, resolve it through the file's own scope/imports (`resolve_in_file`,
+/// the same resolution `classify_callee` uses for calls); a name that resolves
+/// to a SAME-FILE module-nested `Circuit` symbol is a re-exported root.
+///
+/// Fail-closed (§0): a top-level export name that resolves to a circuit in a
+/// DIFFERENT file (a cross-file re-export we do not seed/walk here) records an
+/// amber advisory at the export name rather than silently dropping a potential
+/// root. Names that resolve to non-circuits (types, ledgers, witnesses) or to a
+/// top-level (non-module) circuit are ignored here — the latter is already a
+/// root via its own `export` keyword.
+fn reexported_module_circuits(
+    ctx: &InterpCtx,
+    tree: &ItemTree,
+    sink: &mut DisclosureSink,
+) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    let root = SyntaxNode::new_root(crate::db::parsed(ctx.db, ctx.src).green);
+    let Some(sf) = compactp_ast::SourceFile::cast(root) else {
+        return out;
+    };
+    for item in sf.items() {
+        let compactp_ast::Item::ExportList(exports) = item else {
+            continue;
+        };
+        for name_tok in exports.names() {
+            let name = name_tok.text().to_string();
+            let Some(Definition::Item { file: df, index }) = resolve_in_file(
+                ctx.db,
+                ctx.file,
+                ctx.src,
+                ctx.fd,
+                ctx.ws,
+                name_tok.text_range().start(),
+                name.clone(),
+            ) else {
+                continue;
+            };
+            if df == ctx.file {
+                if let Some(sym) = tree.symbols.get(index as usize)
+                    && sym.kind == SymbolKind::Circuit
+                    && is_module_nested(tree, index)
+                {
+                    out.insert(index);
+                }
+            } else if item_symbol(ctx.db, ctx.file, ctx.src, ctx.fd, df, index)
+                .is_some_and(|s| s.kind == SymbolKind::Circuit)
+            {
+                // Cross-file re-exported circuit: a root we cannot seed/walk here
+                // (needs the target file's SourceText + params). §0 fail-closed —
+                // never silently skip a potential disclosing root.
+                sink.emit_advisory(
+                    name_tok.text_range(),
+                    format!(
+                        "re-exported circuit `{name}` is defined in another module/file; not \
+                         analyzed as a disclosing root here",
+                    ),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Whether symbol `i`'s enclosing-scope chain runs through a `module { }`. A
@@ -2360,9 +2439,17 @@ mod tests {
         let ws = empty_ws(&db);
         let file = crate::FileId::from_raw_for_test(0);
         let tree = item_tree(&db, src);
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
 
         let mut sink = DisclosureSink::new();
-        let roots = discover_roots(&tree, &mut sink);
+        let roots = discover_roots(&base, &tree, &mut sink);
         let ctor_root = roots
             .iter()
             .find(|r| matches!(r, Root::Constructor { .. }))
@@ -2413,9 +2500,20 @@ mod tests {
                      export circuit pub_c(): [] { }\n\
                      circuit priv_c(): [] { }\n";
         let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = empty_ws(&db);
+        let file = crate::FileId::from_raw_for_test(0);
         let tree = item_tree(&db, src);
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
         let mut sink = DisclosureSink::new();
-        let roots = discover_roots(&tree, &mut sink);
+        let roots = discover_roots(&base, &tree, &mut sink);
 
         assert!(roots.iter().any(|r| matches!(r, Root::Constructor { .. })));
         assert!(
@@ -2456,7 +2554,7 @@ mod tests {
         };
         let tree = item_tree(&db, src);
         let mut sink = DisclosureSink::new();
-        let roots = discover_roots(&tree, &mut sink);
+        let roots = discover_roots(&base, &tree, &mut sink);
         assert!(
             !roots
                 .iter()
@@ -2475,6 +2573,134 @@ mod tests {
                 .iter()
                 .any(|a| a.reason.contains("module-nested circuit `leak`")),
             "excluded module circuit must record an amber advisory (never silent green)"
+        );
+    }
+
+    #[test]
+    fn module_reexported_circuit_is_a_root_and_leaks() {
+        // B4 surface 1: a module `export circuit` that writes its own parameter
+        // to a ledger becomes a disclosing ROOT when a top-level `export { s }`
+        // re-exports it (`s` -> `store`). compactc REJECTs this exact shape
+        // (task-B4-findings.md probe b / module_circuit_leak.compact). The
+        // re-exported module circuit must therefore be a root, seeded with its
+        // own param, and its arg->ledger write must confirm an E-leak — NOT the
+        // fail-closed amber that an un-re-exported module circuit gets.
+        let (db, src, fd, ws, file) = walk_setup(
+            "import CompactStandardLibrary;\n\
+             module Inner {\n\
+             export ledger stored: Field;\n\
+             export circuit store(x: Field): [] { stored = x; }\n\
+             }\n\
+             import { store as s } from Inner;\n\
+             export { s };\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&base, &tree, &mut sink);
+        assert!(
+            roots
+                .iter()
+                .any(|r| matches!(r, Root::Circuit { name, .. } if name == "store")),
+            "a re-exported module circuit must be a disclosing root"
+        );
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        assert!(
+            !sink.drain_leaks().is_empty(),
+            "the re-exported module circuit's arg->ledger write must confirm a leak"
+        );
+        // No fail-closed "not re-exported" advisory for `store` (it IS analyzed).
+        assert!(
+            !sink
+                .advisories()
+                .iter()
+                .any(|a| a.reason.contains("`store`") && a.reason.contains("not re-exported")),
+            "an analyzed re-exported root must not also record the excluded-module advisory"
+        );
+    }
+
+    #[test]
+    fn module_reexported_disclosing_circuit_is_a_root_but_no_leak() {
+        // §0 / regression guard for corpus FP #2: a re-exported module circuit
+        // is rooted, but if it disclose()s before the ledger write it must NOT
+        // leak (matches module_reexport_ok.compact, which compactc ACCEPTs).
+        let (db, src, fd, ws, file) = walk_setup(
+            "import CompactStandardLibrary;\n\
+             module Inner {\n\
+             export ledger stored: Field;\n\
+             export circuit store(x: Field): [] { stored = disclose(x); }\n\
+             }\n\
+             import { store as s } from Inner;\n\
+             export { s };\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&base, &tree, &mut sink);
+        assert!(
+            roots
+                .iter()
+                .any(|r| matches!(r, Root::Circuit { name, .. } if name == "store")),
+            "a re-exported module circuit is still rooted even when it discloses"
+        );
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        assert!(
+            sink.drain_leaks().is_empty(),
+            "a re-exported circuit that discloses before the write must not leak"
+        );
+    }
+
+    #[test]
+    fn module_imported_call_leaks_interprocedurally() {
+        // B4 surface 2 (within-file module resolution, already served by B2/B3):
+        // a top-level exported circuit `top` passes its witness param to the
+        // module-imported `s` (== `Inner.store`), which writes it to a ledger.
+        // compactc REJECTs (module_call_leak.compact). The module-imported call
+        // must resolve to its body and confirm the interprocedural leak.
+        let (db, src, fd, ws, file) = walk_setup(
+            "import CompactStandardLibrary;\n\
+             module Inner {\n\
+             export ledger stored: Field;\n\
+             export circuit store(x: Field): [] { stored = x; }\n\
+             }\n\
+             import { store as s } from Inner;\n\
+             export circuit top(secret: Field): [] { s(secret); }\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&base, &tree, &mut sink);
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        assert!(
+            !sink.drain_leaks().is_empty(),
+            "a call to a module-imported circuit that leaks must confirm interprocedurally"
         );
     }
 
@@ -2503,7 +2729,7 @@ mod tests {
         };
         let tree = item_tree(&db, src);
         let mut sink = DisclosureSink::new();
-        let roots = discover_roots(&tree, &mut sink);
+        let roots = discover_roots(&base, &tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -2964,7 +3190,7 @@ mod tests {
         };
         let tree = item_tree(&db, src);
         let mut sink = DisclosureSink::new();
-        let roots = discover_roots(&tree, &mut sink);
+        let roots = discover_roots(&base, &tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -2998,7 +3224,7 @@ mod tests {
         };
         let tree = item_tree(&db, src);
         let mut sink = DisclosureSink::new();
-        let roots = discover_roots(&tree, &mut sink);
+        let roots = discover_roots(&base, &tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -3031,7 +3257,7 @@ mod tests {
         };
         let tree = item_tree(&db, src);
         let mut sink = DisclosureSink::new();
-        let roots = discover_roots(&tree, &mut sink);
+        let roots = discover_roots(&base, &tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -3074,7 +3300,7 @@ mod tests {
         };
         let tree = item_tree(&db, src);
         let mut sink = DisclosureSink::new();
-        let roots = discover_roots(&tree, &mut sink);
+        let roots = discover_roots(&base, &tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -3121,7 +3347,7 @@ mod tests {
         };
         let tree = item_tree(&db, src);
         let mut sink = DisclosureSink::new();
-        let roots = discover_roots(&tree, &mut sink);
+        let roots = discover_roots(&base, &tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -3153,7 +3379,7 @@ mod tests {
         };
         let tree = item_tree(&db, src);
         let mut sink = DisclosureSink::new();
-        let roots = discover_roots(&tree, &mut sink);
+        let roots = discover_roots(&base, &tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }
@@ -3194,7 +3420,7 @@ mod tests {
         };
         let tree = item_tree(&db, src);
         let mut sink = DisclosureSink::new();
-        let roots = discover_roots(&tree, &mut sink);
+        let roots = discover_roots(&base, &tree, &mut sink);
         for root in &roots {
             interp_root(&base, &mut sink, root);
         }

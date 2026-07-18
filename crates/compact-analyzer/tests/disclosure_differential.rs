@@ -188,6 +188,18 @@ const FIXTURES: &[Fixture] = &[
         discloses: true,
         native_confirms: true,
     },
+    Fixture {
+        name: "module_circuit_leak.compact",
+        rule: "B4 re-exported module circuit becomes a disclosing root (arg → ledger)",
+        discloses: true,
+        native_confirms: true,
+    },
+    Fixture {
+        name: "module_call_leak.compact",
+        rule: "B4 top-level export calls a module-imported circuit that leaks",
+        discloses: true,
+        native_confirms: true,
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

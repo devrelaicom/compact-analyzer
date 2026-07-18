@@ -53,7 +53,6 @@ pub fn disclosure_diagnostics_query(
 ) -> Arc<[Diagnostic]> {
     let tree = item_tree(db, src);
     let mut sink = DisclosureSink::new();
-    let roots = interp::discover_roots(&tree, &mut sink);
     let base = InterpCtx {
         db,
         file,
@@ -62,6 +61,7 @@ pub fn disclosure_diagnostics_query(
         ws,
         disclosing_fn: None,
     };
+    let roots = interp::discover_roots(&base, &tree, &mut sink);
     for root in &roots {
         interp::interp_root(&base, &mut sink, root);
     }

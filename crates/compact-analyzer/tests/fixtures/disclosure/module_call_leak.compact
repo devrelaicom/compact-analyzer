@@ -1,0 +1,30 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+// B4 surface 2 (a top-level export calls a module-imported circuit that leaks).
+// `top` is an ordinary top-level exported circuit (a confident root). It passes
+// its own witness-value parameter `secret` to `s`, which is the module-imported
+// `Inner.store` (`import { store as s } from Inner`). `store` writes that
+// argument to a ledger WITHOUT disclose(). compactc follows the module-imported
+// callee through its body and REJECTS: the caller's witness flows through the
+// call into the ledger write.
+//
+// Validated against `compact compile +0.31.1`: REJECT with the interprocedural
+// path
+//   "the value of parameter secret of exported circuit top"
+//   "the argument to store at line 14 char 3"
+//   "the right-hand side of = at line 8 char 12"
+
+module Inner {
+  export ledger stored: Field;
+
+  export circuit store(x: Field): [] {
+    stored = x;
+  }
+}
+
+import { store as s } from Inner;
+
+export circuit top(secret: Field): [] {
+  s(secret);
+}

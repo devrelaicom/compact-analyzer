@@ -1,0 +1,26 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+// B4 surface 1 (re-exported module circuit becomes a disclosing ROOT).
+// `store` is defined inside `module Inner` and writes its own parameter to a
+// ledger WITHOUT disclose(). On its own that is not a root (a module `export
+// circuit` is reached only through its import/export chain — see
+// module_reexport_ok.compact case (a), which ACCEPTS). But the top-level
+// `export { s }` re-exports it (`s` -> `store`), which makes `store` a
+// top-level `id-exported?` disclosing root. compactc then seeds `store`'s own
+// parameter as a witness-value source and REJECTS the arg->ledger write.
+//
+// Validated against `compact compile +0.31.1`: REJECT with
+//   "the value of parameter x of exported circuit store"
+//   "the right-hand side of = at line 8 char 12"
+
+module Inner {
+  export ledger stored: Field;
+
+  export circuit store(x: Field): [] {
+    stored = x;
+  }
+}
+
+import { store as s } from Inner;
+export { s };

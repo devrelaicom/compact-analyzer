@@ -11,7 +11,7 @@
 //! the A1/A2-era file-level `#![cfg_attr(not(test), expect(dead_code))]`
 //! scaffold marker is gone.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use compactp_ast::AstNode;
 use compactp_ast::expr::{CallExpr, Expr, FoldExpr, LambdaExpr, MapExpr};
@@ -33,6 +33,50 @@ use super::tables;
 /// A root's seeded parameter environment: variable name -> its `Abs`.
 /// A3's interpreter looks up identifiers here when walking a root's body.
 pub type Env = HashMap<String, Abs>;
+
+/// The interprocedural memo cache key + value (B0 Q2, walk-local `call-ht` per
+/// the memoization ADR). The key is `((callee_file, callee_symbol), arg_shapes,
+/// control)`; the value is the callee body's returned `Abs`. B2 threads this
+/// field through `WalkState` but does NOT populate it — the lookup/insert is
+/// Task B3. Left present-but-unused so B3 is a pure fill-in.
+pub type CallCache = HashMap<(crate::FileId, u32, Vec<Abs>, Vec<Witness>), Abs>;
+
+/// Hard bound on cross-circuit recursion depth (spec §0, fail-closed). Recursion
+/// is forbidden upstream of the WPP (B0 Q4, `reject-recursive-circuits`), so the
+/// `active`-set guard is the real cycle catch; this depth cap is
+/// belt-and-suspenders against pathological non-cyclic nesting so the walk always
+/// terminates rather than blowing the stack.
+const MAX_CALL_DEPTH: u32 = 256;
+
+/// Walk-local state threaded through the interprocedural interpreter (B2/B3).
+/// Scoped to a single `disclosure_diagnostics_query` run — built fresh per root
+/// walk in `interp_root`, discarded when the walk returns (memoization ADR,
+/// Option A). Mirrors the compiler's `call-ht` + `Call-inprocess` machinery
+/// (`analysis-passes.ss` ~5013-5116, B0 Q1/Q2/Q4).
+#[derive(Default)]
+pub struct WalkState {
+    /// The B3 memo cache (`call-ht`): B2 leaves this empty; B3 wires the
+    /// lookup/insert in `interp_circuit_call`. Present-but-unread in B2 by design
+    /// (memoization ADR) so B3 is a pure fill-in with no signature churn.
+    #[allow(dead_code)]
+    pub cache: CallCache,
+    /// The `Call-inprocess` recursion guard (B0 Q4): the `(file, symbol)` of
+    /// every circuit currently on the active call stack. A callee already in
+    /// this set is a cycle ⇒ fail closed (amber advisory + clean result), never
+    /// an infinite loop.
+    pub active: HashSet<(crate::FileId, u32)>,
+    /// Current cross-circuit call depth (guards `MAX_CALL_DEPTH`).
+    pub depth: u32,
+    /// Walk-local return-value witness accumulator: `interp_stmt`'s `return`
+    /// arm merges each returned value's witnesses here so a callee's
+    /// flow-back value (`interp_body_returning`) picks up returns nested inside
+    /// control flow (`if`/`for`) too, not just a tail `return`. Fail-closed:
+    /// a return whose value the analyzer can only reach through a branch still
+    /// taints the caller-side result (never a silent under-taint). Saved/restored
+    /// around each `interp_circuit_call` so a callee's returns don't leak into
+    /// the caller's accumulator.
+    pub ret_ws: Vec<Witness>,
+}
 
 /// One analysis root (spec §3, R0 S2/S3): an exported circuit or the file's
 /// constructor. A3 walks each root's body, seeded by `seed_sources`.
@@ -310,7 +354,21 @@ pub fn interp_root(ctx: &InterpCtx, sink: &mut DisclosureSink, root: &Root) {
     let Some(body) = root_body(&ctx, root) else {
         return;
     };
-    interp_stmt(&ctx, sink, &mut env, &[], &compactp_ast::Stmt::Block(body));
+    // One walk-local `WalkState` per root walk (memoization ADR, Option A): the
+    // interprocedural cache + recursion guard are scoped to this walk. Sharing a
+    // single cache across roots in one file would also be sound, but a per-root
+    // state keeps roots independent and matches the compiler's single-driver
+    // `handle-call` entry (B0 Q3: roots are never cache-looked-up). The root's
+    // own return value is discarded (only non-root callees flow theirs back).
+    let mut state = WalkState::default();
+    interp_stmt(
+        &ctx,
+        sink,
+        &mut state,
+        &mut env,
+        &[],
+        &compactp_ast::Stmt::Block(body),
+    );
 }
 
 /// The body `Block` of a root's circuit/constructor declaration, located the
@@ -346,8 +404,18 @@ enum CalleeClass {
     /// (`Unknown` when it can't be read precisely — fail-closed via
     /// `abs_of_type`).
     Witness { name: String, ret: TyKind },
-    /// A user `circuit` (defer cross-circuit interpretation to v3b).
-    Circuit,
+    /// A user `circuit` resolved to a definition we can interpret (B2): carries
+    /// the def's `(file, symbol)` so `interp_circuit_call` can locate its
+    /// params + body. Same-file for B2; cross-module is deferred inside
+    /// `interp_circuit_call` (B4 lifts it).
+    Circuit { file: crate::FileId, symbol: u32 },
+    /// A circuit-shaped callee we can NOT interpret here and defer fail-closed
+    /// (amber advisory + clean result, §0): an unresolved name (a module-imported
+    /// circuit v3a's resolution can't follow), a bodyless `CircuitSig`, or a
+    /// cross-contract `ContractCircuit`. Distinct from `Native` — it must NOT
+    /// conduit-taint its args (that would false-positive on compiler-accepted
+    /// module programs; see `unresolved_callee_class`).
+    DeferredCircuit,
     /// A native/stdlib primitive, a ledger/method call, or an unresolved
     /// callee — all deferred to A6, fail-closed here.
     Native,
@@ -363,6 +431,7 @@ enum CalleeClass {
 pub fn interp_expr(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &Env,
     control: &[Witness],
     expr: &Expr,
@@ -387,21 +456,21 @@ pub fn interp_expr(
             .unwrap_or_else(|| Abs::Atomic(Vec::new())),
         // Parenthesized (structural): passthrough the inner expression.
         Expr::Paren(_) => match child_exprs(expr.syntax()).first() {
-            Some(inner) => interp_expr(ctx, sink, env, control, inner),
+            Some(inner) => interp_expr(ctx, sink, state, env, control, inner),
             None => Abs::Atomic(Vec::new()),
         },
         // Cast / `as` (R0 P2): identity passthrough — casts carry taint
         // unchanged, they do NOT sanitize. The `Type` child does not cast to
         // `Expr`, so the sole `Expr` child is the operand.
         Expr::Cast(_) => match child_exprs(expr.syntax()).first() {
-            Some(operand) => interp_expr(ctx, sink, env, control, operand),
+            Some(operand) => interp_expr(ctx, sink, state, env, control, operand),
             None => Abs::Atomic(Vec::new()),
         },
         // `disclose(e)` (R0 D1): the ONLY sanitizer. Interpret the argument,
         // then clear witnesses at every level.
         Expr::Disclose(_) => {
             let arg = match child_exprs(expr.syntax()).first() {
-                Some(e) => interp_expr(ctx, sink, env, control, e),
+                Some(e) => interp_expr(ctx, sink, state, env, control, e),
                 None => Abs::Atomic(Vec::new()),
             };
             disclose(&arg)
@@ -415,11 +484,11 @@ pub fn interp_expr(
             }
             None => Abs::Atomic(Vec::new()),
         },
-        Expr::Binary(b) => interp_binary(ctx, sink, env, control, b, src),
-        Expr::Ternary(_) => interp_ternary(ctx, sink, env, control, expr, src),
-        Expr::Call(call) => interp_call(ctx, sink, env, control, call, src),
-        Expr::Member(m) => interp_member(ctx, sink, env, control, m, src),
-        Expr::Index(_) => interp_index(ctx, sink, env, control, expr, src),
+        Expr::Binary(b) => interp_binary(ctx, sink, state, env, control, b, src),
+        Expr::Ternary(_) => interp_ternary(ctx, sink, state, env, control, expr, src),
+        Expr::Call(call) => interp_call(ctx, sink, state, env, control, call, src),
+        Expr::Member(m) => interp_member(ctx, sink, state, env, control, m, src),
+        Expr::Index(_) => interp_index(ctx, sink, state, env, control, expr, src),
         // Struct literal (R0 P5 `new`): `Multiple`, one child per field, slotted
         // into DECLARED field order so it agrees with the projection path
         // (`field_index`/`abs_of_type`, both declared-order). A struct-update
@@ -429,13 +498,14 @@ pub fn interp_expr(
                 return fail_closed_expr(
                     ctx,
                     sink,
+                    state,
                     env,
                     control,
                     expr,
                     "struct-update (spread) construction not modeled",
                 );
             }
-            interp_struct_literal(ctx, sink, env, control, s, src)
+            interp_struct_literal(ctx, sink, state, env, control, s, src)
         }
         // Array literal (R0 AB1/P5 `vector`): arrays are tracked in the
         // aggregate -> `Single` over the join of all element abses.
@@ -443,7 +513,7 @@ pub fn interp_expr(
             let elems = child_exprs(a.syntax());
             let mut acc: Option<Abs> = None;
             for e in &elems {
-                let ea = interp_expr(ctx, sink, env, control, e);
+                let ea = interp_expr(ctx, sink, state, env, control, e);
                 acc = Some(match acc {
                     Some(prev) => combine_abs(&prev, &ea),
                     None => ea,
@@ -456,7 +526,7 @@ pub fn interp_expr(
         Expr::Bytes(bytes) => {
             let mut ws = Vec::new();
             for e in child_exprs(bytes.syntax()) {
-                let a = interp_expr(ctx, sink, env, control, &e);
+                let a = interp_expr(ctx, sink, state, env, control, &e);
                 ws = merge_witnesses(&ws, &witnesses_of(&a));
             }
             Abs::Atomic(ws)
@@ -465,25 +535,36 @@ pub fn interp_expr(
         // sequences' element abstracts — an inner `disclose` clears, an inner
         // sink records — with the fold iterated to a bounded `abs_equal` fixed
         // point. Routed out of the fail-closed catch-all.
-        Expr::Map(m) => interp_map(ctx, sink, env, control, m),
-        Expr::Fold(f) => interp_fold(ctx, sink, env, control, f),
+        Expr::Map(m) => interp_map(ctx, sink, state, env, control, m),
+        Expr::Fold(f) => interp_fold(ctx, sink, state, env, control, f),
         // Not in the R0 index (or deferred): fail closed.
         // `slice`/`pad`/`spread`/`lambda`/unary -> unmodeled. Advisory +
         // conservative union of subexpr witnesses.
         Expr::Slice(_) => fail_closed_expr(
             ctx,
             sink,
+            state,
             env,
             control,
             expr,
             "slice projection not modeled",
         ),
-        Expr::Pad(_) => fail_closed_expr(ctx, sink, env, control, expr, "pad not modeled"),
-        Expr::Spread(_) => fail_closed_expr(ctx, sink, env, control, expr, "spread not modeled"),
-        Expr::Unary(_) => {
-            fail_closed_expr(ctx, sink, env, control, expr, "unary operator not modeled")
+        Expr::Pad(_) => fail_closed_expr(ctx, sink, state, env, control, expr, "pad not modeled"),
+        Expr::Spread(_) => {
+            fail_closed_expr(ctx, sink, state, env, control, expr, "spread not modeled")
         }
-        Expr::Lambda(_) => fail_closed_expr(ctx, sink, env, control, expr, "lambda not modeled"),
+        Expr::Unary(_) => fail_closed_expr(
+            ctx,
+            sink,
+            state,
+            env,
+            control,
+            expr,
+            "unary operator not modeled",
+        ),
+        Expr::Lambda(_) => {
+            fail_closed_expr(ctx, sink, state, env, control, expr, "lambda not modeled")
+        }
     }
 }
 
@@ -494,6 +575,7 @@ pub fn interp_expr(
 fn interp_binary(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &Env,
     control: &[Witness],
     b: &compactp_ast::expr::BinaryExpr,
@@ -503,7 +585,7 @@ fn interp_binary(
     let op = b.op().map(|t| t.kind());
     let lhs = kids
         .first()
-        .map(|e| interp_expr(ctx, sink, env, control, e))
+        .map(|e| interp_expr(ctx, sink, state, env, control, e))
         .unwrap_or_else(|| Abs::Atomic(Vec::new()));
     // `&&`/`||` short-circuit (R0 F3): they desugar to `if`, so the RHS runs only
     // under the LHS — a sink inside the RHS is control-dependent on the LHS's
@@ -518,7 +600,7 @@ fn interp_binary(
     };
     let rhs = kids
         .get(1)
-        .map(|e| interp_expr(ctx, sink, env, &rhs_control, e))
+        .map(|e| interp_expr(ctx, sink, state, env, &rhs_control, e))
         .unwrap_or_else(|| Abs::Atomic(Vec::new()));
     match op {
         Some(SyntaxKind::PLUS | SyntaxKind::MINUS | SyntaxKind::STAR) => {
@@ -571,6 +653,7 @@ fn interp_binary(
 fn interp_ternary(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &Env,
     control: &[Witness],
     expr: &Expr,
@@ -579,7 +662,7 @@ fn interp_ternary(
     let kids = child_exprs(expr.syntax());
     let cond = kids
         .first()
-        .map(|e| interp_expr(ctx, sink, env, control, e))
+        .map(|e| interp_expr(ctx, sink, state, env, control, e))
         .unwrap_or_else(|| Abs::Atomic(Vec::new()));
     // Both branches are gated on the condition (R0 F1/§3.3): thread its
     // witnesses into `control` so a sink inside either branch records the
@@ -588,11 +671,11 @@ fn interp_ternary(
     let branch_control = thread_control(witnesses_of(&cond), control, src);
     let then_abs = kids
         .get(1)
-        .map(|e| interp_expr(ctx, sink, env, &branch_control, e))
+        .map(|e| interp_expr(ctx, sink, state, env, &branch_control, e))
         .unwrap_or_else(|| Abs::Atomic(Vec::new()));
     let else_abs = kids
         .get(2)
-        .map(|e| interp_expr(ctx, sink, env, &branch_control, e))
+        .map(|e| interp_expr(ctx, sink, state, env, &branch_control, e))
         .unwrap_or_else(|| Abs::Atomic(Vec::new()));
     let joined = match &cond {
         Abs::Boolean { value, .. } => {
@@ -628,6 +711,7 @@ fn interp_ternary(
 fn interp_call(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &Env,
     control: &[Witness],
     call: &CallExpr,
@@ -647,19 +731,22 @@ fn interp_call(
             };
             abs_of_type(sink, &ret, std::slice::from_ref(&w))
         }
-        // A cross-circuit call (v3b) or a native/stdlib/ledger-op/unresolved
-        // callee (A6): the taint semantics of the RESULT are not yet modeled, so
-        // fail closed to an AMBER advisory (spec §0) and return a CLEAN result —
-        // NOT a conservatively-tainted one. A tainted result would flow to a sink
-        // as a confirmed RED leak (§0 says fail-closed is *amber*, not red), and
-        // for a native that is actually a sanitizer (`persistentCommit`/
-        // `transientCommit`, `discloses: nothing`) that RED would be a false
-        // positive on compiler-accepted code — breaking the corpus gate. A6's
-        // conduit table promotes the real conduits (`persistentHash` → "a hash
-        // of") back to tainted; until then the uncertainty lives in the advisory.
-        // Arguments are still interpreted (for their own nested sinks/advisories).
-        CalleeClass::Circuit => {
-            interp_args_for_effect(ctx, sink, env, control, call);
+        // A cross-circuit call to a resolved user circuit (v3b B2): interpret
+        // the callee body under the interpreted arg shapes so witness taint flows
+        // through the helper to its ledger/return sinks and back to the caller.
+        CalleeClass::Circuit { file: cf, symbol } => {
+            interp_circuit_call(ctx, sink, state, env, control, call, cf, symbol, src)
+        }
+        // A circuit-shaped callee we can't interpret here (unresolved / bodyless
+        // sig / cross-contract): the taint semantics of the RESULT are not
+        // modeled, so fail closed to an AMBER advisory (spec §0) and return a
+        // CLEAN result — NOT a conservatively-tainted one. A tainted result would
+        // flow to a sink as a confirmed RED leak, a false positive on
+        // compiler-accepted module programs (the `top_func` → `mf(x)` pattern);
+        // §0 says fail-closed is *amber*, not red. Arguments are still
+        // interpreted (for their own nested sinks/advisories).
+        CalleeClass::DeferredCircuit => {
+            interp_args_for_effect(ctx, sink, state, env, control, call);
             sink.emit_advisory(src, "cross-circuit call not interpreted (v3b)".to_string());
             Abs::Atomic(Vec::new())
         }
@@ -669,7 +756,7 @@ fn interp_call(
             // args) — unlike the Circuit arm, which discards it.
             let args: Vec<Abs> = arg_exprs(call)
                 .iter()
-                .map(|a| interp_expr(ctx, sink, env, control, a))
+                .map(|a| interp_expr(ctx, sink, state, env, control, a))
                 .collect();
             let name = call
                 .name()
@@ -689,6 +776,185 @@ fn interp_call(
             }
         }
     }
+}
+
+/// Interprets a cross-circuit call (B2 — the core of v3b). Locates the callee's
+/// params + body, interprets each argument to an `Abs` (keeping taint), binds a
+/// FRESH `empty-env` of `param -> arg_shape` (the callee does NOT inherit the
+/// caller's env — B0 Q1, `extend-env empty-env var-name* abs*`), threads the
+/// CALLER's `control` in unchanged (B0 Q1), and walks the callee body with
+/// `disclosing_fn = None` (a non-root callee's `return` must NOT leak — the K7
+/// filter, B0 Q3). The callee's returned `Abs` flows back so caller-side taint
+/// propagates. Callee-body ledger/return sinks record into the shared `sink`.
+///
+/// Fail-closed (§0) at every unanalyzable point — a recursion cycle / excessive
+/// depth (B0 Q4), an unresolvable or cross-file callee (cross-module deferred to
+/// B4), or an arity mismatch — records an amber advisory and returns a CLEAN
+/// `Atomic([])`: never an infinite loop, never a silent green, never a
+/// conduit-tainted red.
+#[allow(clippy::too_many_arguments)]
+fn interp_circuit_call(
+    ctx: &InterpCtx,
+    sink: &mut DisclosureSink,
+    state: &mut WalkState,
+    env: &Env,
+    control: &[Witness],
+    call: &CallExpr,
+    callee_file: crate::FileId,
+    callee_symbol: u32,
+    src: TextRange,
+) -> Abs {
+    // Recursion / depth guard (B0 Q4, §0 fail-closed, terminating). Recursion is
+    // rejected by `reject-recursive-circuits` upstream of the WPP, so `active` is
+    // the real cycle catch; the depth cap is belt-and-suspenders against
+    // pathological non-cyclic nesting. Either ⇒ amber + clean, never a loop.
+    let key = (callee_file, callee_symbol);
+    if state.depth >= MAX_CALL_DEPTH || state.active.contains(&key) {
+        sink.emit_advisory(
+            src,
+            "recursive or deeply-nested circuit call not analyzed".to_string(),
+        );
+        return Abs::Atomic(Vec::new());
+    }
+    // Locate the callee's params + body (same-file for B2; cross-module is B4).
+    let Some(callee) = resolve_circuit_def(ctx, callee_file, callee_symbol) else {
+        sink.emit_advisory(
+            src,
+            "cross-circuit call target could not be resolved (cross-module deferred to v3b)"
+                .to_string(),
+        );
+        return Abs::Atomic(Vec::new());
+    };
+    // Interpret the arguments in the CALLER's env/control (keeping taint). Their
+    // own nested sinks/advisories fire here regardless of the callee body.
+    let arg_shapes: Vec<Abs> = arg_exprs(call)
+        .iter()
+        .map(|a| interp_expr(ctx, sink, state, env, control, a))
+        .collect();
+    if arg_shapes.len() != callee.params.len() {
+        sink.emit_advisory(src, "circuit call arity mismatch not analyzed".to_string());
+        return Abs::Atomic(Vec::new());
+    }
+    // (B3 inserts the `call-ht` memo lookup HERE, keyed (key, arg_shapes, control).)
+    // Bind a FRESH env: param -> arg_shape — NO caller-env inheritance (B0 Q1).
+    let mut callee_env: Env = HashMap::new();
+    for (p, a) in callee.params.iter().zip(arg_shapes.iter()) {
+        callee_env.insert(p.clone(), a.clone());
+    }
+    // Non-root callee: `disclosing_fn = None` (K7 disarmed, B0 Q3). `callee_file`
+    // is `ctx.file` for B2 (guaranteed by `resolve_circuit_def`'s same-file gate);
+    // threading it explicitly keeps B4's cross-module lift a one-line change.
+    let callee_ctx = InterpCtx {
+        file: callee_file,
+        disclosing_fn: None,
+        ..*ctx
+    };
+    state.active.insert(key);
+    state.depth += 1;
+    let ret = interp_body_returning(
+        &callee_ctx,
+        sink,
+        state,
+        &mut callee_env,
+        control,
+        &callee.body,
+    );
+    state.depth -= 1;
+    state.active.remove(&key);
+    ret
+}
+
+/// A callee circuit's parameter names + body block (B2). Located by the symbol's
+/// `name_range` the same way `seed_sources`/`root_body` find a root's def.
+struct CircuitDef {
+    /// Parameter names, in declaration order — bound positionally to the call's
+    /// interpreted `arg_shapes`.
+    params: Vec<String>,
+    /// The circuit body block, walked by `interp_body_returning`.
+    body: compactp_ast::Block,
+}
+
+/// Resolves a callee circuit's params + body from its `(file, symbol)`. `None`
+/// (caller fails closed) when the callee is cross-file (B2 is same-file only;
+/// B4 adds cross-module by reading the target file's `SourceText`/item tree),
+/// its symbol index doesn't resolve, or the declaration has no body.
+fn resolve_circuit_def(
+    ctx: &InterpCtx,
+    callee_file: crate::FileId,
+    callee_symbol: u32,
+) -> Option<CircuitDef> {
+    // B2: same-file only. A cross-file circuit needs the target file's source
+    // text + item tree threaded in — deferred to B4.
+    if callee_file != ctx.file {
+        return None;
+    }
+    let tree = item_tree(ctx.db, ctx.src);
+    let sym = tree.symbols.get(callee_symbol as usize)?;
+    let ast_root = SyntaxNode::new_root(crate::db::parsed(ctx.db, ctx.src).green);
+    let cd = ast_root
+        .descendants()
+        .filter_map(compactp_ast::CircuitDef::cast)
+        .find(|c| c.name().map(|n| n.text_range()) == Some(sym.name_range))?;
+    let params = cd
+        .params()
+        .filter_map(|p| param_name_and_type(p).map(|(name, _, _)| name))
+        .collect();
+    let body = cd.body()?;
+    Some(CircuitDef { params, body })
+}
+
+/// Walks a callee circuit body (B2) and returns the `Abs` that flows back to the
+/// caller — the value of its `return` (the body block's value). Factored out of
+/// `interp_stmt`'s block handling so a callee's returned value is capturable; the
+/// root path keeps discarding it (`interp_root` ignores the body value).
+///
+/// A tail `return e` is captured precisely (its `Abs`, so a struct/tuple return
+/// still projects field-accurately at the caller). Returns nested inside control
+/// flow (`if`/`for`) are captured conservatively via the walk-local `ret_ws`
+/// accumulator (`interp_stmt`'s `return` arm) and folded into the result as a
+/// witness union — fail-closed (never a silent under-taint of the flow-back
+/// value). A body with no `return` (a `[]`-returning helper like `stash`) flows
+/// back a clean unit `Atomic([])`.
+fn interp_body_returning(
+    ctx: &InterpCtx,
+    sink: &mut DisclosureSink,
+    state: &mut WalkState,
+    env: &mut Env,
+    control: &[Witness],
+    body: &compactp_ast::Block,
+) -> Abs {
+    // Save/restore the caller's return accumulator so this callee's returns don't
+    // bleed into it (and the caller's don't bleed into the callee's flow-back).
+    let saved_ret = std::mem::take(&mut state.ret_ws);
+    let mut tail: Option<Abs> = None;
+    for s in body.stmts() {
+        if let compactp_ast::Stmt::Return(r) = &s {
+            // A top-level `return`: capture its value precisely for the flow-back
+            // SHAPE. The K7 return sink is disarmed for a non-root callee
+            // (`disclosing_fn = None`, B0 Q3), so interpreting the value here
+            // records no return leak — it only realizes any nested arg/ledger
+            // sinks in the returned expression.
+            let val = r
+                .value()
+                .map(|e| interp_expr(ctx, sink, state, env, control, &e))
+                .unwrap_or_else(|| Abs::Atomic(Vec::new()));
+            tail = Some(match tail {
+                Some(prev) => combine_abs(&prev, &val),
+                None => val,
+            });
+        } else {
+            interp_stmt(ctx, sink, state, env, control, &s);
+        }
+    }
+    // `ret_ws` now holds witnesses from returns nested inside control flow only
+    // (the top-level returns above bypass `interp_stmt`). Restore the caller's.
+    let nested = std::mem::replace(&mut state.ret_ws, saved_ret);
+    let mut result = tail.unwrap_or_else(|| Abs::Atomic(Vec::new()));
+    if !nested.is_empty() {
+        // Fail-closed: a value returned from a branch still taints the flow-back.
+        result = add_witnesses(result, &nested);
+    }
+    result
 }
 
 /// A method call reached as `CalleeClass::Native`: a ledger ADT operation
@@ -875,6 +1141,7 @@ fn ordinal(n: usize) -> String {
 fn interp_struct_literal(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &Env,
     control: &[Witness],
     s: &compactp_ast::expr::StructExpr,
@@ -886,7 +1153,7 @@ fn interp_struct_literal(
         .map(|fi| {
             let name = fi.name().map(|n| n.text().to_string());
             let abs = match child_exprs(fi.syntax()).first() {
-                Some(e) => interp_expr(ctx, sink, env, control, e),
+                Some(e) => interp_expr(ctx, sink, state, env, control, e),
                 None => Abs::Atomic(Vec::new()),
             };
             (name, abs)
@@ -941,6 +1208,7 @@ fn interp_struct_literal(
 fn interp_member(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &Env,
     control: &[Witness],
     m: &compactp_ast::expr::MemberExpr,
@@ -949,7 +1217,7 @@ fn interp_member(
     let Some(base) = child_exprs(m.syntax()).into_iter().next() else {
         return Abs::Atomic(Vec::new());
     };
-    let base_abs = interp_expr(ctx, sink, env, control, &base);
+    let base_abs = interp_expr(ctx, sink, state, env, control, &base);
     let field = m.field().map(|t| t.text().to_string());
     if let Abs::Multiple(children) = &base_abs
         && let Some(idx) = field_index(ctx, &base, field.as_deref())
@@ -971,6 +1239,7 @@ fn interp_member(
 fn interp_index(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &Env,
     control: &[Witness],
     expr: &Expr,
@@ -979,11 +1248,11 @@ fn interp_index(
     let kids = child_exprs(expr.syntax());
     let base = kids
         .first()
-        .map(|e| interp_expr(ctx, sink, env, control, e))
+        .map(|e| interp_expr(ctx, sink, state, env, control, e))
         .unwrap_or_else(|| Abs::Atomic(Vec::new()));
     let idx_ws = kids
         .get(1)
-        .map(|e| witnesses_of(&interp_expr(ctx, sink, env, control, e)))
+        .map(|e| witnesses_of(&interp_expr(ctx, sink, state, env, control, e)))
         .unwrap_or_default();
     let pp = PathPoint {
         src,
@@ -1028,6 +1297,7 @@ fn interp_index(
 fn interp_map(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &Env,
     control: &[Witness],
     m: &MapExpr,
@@ -1037,6 +1307,7 @@ fn interp_map(
         return fail_closed_expr(
             ctx,
             sink,
+            state,
             env,
             control,
             &Expr::Map(m.clone()),
@@ -1047,6 +1318,7 @@ fn interp_map(
         return fail_closed_expr(
             ctx,
             sink,
+            state,
             env,
             control,
             &Expr::Map(m.clone()),
@@ -1059,7 +1331,7 @@ fn interp_map(
     }
     let seq_abses: Vec<Abs> = seqs
         .iter()
-        .map(|s| interp_expr(ctx, sink, env, control, s))
+        .map(|s| interp_expr(ctx, sink, state, env, control, s))
         .collect();
 
     if let Some(len) = unroll_len(&seq_abses) {
@@ -1068,7 +1340,7 @@ fn interp_map(
             .map(|i| {
                 let values = seq_abses.iter().map(|s| seq_element_at(s, i));
                 let child = bind_lambda_env(env, &params, values);
-                interp_expr(ctx, sink, &child, control, &body)
+                interp_expr(ctx, sink, state, &child, control, &body)
             })
             .collect();
         Abs::Multiple(results)
@@ -1076,7 +1348,7 @@ fn interp_map(
         // Homogeneous aggregate: one application over the element abstracts.
         let values = seq_abses.iter().map(seq_element_abs);
         let child = bind_lambda_env(env, &params, values);
-        let elem = interp_expr(ctx, sink, &child, control, &body);
+        let elem = interp_expr(ctx, sink, state, &child, control, &body);
         Abs::Single(Box::new(elem))
     }
 }
@@ -1098,6 +1370,7 @@ fn interp_map(
 fn interp_fold(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &Env,
     control: &[Witness],
     f: &FoldExpr,
@@ -1109,6 +1382,7 @@ fn interp_fold(
         return fail_closed_expr(
             ctx,
             sink,
+            state,
             env,
             control,
             &Expr::Fold(f.clone()),
@@ -1119,6 +1393,7 @@ fn interp_fold(
         return fail_closed_expr(
             ctx,
             sink,
+            state,
             env,
             control,
             &Expr::Fold(f.clone()),
@@ -1129,16 +1404,17 @@ fn interp_fold(
         return fail_closed_expr(
             ctx,
             sink,
+            state,
             env,
             control,
             &Expr::Fold(f.clone()),
             "fold with a non-lambda function reference not modeled",
         );
     };
-    let init_abs = interp_expr(ctx, sink, env, control, init_expr);
+    let init_abs = interp_expr(ctx, sink, state, env, control, init_expr);
     let seq_abses: Vec<Abs> = seqs
         .iter()
-        .map(|s| interp_expr(ctx, sink, env, control, s))
+        .map(|s| interp_expr(ctx, sink, state, env, control, s))
         .collect();
 
     if let Some(len) = unroll_len(&seq_abses) {
@@ -1148,7 +1424,7 @@ fn interp_fold(
             let values =
                 std::iter::once(acc.clone()).chain(seq_abses.iter().map(|s| seq_element_at(s, i)));
             let child = bind_lambda_env(env, &params, values);
-            acc = interp_expr(ctx, sink, &child, control, &body);
+            acc = interp_expr(ctx, sink, state, &child, control, &body);
         }
         acc
     } else {
@@ -1160,7 +1436,7 @@ fn interp_fold(
         for _ in 0..bound {
             let values = std::iter::once(acc.clone()).chain(elems.iter().cloned());
             let child = bind_lambda_env(env, &params, values);
-            let next = interp_expr(ctx, sink, &child, control, &body);
+            let next = interp_expr(ctx, sink, state, &child, control, &body);
             if abs_equal(&next, &acc) {
                 return next;
             }
@@ -1321,6 +1597,7 @@ fn seq_element_at(seq: &Abs, i: usize) -> Abs {
 pub fn interp_stmt(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &mut Env,
     control: &[Witness],
     stmt: &compactp_ast::Stmt,
@@ -1329,14 +1606,14 @@ pub fn interp_stmt(
     match stmt {
         Stmt::Block(b) => {
             for s in b.stmts() {
-                interp_stmt(ctx, sink, env, control, &s);
+                interp_stmt(ctx, sink, state, env, control, &s);
             }
         }
         // `const pat = expr` (R0 P5 `let*`): interpret RHS, bind the pattern.
         Stmt::Const(c) => {
             let val = c
                 .value()
-                .map(|e| interp_expr(ctx, sink, env, control, &e))
+                .map(|e| interp_expr(ctx, sink, state, env, control, &e))
                 .unwrap_or_else(|| Abs::Atomic(Vec::new()));
             bind_pattern(sink, env, c.pattern().as_ref(), val);
         }
@@ -1344,7 +1621,7 @@ pub fn interp_stmt(
         // (and any advisory) is realized. Neither is a sink.
         Stmt::Expr(_) | Stmt::Assert(_) => {
             for e in child_exprs(stmt.syntax()) {
-                interp_expr(ctx, sink, env, control, &e);
+                interp_expr(ctx, sink, state, env, control, &e);
             }
         }
         // Assignment (R0 K1 ledger sink, spec §3.2). A Cell-style write
@@ -1356,7 +1633,7 @@ pub fn interp_stmt(
         // container-op (`c.method(arg)`) args are A6.
         Stmt::Assign(a) => match child_exprs(a.syntax()).as_slice() {
             [target, value] => {
-                let value_abs = interp_expr(ctx, sink, env, control, value);
+                let value_abs = interp_expr(ctx, sink, state, env, control, value);
                 if is_ledger_field(ctx, target) {
                     let range = a.syntax().text_range();
                     sink.record_leak(range, "ledger operation", witnesses_of(&value_abs));
@@ -1371,7 +1648,7 @@ pub fn interp_stmt(
             // Defensive (unexpected shape): realize taint, record no sink.
             kids => {
                 for e in kids {
-                    interp_expr(ctx, sink, env, control, e);
+                    interp_expr(ctx, sink, state, env, control, e);
                 }
             }
         },
@@ -1381,7 +1658,20 @@ pub fn interp_stmt(
         // constructor argument) is NOT a disclosure. A4 does the DATA leak; the
         // control-witness leak (K6) is A5.
         Stmt::Return(r) => {
-            let val = r.value().map(|e| interp_expr(ctx, sink, env, control, &e));
+            let val = r
+                .value()
+                .map(|e| interp_expr(ctx, sink, state, env, control, &e));
+            // Interprocedural flow-back (B2): merge this return's value witnesses
+            // into the walk-local accumulator so a callee's `interp_body_returning`
+            // captures returns nested inside control flow, not just a tail
+            // `return`. Unfiltered (unlike the K7 sink below): flowing a witness
+            // OUT of a callee to the CALLER is a data flow, not a `return`-sink
+            // disclosure — the caller decides if the returned value reaches a
+            // sink. Harmless on a root walk (nobody reads the accumulator). Fires
+            // regardless of `disclosing_fn` (a non-root callee has it `None`).
+            if let Some(val) = &val {
+                state.ret_ws = merge_witnesses(&state.ret_ws, &witnesses_of(val));
+            }
             if let (Some(fname), Some(val)) = (ctx.disclosing_fn, &val) {
                 let range = stmt.syntax().text_range();
                 let filtered = filter_witnesses(&witnesses_of(val));
@@ -1414,7 +1704,7 @@ pub fn interp_stmt(
             let mut branch_control = control.to_vec();
             for child in stmt.syntax().children() {
                 if let Some(e) = Expr::cast(child.clone()) {
-                    let cond = interp_expr(ctx, sink, env, control, &e);
+                    let cond = interp_expr(ctx, sink, state, env, control, &e);
                     branch_control =
                         thread_control(witnesses_of(&cond), control, stmt.syntax().text_range());
                 } else if let Some(blk) = compactp_ast::Block::cast(child.clone()) {
@@ -1422,13 +1712,14 @@ pub fn interp_stmt(
                     interp_stmt(
                         ctx,
                         sink,
+                        state,
                         &mut scope,
                         &branch_control,
                         &compactp_ast::Stmt::Block(blk),
                     );
                 } else if let Some(nested) = compactp_ast::Stmt::cast(child.clone()) {
                     let mut scope = env.clone();
-                    interp_stmt(ctx, sink, &mut scope, &branch_control, &nested);
+                    interp_stmt(ctx, sink, state, &mut scope, &branch_control, &nested);
                 }
             }
         }
@@ -1441,7 +1732,7 @@ pub fn interp_stmt(
             );
             let mut range_ws = Vec::new();
             for e in child_exprs(stmt.syntax()) {
-                let a = interp_expr(ctx, sink, env, control, &e);
+                let a = interp_expr(ctx, sink, state, env, control, &e);
                 range_ws = merge_witnesses(&range_ws, &witnesses_of(&a));
             }
             let mut scope = env.clone();
@@ -1452,6 +1743,7 @@ pub fn interp_stmt(
                 interp_stmt(
                     ctx,
                     sink,
+                    state,
                     &mut scope,
                     control,
                     &compactp_ast::Stmt::Block(body),
@@ -1465,7 +1757,7 @@ pub fn interp_stmt(
                 "multi-const statement not modeled".to_string(),
             );
             for e in child_exprs(stmt.syntax()) {
-                interp_expr(ctx, sink, env, control, &e);
+                interp_expr(ctx, sink, state, env, control, &e);
             }
         }
     }
@@ -1566,6 +1858,7 @@ fn bind_conservative(env: &mut Env, pat: &compactp_ast::Pat, ws: &[Witness]) {
 fn fail_closed_expr(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &Env,
     control: &[Witness],
     expr: &Expr,
@@ -1573,7 +1866,7 @@ fn fail_closed_expr(
 ) -> Abs {
     let mut ws = Vec::new();
     for child in child_exprs(expr.syntax()) {
-        let a = interp_expr(ctx, sink, env, control, &child);
+        let a = interp_expr(ctx, sink, state, env, control, &child);
         ws = merge_witnesses(&ws, &witnesses_of(&a));
     }
     sink.emit_advisory(expr.syntax().text_range(), reason.to_string());
@@ -1612,9 +1905,16 @@ fn classify_callee(ctx: &InterpCtx, call: &CallExpr) -> CalleeClass {
             name: sym.name.clone(),
             ret: witness_return_ty(ctx, df, &sym),
         },
-        SymbolKind::Circuit | SymbolKind::CircuitSig | SymbolKind::ContractCircuit => {
-            CalleeClass::Circuit
-        }
+        // A user circuit with a body: interpretable (B2). Carries the def's
+        // `(file, symbol)`; `interp_circuit_call` fails closed if it's cross-file
+        // (B4) or its body can't be read.
+        SymbolKind::Circuit => CalleeClass::Circuit {
+            file: df,
+            symbol: index,
+        },
+        // A bodyless circuit signature or a cross-contract circuit: nothing to
+        // walk here ⇒ deferred fail-closed (amber), NOT native conduit-taint.
+        SymbolKind::CircuitSig | SymbolKind::ContractCircuit => CalleeClass::DeferredCircuit,
         _ => CalleeClass::Native,
     }
 }
@@ -1638,7 +1938,7 @@ fn unresolved_callee_class(name: &str) -> CalleeClass {
     if tables::native_conduit(name).is_some() {
         CalleeClass::Native
     } else {
-        CalleeClass::Circuit
+        CalleeClass::DeferredCircuit
     }
 }
 
@@ -1667,12 +1967,13 @@ fn witness_return_ty(ctx: &InterpCtx, def_file: crate::FileId, sym: &crate::Symb
 fn interp_args_for_effect(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
+    state: &mut WalkState,
     env: &Env,
     control: &[Witness],
     call: &CallExpr,
 ) {
     for arg in arg_exprs(call) {
-        interp_expr(ctx, sink, env, control, &arg);
+        interp_expr(ctx, sink, state, env, control, &arg);
     }
 }
 
@@ -2210,7 +2511,7 @@ mod tests {
         let mut env = Env::new();
         env.insert("w".into(), Abs::Atomic(vec![witness(1)]));
         let mut sink = DisclosureSink::new();
-        let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
+        let out = interp_expr(&ctx, &mut sink, &mut WalkState::default(), &env, &[], &expr);
         assert!(witnesses_of(&out).is_empty(), "disclose must clear taint");
     }
 
@@ -2230,7 +2531,7 @@ mod tests {
         let expr = first_expr(&root, compactp_syntax::SyntaxKind::CALL_EXPR);
         let env = Env::new();
         let mut sink = DisclosureSink::new();
-        let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
+        let out = interp_expr(&ctx, &mut sink, &mut WalkState::default(), &env, &[], &expr);
         match out {
             Abs::Atomic(ws) => {
                 assert_eq!(ws.len(), 1);
@@ -2263,7 +2564,7 @@ mod tests {
         let expr = first_expr(&root, compactp_syntax::SyntaxKind::MEMBER_EXPR);
         let env = Env::new();
         let mut sink = DisclosureSink::new();
-        let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
+        let out = interp_expr(&ctx, &mut sink, &mut WalkState::default(), &env, &[], &expr);
         // `.b` must project to g2's witness only (g1 dropped -> field granularity).
         let got = witnesses_of(&out);
         assert_eq!(got.len(), 1, "one field's witness");
@@ -2292,7 +2593,7 @@ mod tests {
         let mut env = Env::new();
         env.insert("w".into(), Abs::Atomic(vec![witness(1)]));
         let mut sink = DisclosureSink::new();
-        let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
+        let out = interp_expr(&ctx, &mut sink, &mut WalkState::default(), &env, &[], &expr);
         assert_eq!(witnesses_of(&out).len(), 1, "cast does not sanitize");
     }
 
@@ -2313,7 +2614,7 @@ mod tests {
         let mut env = Env::new();
         env.insert("w".into(), Abs::Atomic(vec![witness(1)]));
         let mut sink = DisclosureSink::new();
-        let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
+        let out = interp_expr(&ctx, &mut sink, &mut WalkState::default(), &env, &[], &expr);
         assert!(
             matches!(out, Abs::Atomic(_)),
             "comparison result is Atomic, not Boolean"
@@ -2340,7 +2641,7 @@ mod tests {
         env.insert("a".into(), Abs::Atomic(vec![witness(1)]));
         env.insert("b".into(), Abs::Atomic(vec![witness(2)]));
         let mut sink = DisclosureSink::new();
-        let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
+        let out = interp_expr(&ctx, &mut sink, &mut WalkState::default(), &env, &[], &expr);
         assert_eq!(
             witnesses_of(&out).len(),
             2,
@@ -2364,7 +2665,7 @@ mod tests {
         let mut env = Env::new();
         env.insert("w".into(), Abs::Atomic(vec![witness(1)]));
         let mut sink = DisclosureSink::new();
-        let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
+        let out = interp_expr(&ctx, &mut sink, &mut WalkState::default(), &env, &[], &expr);
         assert_eq!(witnesses_of(&out).len(), 1, "arithmetic does not sanitize");
     }
 
@@ -2385,7 +2686,7 @@ mod tests {
         let mut env = Env::new();
         env.insert("w".into(), Abs::Atomic(vec![witness(1)]));
         let mut sink = DisclosureSink::new();
-        let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
+        let out = interp_expr(&ctx, &mut sink, &mut WalkState::default(), &env, &[], &expr);
         assert!(
             !sink.advisories().is_empty(),
             "unhandled form emits advisory"
@@ -2416,7 +2717,7 @@ mod tests {
         let mut env = Env::new();
         env.insert("w".into(), Abs::Atomic(vec![witness(1)]));
         let mut sink = DisclosureSink::new();
-        let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
+        let out = interp_expr(&ctx, &mut sink, &mut WalkState::default(), &env, &[], &expr);
         assert!(
             !sink.advisories().is_empty(),
             "an unresolved call emits a fail-closed advisory (never silent green)"
@@ -2451,6 +2752,7 @@ mod tests {
         interp_stmt(
             &ctx,
             &mut sink,
+            &mut WalkState::default(),
             &mut env,
             &[],
             &compactp_ast::Stmt::Block(block),
@@ -2497,6 +2799,7 @@ mod tests {
         interp_stmt(
             &ctx,
             &mut sink,
+            &mut WalkState::default(),
             &mut env,
             &[],
             &compactp_ast::Stmt::Block(block),
@@ -2559,6 +2862,7 @@ mod tests {
         interp_stmt(
             &ctx,
             &mut sink,
+            &mut WalkState::default(),
             &mut env,
             &[],
             &compactp_ast::Stmt::Block(block),
@@ -2936,7 +3240,7 @@ mod tests {
             env.insert((*name).to_string(), abs.clone());
         }
         let mut sink = DisclosureSink::new();
-        let out = interp_expr(&ctx, &mut sink, &env, &[], &expr);
+        let out = interp_expr(&ctx, &mut sink, &mut WalkState::default(), &env, &[], &expr);
         let advisories: Vec<String> = sink.advisories().iter().map(|a| a.reason.clone()).collect();
         (out, advisories)
     }
@@ -3060,6 +3364,130 @@ mod tests {
         assert!(
             had_advisory,
             "the deferred unresolved call records a fail-closed advisory (§0)"
+        );
+    }
+
+    // -- B2: interprocedural cross-circuit call interpretation --------------
+
+    #[test]
+    fn cross_circuit_call_propagates_taint_to_callee_ledger_sink() {
+        // leak(secret) -> stash(secret) -> `store = v` is a confirmed E3100 leak.
+        // Validated against compactc 0.31.1 (fixture interproc_call_leak.compact
+        // REJECTs: "potential witness-value disclosure must be declared but is
+        // not", path `secret` -> "the argument to stash" -> RHS of `=`).
+        let (leaks, _adv) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger store: Field;\n\
+             circuit stash(v: Field): [] { store = v; }\n\
+             export circuit leak(secret: Field): [] { stash(secret); }\n",
+        );
+        assert!(
+            !leaks.is_empty(),
+            "cross-circuit witness->ledger must confirm a leak"
+        );
+        assert_eq!(leaks[0].nature, "ledger operation");
+        // The leaked witness is leak's own `secret` param, threaded THROUGH
+        // stash's `v` param to the callee's ledger write — the interprocedural
+        // flow the intraprocedural walk could not see.
+        assert!(
+            leaks.iter().flat_map(|l| &l.witnesses).any(|w| matches!(
+                &w.info,
+                WitnessInfo::CircuitArg { function, arg }
+                    if function == "leak" && arg == "secret"
+            )),
+            "the leaked witness must be leak's `secret` param, flowed through stash: {leaks:?}"
+        );
+    }
+
+    #[test]
+    fn cross_circuit_callee_disclose_sanitizes() {
+        // The callee `disclose()`s before the write — interproc_call_ok.compact
+        // compiles CLEAN under compactc 0.31.1, so the analyzer must confirm no
+        // leak. This is the fail-closed corpus-safety direction: interprocedural
+        // interpretation must not manufacture a false positive when the callee
+        // sanitizes.
+        let (leaks, _adv) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger store: Field;\n\
+             circuit stash(v: Field): [] { store = disclose(v); }\n\
+             export circuit leak(secret: Field): [] { stash(secret); }\n",
+        );
+        assert!(
+            leaks.is_empty(),
+            "callee disclose() must sanitize -- no leak (got {leaks:?})"
+        );
+    }
+
+    #[test]
+    fn cross_circuit_return_value_flows_back_to_caller_sink() {
+        // The callee RETURNS a witness-return value; the caller writes that
+        // returned value to the ledger. The leak only manifests because the
+        // callee's returned `Abs` flows back to the caller (B0 Q1). Validated
+        // against compactc 0.31.1 (rejects with the disclosure banner).
+        let (leaks, _adv) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger store: Field;\n\
+             witness getW(): Field;\n\
+             circuit fetch(): Field { return getW(); }\n\
+             export circuit f(): [] { store = fetch(); }\n",
+        );
+        assert!(
+            !leaks.is_empty(),
+            "a witness value RETURNED from a callee and sunk by the caller must leak"
+        );
+        assert!(
+            leaks.iter().flat_map(|l| &l.witnesses).any(|w| matches!(
+                &w.info,
+                WitnessInfo::WitnessReturn { function } if function == "getW"
+            )),
+            "the flowed-back leak must carry getW's witness-return: {leaks:?}"
+        );
+    }
+
+    #[test]
+    fn cross_circuit_callee_return_is_not_a_disclosure_sink() {
+        // K7 filter (B0 Q3): a NON-root callee runs with `disclosing_fn = None`,
+        // so `return v` (v = the callee's own witness-derived arg) is NOT itself
+        // a disclosure — only the caller's use of the returned value can leak. If
+        // the caller does nothing observable with it, there is no leak. This
+        // guards against wrongly arming the return sink inside a callee.
+        let (leaks, _adv) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             witness getW(): Field;\n\
+             circuit fetch(): Field { return getW(); }\n\
+             export circuit f(): Field { const x = fetch(); return disclose(x); }\n",
+        );
+        assert!(
+            leaks.is_empty(),
+            "a callee `return` is not a sink; the caller disclosed the value (got {leaks:?})"
+        );
+    }
+
+    #[test]
+    fn recursive_circuit_call_fails_closed_and_terminates() {
+        // §0 fail-closed + termination (B0 Q4): recursion is rejected upstream of
+        // the WPP, so a hand-written cyclic program (which compactc would reject)
+        // must NOT hang the analyzer. The `active`-set guard breaks the cycle,
+        // records an amber advisory, and returns clean — never an infinite loop,
+        // never a stack overflow. (This source does not compile; the point is the
+        // analyzer's robustness, not a differential match.)
+        let (leaks, had_advisory) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger store: Field;\n\
+             circuit ping(v: Field): Field { return pong(v); }\n\
+             circuit pong(v: Field): Field { return ping(v); }\n\
+             export circuit f(secret: Field): [] { store = disclose(ping(secret)); }\n",
+        );
+        // Termination is the assertion that matters (the test returning at all).
+        // The recursion is broken fail-closed with an amber advisory; the caller
+        // `disclose()`s, so no confirmed leak is manufactured.
+        assert!(
+            had_advisory,
+            "the broken recursion cycle must record a fail-closed amber advisory (§0)"
+        );
+        assert!(
+            leaks.is_empty(),
+            "the disclosed result must not leak; recursion guard stays fail-closed (got {leaks:?})"
         );
     }
 }

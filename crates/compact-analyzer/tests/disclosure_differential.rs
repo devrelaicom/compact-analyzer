@@ -44,6 +44,18 @@ fn native_discloses(text: &str, path: &Path) -> bool {
         .any(|d| d.code.prefix == "E" && d.code.number >= 3100)
 }
 
+/// True if native reports SOMETHING at this file — a confirmed E-leak (>=3100) OR any U-family
+/// advisory. Used by the reject-direction parity gate: on a file compactc rejects for disclosure,
+/// native must not be silent-green (§0).
+fn native_reports_something(text: &str, path: &Path) -> bool {
+    let mut host = AnalysisHost::new();
+    let file: FileId = host.vfs_mut().file_id(path);
+    host.vfs_mut().set_overlay(file, text.to_string(), 1);
+    host.disclosure_diagnostics(file)
+        .iter()
+        .any(|d| (d.code.prefix == "E" && d.code.number >= 3100) || d.code.prefix == "U")
+}
+
 /// `compactc`'s disclosure verdict for one source file on disk: `Some(true)`
 /// on a post-parse reject whose stderr carries the WPP banner, `Some(false)`
 /// ONLY on a clean compile, `None` otherwise (a parse rejection, a
@@ -200,6 +212,18 @@ const FIXTURES: &[Fixture] = &[
         discloses: true,
         native_confirms: true,
     },
+    Fixture {
+        name: "interproc_call_leak.compact",
+        rule: "B2 cross-circuit call -> ledger sink",
+        discloses: true,
+        native_confirms: true,
+    },
+    Fixture {
+        name: "interproc_call_ok.compact",
+        rule: "B2 callee disclose() sanitizes",
+        discloses: false,
+        native_confirms: false,
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -290,6 +314,7 @@ fn corpus_no_false_positive_disclosures() {
     let mut confirmed_leak = 0usize;
     let mut indeterminate = 0usize;
     let mut false_positives: Vec<PathBuf> = Vec::new();
+    let mut silent_on_reject: Vec<PathBuf> = Vec::new();
 
     for path in files {
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -302,14 +327,20 @@ fn corpus_no_false_positive_disclosures() {
                     false_positives.push(path);
                 }
             }
-            Some(true) => confirmed_leak += 1,
+            Some(true) => {
+                confirmed_leak += 1;
+                if !native_reports_something(&text, &path) {
+                    silent_on_reject.push(path);
+                }
+            }
             None => indeterminate += 1,
         }
     }
 
     eprintln!(
-        "disclosure corpus gate: accepted={accepted} compiler_confirmed_leak={confirmed_leak} indeterminate={indeterminate} false_positives={}",
-        false_positives.len()
+        "disclosure corpus gate: accepted={accepted} compiler_confirmed_leak={confirmed_leak} indeterminate={indeterminate} false_positives={} silent_on_reject={}",
+        false_positives.len(),
+        silent_on_reject.len()
     );
     assert!(
         accepted > 0,
@@ -323,5 +354,12 @@ fn corpus_no_false_positive_disclosures() {
          (false positives): {:?}",
         false_positives.len(),
         false_positives
+    );
+    assert!(
+        silent_on_reject.is_empty(),
+        "native was silent (no E>=3100 leak, no U advisory) on {} file(s) compactc rejects for \
+         disclosure (§0 fail-closed violation — silent green on a WPP reject): {:?}",
+        silent_on_reject.len(),
+        silent_on_reject
     );
 }

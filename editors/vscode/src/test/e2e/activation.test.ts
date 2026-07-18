@@ -151,6 +151,64 @@ suite("Compact Analyzer activation smoke", () => {
     );
   });
 
+  test("scenario 1f: a disclosure leak (E3100) reaches the Problems panel as a red diagnostic", async function () {
+    this.timeout(DIAGNOSTIC_TIMEOUT_MS + 15_000);
+    assert.strictEqual(api.serverStatus(), "running", "server should be running for the disclosure-leak check");
+
+    const uri = fixtureUri("disclosure-leak.compact");
+    const document = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(document);
+
+    const deadline = Date.now() + DIAGNOSTIC_TIMEOUT_MS;
+    let leakDiag: vscode.Diagnostic | undefined;
+    for (;;) {
+      leakDiag = vscode.languages
+        .getDiagnostics(uri)
+        .find((d) => d.source === "compact-analyzer" && String(d.code) === "E3100");
+      if (leakDiag || Date.now() >= deadline) {
+        break;
+      }
+      await delay(200);
+    }
+    assert.ok(
+      leakDiag,
+      `expected an E3100 disclosure leak within ${DIAGNOSTIC_TIMEOUT_MS}ms, ` +
+        `got ${JSON.stringify(vscode.languages.getDiagnostics(uri).map((d) => ({ source: d.source, code: d.code, message: d.message })))}`,
+    );
+    assert.strictEqual(leakDiag.severity, vscode.DiagnosticSeverity.Error, "an E3100 leak must be an error");
+  });
+
+  test("scenario 1g: a fail-closed advisory (U3100) reaches the Problems panel as an amber diagnostic", async function () {
+    this.timeout(DIAGNOSTIC_TIMEOUT_MS + 15_000);
+    assert.strictEqual(api.serverStatus(), "running", "server should be running for the disclosure-advisory check");
+
+    const uri = fixtureUri("disclosure-advisory.compact");
+    const document = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(document);
+
+    const deadline = Date.now() + DIAGNOSTIC_TIMEOUT_MS;
+    let advisoryDiag: vscode.Diagnostic | undefined;
+    for (;;) {
+      advisoryDiag = vscode.languages
+        .getDiagnostics(uri)
+        .find((d) => d.source === "compact-analyzer (unverified)" && String(d.code) === "U3100");
+      if (advisoryDiag || Date.now() >= deadline) {
+        break;
+      }
+      await delay(200);
+    }
+    assert.ok(
+      advisoryDiag,
+      `expected a U3100 advisory within ${DIAGNOSTIC_TIMEOUT_MS}ms, ` +
+        `got ${JSON.stringify(vscode.languages.getDiagnostics(uri).map((d) => ({ source: d.source, code: d.code, message: d.message })))}`,
+    );
+    assert.strictEqual(
+      advisoryDiag.severity,
+      vscode.DiagnosticSeverity.Warning,
+      "a U3100 advisory must be a warning (amber), distinguished by source rather than severity",
+    );
+  });
+
   // Task 4 (v2c §8 done-bar): the three type-aware editor features are LSP
   // capabilities the thin `vscode-languageclient` inherits once the server
   // advertises them (Tasks 1-3) — no client code drives them. These tests

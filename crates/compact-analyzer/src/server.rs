@@ -923,14 +923,17 @@ impl GlobalState {
     }
 
     /// Assembles the full native diagnostic set for `file` — parser, resolution,
-    /// and (when the `typeDiagnostics` config toggle is on) type diagnostics —
-    /// each converted to LSP and tagged `source = "compact-analyzer"`. This is
-    /// the SINGLE place native diagnostics are built, shared by the live publish
-    /// path (`publish_file_diagnostics`) and the on-save path (`did_save`), so
-    /// the two can never drift apart. Parser and resolution diagnostics are
-    /// always published; only the type contribution is gated. `type_diagnostics`
-    /// is already corpus-gate-green and is forwarded verbatim (never re-filtered
-    /// here) when the gate is open.
+    /// disclosure (WPP), and (when the `typeDiagnostics` config toggle is on)
+    /// type diagnostics — each converted to LSP and source-tagged (E-family
+    /// disclosure leaks and everything else get `"compact-analyzer"`; U-family
+    /// fail-closed advisories get `"compact-analyzer (unverified)"`, per
+    /// `lsp_utils::diagnostic_to_lsp`). This is the SINGLE place native
+    /// diagnostics are built, shared by the live publish path
+    /// (`publish_file_diagnostics`) and the on-save path (`did_save`), so the
+    /// two can never drift apart. Parser, resolution, and disclosure
+    /// diagnostics are always published; only the type contribution is gated.
+    /// `type_diagnostics` is already corpus-gate-green and is forwarded
+    /// verbatim (never re-filtered here) when the gate is open.
     fn build_native_diagnostics(
         &mut self,
         file: FileId,
@@ -948,6 +951,9 @@ impl GlobalState {
             None => Vec::new(),
         };
         for d in self.host.resolution_diagnostics(file) {
+            native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+        }
+        for d in self.host.disclosure_diagnostics(file) {
             native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
         }
         if self.toolchain_config.type_diagnostics {
@@ -1797,6 +1803,29 @@ mod tests {
             merged.last().unwrap().source.as_deref(),
             Some("compact-analyzer"),
             "the truncation note is appended after the merge"
+        );
+    }
+
+    /// One-directional merge invariant (spec §4.3): a native ABSENCE at a
+    /// sink must never suppress a compile-on-save `compactc` diagnostic
+    /// there. `merge_diagnostics` only drops a compiler diagnostic when a
+    /// native one already occupies the EXACT same range; an empty native set
+    /// (disclosure analysis fails closed / finds nothing at this file) has
+    /// no range to coincide with, so every compiler diagnostic survives
+    /// untouched. This holds regardless of which native sub-analysis (parser,
+    /// resolution, type, disclosure) produced (or didn't produce) an entry —
+    /// `merge_diagnostics` sees only the flattened `native` list built by
+    /// `build_native_diagnostics`.
+    #[test]
+    fn merge_diagnostics_empty_native_does_not_suppress_compiler_diagnostics() {
+        let native: Vec<lsp_types::Diagnostic> = Vec::new();
+        let compiler = vec![diag_at(0, "compactc found a real problem".to_string())];
+
+        let merged = merge_diagnostics(&native, &compiler);
+
+        assert_eq!(
+            merged, compiler,
+            "native absence must not drop the compile-on-save diagnostic"
         );
     }
 }

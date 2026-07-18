@@ -1,0 +1,12 @@
+// A K1 ledger sink: `c = getW();` writes a witness value straight to a
+// ledger Cell, so the native disclosure (WPP) analyzer reports a confirmed
+// E3100 leak with source "compact-analyzer". This needs no Compact
+// toolchain — the smoke test stays hermetic and proves the v3a disclosure
+// analyzer reaches the Problems panel as a red diagnostic.
+import CompactStandardLibrary;
+
+export ledger c: Uint<8>;
+
+witness getW(): Uint<8>;
+
+export circuit f(): [] { c = getW(); }

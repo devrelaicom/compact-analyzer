@@ -1,0 +1,8 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+export ledger c: Uint<8>;
+
+constructor(secret: Uint<8>) {
+  c = secret;
+}

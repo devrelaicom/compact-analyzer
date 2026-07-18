@@ -1,0 +1,10 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+export ledger s: Set<Uint<8>>;
+
+witness getW(): Uint<8>;
+
+export circuit f(): [] {
+  s.insert(getW());
+}

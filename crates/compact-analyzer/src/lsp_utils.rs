@@ -95,11 +95,21 @@ pub(crate) fn diagnostic_to_lsp(
         )
     };
 
+    // A `U`-family code is a fail-closed "unverified" advisory (spec §0,
+    // analyzer-core's disclosure module A8) — a `Severity::Warning` under a
+    // distinct source string, so amber advisories read visibly different
+    // from a real warning even though both render as `WARNING` severity.
+    let source = if d.code.prefix == "U" {
+        "compact-analyzer (unverified)"
+    } else {
+        "compact-analyzer"
+    };
+
     lsp_types::Diagnostic {
         range: range_to_lsp(li, d.primary_span),
         severity: Some(severity),
         code: Some(NumberOrString::String(d.code.to_string())),
-        source: Some("compact-analyzer".to_string()),
+        source: Some(source.to_string()),
         message,
         related_information,
         ..Default::default()
@@ -368,5 +378,33 @@ mod tests {
             diagnostic_to_lsp(&note, &li, &uri).severity,
             Some(DiagnosticSeverity::INFORMATION)
         );
+    }
+
+    #[test]
+    fn u_family_code_maps_to_unverified_source() {
+        let li = LineIndex::new(Arc::from("x"));
+        let uri = lsp_types::Url::parse("file:///tmp/x.compact").unwrap();
+        let advisory = Diagnostic::warning(
+            DiagnosticCode::new("U", 3100),
+            "unverified: Unknown declared type".to_string(),
+            TextRange::new(TextSize::new(0), TextSize::new(1)),
+        );
+        let lsp = diagnostic_to_lsp(&advisory, &li, &uri);
+        assert_eq!(lsp.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(lsp.source.as_deref(), Some("compact-analyzer (unverified)"));
+    }
+
+    #[test]
+    fn e_family_code_keeps_plain_source() {
+        let li = LineIndex::new(Arc::from("x"));
+        let uri = lsp_types::Url::parse("file:///tmp/x.compact").unwrap();
+        let leak = Diagnostic::error(
+            DiagnosticCode::new("E", 3100),
+            "potential witness-value disclosure".to_string(),
+            TextRange::new(TextSize::new(0), TextSize::new(1)),
+        );
+        let lsp = diagnostic_to_lsp(&leak, &li, &uri);
+        assert_eq!(lsp.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(lsp.source.as_deref(), Some("compact-analyzer"));
     }
 }

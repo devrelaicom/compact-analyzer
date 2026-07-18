@@ -1,0 +1,53 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+// Regression fixture for corpus FP #2 (`examples/modules/selective_examples.compact`,
+// the Test4/Test11 patterns). compactc ACCEPTS this file. Two shapes the native
+// analyzer wrongly flagged pre-fix:
+//
+// (a) A module-nested `export circuit` that writes its own parameter to a
+//     ledger, but is NOT re-exported to the top level. compactc reaches it only
+//     through internal calls, so it is never a disclosing ROOT and accepts. (If
+//     it WERE top-level-reachable, that arg->ledger write WOULD disclose — the
+//     divergence is purely reachability, which v3a cannot resolve, so v3a fails
+//     closed by excluding every module-nested circuit + recording an advisory.)
+//
+// (b) A top-level circuit that passes its parameter to a module-imported callee
+//     which DISCLOSES the value internally; compactc follows the callee, sees
+//     the disclose, and accepts. v3a cannot follow the module-import chain, so
+//     it must treat the unresolved callee as amber-clean (deferred), NOT
+//     conduit-taint the arg into the ledger write (which would be a false red).
+
+// (a) `store` writes its arg to a ledger and is only ever called internally
+//     (imported into `Wrapper` below, never re-exported to the top level).
+module Inner {
+  export ledger stored: Field;
+
+  export circuit store(x: Field): Field {
+    stored = x;
+    return x;
+  }
+}
+
+// `wrap` discloses its own arg before calling `store`, and is the only circuit
+// re-exported to the top level.
+module Wrapper {
+  import { store as inner_store } from Inner;
+
+  export circuit wrap(x: Field): Field {
+    return inner_store(disclose(x));
+  }
+}
+
+import { wrap as w } from Wrapper;
+export { w };
+
+// (b) `entry` passes its parameter through the module-imported `w` (which
+//     discloses internally) into a ledger write; compactc accepts.
+export ledger top_result: Field;
+
+export circuit entry(x: Field): Field {
+  const result = w(x);
+  top_result = result;
+  return result;
+}

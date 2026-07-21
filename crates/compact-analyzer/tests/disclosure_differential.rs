@@ -363,3 +363,93 @@ fn corpus_no_false_positive_disclosures() {
         silent_on_reject
     );
 }
+
+// --- Cross-file (XF1) -------------------------------------------------------
+//
+// A multi-file fixture is a *directory* holding `main.compact` plus the
+// module file(s) it imports via `import "./libB"`. compactc anchors a
+// cross-file disclosure at the SINK in the callee file; the native analyzer
+// takes the pragmatic scope and anchors at the CALL SITE in `main` — both
+// REPORT the leak, and the differential compares PRESENCE (any E>=3100), not
+// span, so they agree. `compiler_discloses` needs no change: it compiles
+// `main.compact` in place, and the relative import resolves to its sibling.
+
+/// Native cross-file verdict: warm the workspace by discovering+indexing every
+/// `.compact` under `dir` (so `main`'s `import "./libB"` resolves to the
+/// sibling and libB's `SourceText` enters `Workspace.file_srcs` — exactly how
+/// the LSP server builds the workspace on init), then does `main.compact`
+/// disclose a confirmed leak? Files are read from disk (the fixtures are real
+/// on-disk files), so no VFS overlay is needed.
+fn native_discloses_multifile(dir: &Path) -> bool {
+    let mut host = AnalysisHost::new();
+    host.discover_and_index(std::slice::from_ref(&dir.to_path_buf()), &|| true);
+    let main = host.vfs_mut().file_id(&dir.join("main.compact"));
+    host.disclosure_diagnostics(main)
+        .iter()
+        .any(|d| d.code.prefix == "E" && d.code.number >= 3100)
+}
+
+struct MultiFixture {
+    dir: &'static str,
+    /// compactc's WPP verdict on `main.compact` (validated against real compactc).
+    discloses: bool,
+    /// Whether the native analyzer emits a confirmed E-leak.
+    native_confirms: bool,
+}
+
+/// Multi-file fixtures pinning the cross-file circuit-resolution rule (XF1)
+/// against real compactc. Both were validated by compiling `main.compact` in
+/// place (the `import "./libB"` resolves to the sibling `libB.compact`).
+const MULTI_FIXTURES: &[MultiFixture] = &[
+    MultiFixture {
+        dir: "crossfile_call_leak",
+        discloses: true,
+        native_confirms: true,
+    },
+    MultiFixture {
+        dir: "crossfile_call_ok",
+        discloses: false,
+        native_confirms: false,
+    },
+];
+
+#[test]
+fn crossfile_disclosure_differential() {
+    let dir = fixtures_dir();
+    let tc = Toolchain::discover(None);
+    for fx in MULTI_FIXTURES {
+        let fxdir = dir.join(fx.dir);
+        let main = fxdir.join("main.compact");
+
+        // Native side (always asserted).
+        let got = native_discloses_multifile(&fxdir);
+        assert_eq!(
+            got, fx.native_confirms,
+            "native cross-file verdict for {} (expected native_confirms={})",
+            fx.dir, fx.native_confirms
+        );
+
+        // Live cross-check: compactc compiles `main.compact` in place; the
+        // relative import pulls in the sibling `libB.compact`. Wording/span
+        // are NOT compared (compactc anchors at the sink, native at the call
+        // site) — only the accept/reject verdict.
+        if let Some(tc) = &tc {
+            match compiler_discloses(tc, &main) {
+                Some(discloses) => assert_eq!(
+                    discloses, fx.discloses,
+                    "compactc cross-file verdict for {}",
+                    fx.dir
+                ),
+                None => eprintln!(
+                    "crossfile_disclosure_differential: compactc indeterminate for {}",
+                    fx.dir
+                ),
+            }
+        } else {
+            eprintln!(
+                "crossfile_disclosure_differential: compactc absent; skipped live cross-check for {}",
+                fx.dir
+            );
+        }
+    }
+}

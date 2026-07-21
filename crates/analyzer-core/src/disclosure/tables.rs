@@ -83,12 +83,24 @@ pub fn native_conduit(name: &str) -> Option<ArgFlags> {
         // coin → nothing; recipient → nothing                   ⇒ Void
         "createZswapOutput" => &[None, None],
         // --- M6 stdlib CONDUIT circuits (values flow into the result; leak only
-        //     at a downstream sink). Confirmed: `store = some(getW())` REJECTs,
-        //     `store = disclose(some(getW()))` ACCEPTs (task-M6a-findings.md). ---
-        // Pure constructors — the wrapped value flows transparently (no exposure).
-        "some" => &[Some("")],  // value → Maybe<T>.value      ⇒ Maybe<T>
-        "left" => &[Some("")],  // value → Either.left         ⇒ Either<A,B>
-        "right" => &[Some("")], // value → Either.right        ⇒ Either<A,B>
+        //     at a downstream sink). Confirmed against compactc 0.31.1
+        //     (task-M6a-findings.md). ---
+        //
+        // NOT modeled here on purpose: the pure ADT constructors `some`/`left`/
+        // `right`. They ARE conduits (compactc REJECTs `store = some(getW())`),
+        // but their result is a struct with a CONSTANT tag field (`Maybe.is_some`
+        // = true, `Either.is_left`) and a DEFAULT sibling arm (`left(v).right` =
+        // default). `native_conduit_result` models a conduit result as a FLAT
+        // `Atomic`, and `interp_member` cannot resolve a stdlib struct's field
+        // index (`field_index` does not resolve `Maybe`/`Either` here — verified),
+        // so projecting a clean field (`left(getW()).right`, `some(getW()).is_some`)
+        // over-taints and would fire a FALSE-POSITIVE red on a compactc-ACCEPTED
+        // program. So these three fall through to the fail-closed amber advisory
+        // (`DeferredCircuit`), which is §0-safe. Re-add them only once the result
+        // is modeled with per-field precision (a structured `Multiple` AND
+        // `field_index` resolving stdlib struct fields). The hash conduits below
+        // are safe because they return a scalar / an all-arg-derived single-field
+        // digest (no constant field to mis-taint on projection).
         // Hash conduits — arg(s) flow, hashed into the result.
         "evolveNonce" => &[Some("a hash of"), Some("a hash of")], // index, nonce ⇒ Bytes<32>
         "merkleTreePathRoot" => &[Some("a hash of")],             // path        ⇒ MerkleTreeDigest
@@ -284,10 +296,19 @@ mod tests {
 
     #[test]
     fn stdlib_circuit_conduits_sinks_and_sanitizer() {
-        // M6 CONDUIT: `some` flows its single arg into the Maybe result (no exposure).
-        assert_eq!(native_conduit("some"), Some(&[Some("")][..]));
+        // M6 CONDUIT: `evolveNonce` flows both args (hashed) into its scalar result.
+        assert_eq!(
+            native_conduit("evolveNonce"),
+            Some(&[Some("a hash of"), Some("a hash of")][..])
+        );
         // M6 SANITIZER: `tokenType` hides BOTH args (the §0 false-positive trap).
         assert_eq!(native_conduit("tokenType"), Some(&[None, None][..]));
+        // The pure ADT constructors `some`/`left`/`right` are DELIBERATELY not
+        // modeled (flat-Atomic over-taint would FP on a clean-field projection —
+        // see `native_conduit`); they fall through to the amber advisory.
+        assert!(native_conduit("some").is_none());
+        assert!(native_conduit("left").is_none());
+        assert!(native_conduit("right").is_none());
         // M6 SINK: `sendShielded` leaks all 3 params (none hidden).
         match stdlib_sink("sendShielded") {
             Some(flags) => {

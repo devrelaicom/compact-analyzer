@@ -226,14 +226,14 @@ const FIXTURES: &[Fixture] = &[
     },
     // --- M6 stdlib-circuit disclosure (conduits + sinks + sanitizer) ---
     Fixture {
-        name: "stdlib_some_leak.compact",
-        rule: "M6 stdlib CONDUIT (`some`) → downstream ledger sink",
+        name: "stdlib_evolvenonce_leak.compact",
+        rule: "M6 stdlib CONDUIT (`evolveNonce` hash) → downstream ledger sink",
         discloses: true,
         native_confirms: true,
     },
     Fixture {
-        name: "stdlib_some_disclosed.compact",
-        rule: "M6 stdlib CONDUIT (`some`) + D1 disclose sanitizer",
+        name: "stdlib_evolvenonce_disclosed.compact",
+        rule: "M6 stdlib CONDUIT (`evolveNonce`) + D1 disclose sanitizer",
         discloses: false,
         native_confirms: false,
     },

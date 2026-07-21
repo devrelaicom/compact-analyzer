@@ -668,17 +668,21 @@ mod tests {
         );
     }
 
-    /// M6 CONDUIT: a witness flowing through the stdlib constructor `some`
-    /// carries its taint into the `Maybe<Field>` result, which then leaks at the
+    /// M6 CONDUIT: a witness flowing through the stdlib hash-conduit `evolveNonce`
+    /// carries its taint into the `Bytes<32>` result, which then leaks at the
     /// downstream ledger write. Ground truth (task-M6a): compactc 0.31.1 REJECTs
-    /// `m = some<Field>(getW())` and ACCEPTs the `disclose()`d variant.
+    /// `stored = evolveNonce(0, getW())` and ACCEPTs the `disclose()`d variant.
+    /// (`evolveNonce` is used here rather than the pure constructors `some`/`left`/
+    /// `right`: those return a struct with a constant tag field the flat-`Atomic`
+    /// conduit would over-taint on projection, so they are intentionally left as
+    /// amber advisories — see `tables::native_conduit`.)
     #[test]
-    fn stdlib_conduit_some_leaks_at_downstream_ledger_sink() {
+    fn stdlib_conduit_evolvenonce_leaks_at_downstream_ledger_sink() {
         let db = CompactDatabase::default();
         let text = "import CompactStandardLibrary;\n\
-                     export ledger m: Maybe<Field>;\n\
-                     witness getW(): Field;\n\
-                     export circuit f(): [] { m = some<Field>(getW()); }\n";
+                     export ledger stored: Bytes<32>;\n\
+                     witness getW(): Bytes<32>;\n\
+                     export circuit f(): [] { stored = evolveNonce(0, getW()); }\n";
         let src = SourceText::new(&db, Arc::from(text));
         let fd = FileDeps::new(&db, Arc::from(Vec::new()));
         let ws = empty_ws(&db);
@@ -688,20 +692,20 @@ mod tests {
         assert_eq!(
             e_leaks(&diags).len(),
             1,
-            "a witness flowing through `some` into a ledger write must confirm one leak: {diags:?}"
+            "a witness flowing through `evolveNonce` into a ledger write must confirm one leak: {diags:?}"
         );
 
         // Disclosed variant ACCEPTs: `disclose()` sanitizes the flow.
         let text_ok = "import CompactStandardLibrary;\n\
-                        export ledger m: Maybe<Field>;\n\
-                        witness getW(): Field;\n\
-                        export circuit f(): [] { m = disclose(some<Field>(getW())); }\n";
+                        export ledger stored: Bytes<32>;\n\
+                        witness getW(): Bytes<32>;\n\
+                        export circuit f(): [] { stored = disclose(evolveNonce(0, getW())); }\n";
         let src_ok = SourceText::new(&db, Arc::from(text_ok));
         let fd_ok = FileDeps::new(&db, Arc::from(Vec::new()));
         let diags_ok = disclosure_diagnostics_query(&db, file, src_ok, fd_ok, ws);
         assert!(
             e_leaks(&diags_ok).is_empty(),
-            "disclose() around `some` must sanitize the conduit flow: {diags_ok:?}"
+            "disclose() around `evolveNonce` must sanitize the conduit flow: {diags_ok:?}"
         );
     }
 
@@ -727,9 +731,16 @@ mod tests {
             e_leaks(&diags).is_empty(),
             "tokenType is a sanitizer — no confirmed leak may fire (false positive): {diags:?}"
         );
+        // Assert NO U-family advisory at all — not merely none *naming* tokenType.
+        // If tokenType were dropped from every table it would fall to
+        // `DeferredCircuit`, whose advisory ("cross-circuit call not interpreted…")
+        // never names tokenType, so a name-only check would pass while silently
+        // degrading the clean accept to amber. The sanitizer model must produce a
+        // fully clean verdict (zero advisories), so pin that directly.
         assert!(
-            !diags.iter().any(|d| d.message.contains("tokenType")),
-            "tokenType must not raise an advisory naming it (compactc ACCEPTs): {diags:?}"
+            !diags.iter().any(|d| d.code.prefix == "U"),
+            "tokenType sanitizer must raise NO advisory (a U here means it degraded \
+             to the amber DeferredCircuit path — the sanitizer model was lost): {diags:?}"
         );
     }
 

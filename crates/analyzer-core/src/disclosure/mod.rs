@@ -351,11 +351,18 @@ mod tests {
     #[test]
     fn module_nested_circuit_renders_amber_advisory_not_a_leak() {
         let db = CompactDatabase::default();
+        // `leak` is module-nested-not-re-exported, but the re-exported root
+        // `caller` calls it, so it is REACHABLE from an analyzed root and keeps
+        // its advisory. `caller` passes a `disclose()`d value, so no confirmed
+        // E-leak is manufactured — the advisory renders alone as a U3100.
         let text = "import CompactStandardLibrary;\n\
                      module M {\n\
                      export ledger c: Field;\n\
-                     export circuit leak(x: Field): Field { c = x; return x; }\n\
-                     }\n";
+                     export circuit leak(x: Field): [] { c = x; }\n\
+                     export circuit caller(x: Field): [] { leak(disclose(x)); }\n\
+                     }\n\
+                     import { caller as cc } from M;\n\
+                     export { cc };\n";
         let src = SourceText::new(&db, Arc::from(text));
         let fd = FileDeps::new(&db, Arc::from(Vec::new()));
         let ws = empty_ws(&db);

@@ -133,36 +133,123 @@ pub enum Root {
 /// records the exclusion).
 pub fn discover_roots(ctx: &InterpCtx, tree: &ItemTree, sink: &mut DisclosureSink) -> Vec<Root> {
     let reexported = reexported_module_circuits(ctx, tree, sink);
-    tree.symbols
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| match s.kind {
+
+    // First pass: collect the real roots (which double as reachability seeds) and,
+    // separately, the module-nested circuits we exclude from rooting. The
+    // exclusion advisory is DEFERRED — whether to emit it depends on reachability,
+    // which is computed from the roots below.
+    let mut roots: Vec<Root> = Vec::new();
+    let mut excluded: Vec<(TextRange, String, u32)> = Vec::new();
+    for (i, s) in tree.symbols.iter().enumerate() {
+        match s.kind {
             SymbolKind::Circuit if s.exported => {
                 if is_module_nested(tree, i as u32) && !reexported.contains(&(i as u32)) {
                     // Module-exported but not re-exported to the top level: not a
-                    // root (compactc ACCEPTs it there). Fail closed to amber.
-                    sink.emit_advisory(
-                        s.name_range,
-                        format!(
-                            "module-nested circuit `{}` is not re-exported to the top level, so \
-                             it is not analyzed as a disclosing root",
-                            s.name
-                        ),
-                    );
-                    None
+                    // root (compactc ACCEPTs it there). Defer the fail-closed
+                    // amber until we know whether it is reachable.
+                    excluded.push((s.name_range, s.name.clone(), i as u32));
                 } else {
                     // A top-level exported circuit, OR a module circuit the top
                     // level re-exports (B4): a real `id-exported?` disclosing root.
-                    Some(Root::Circuit {
+                    roots.push(Root::Circuit {
                         name: s.name.clone(),
                         symbol: i as u32,
-                    })
+                    });
                 }
             }
-            SymbolKind::Constructor => Some(Root::Constructor { symbol: i as u32 }),
-            _ => None,
-        })
-        .collect()
+            SymbolKind::Constructor => roots.push(Root::Constructor { symbol: i as u32 }),
+            _ => {}
+        }
+    }
+
+    // A module-nested-not-re-exported circuit only warrants an advisory if it is
+    // actually REACHABLE from an analyzed root — i.e. a root's body (transitively)
+    // calls it, so the interprocedural walk enters its body. An UNREACHABLE such
+    // circuit is dead from the disclosure standpoint: compactc ACCEPTs the file,
+    // no witness ever flows through it, and advising there is pure noise (the
+    // dominant remaining source of amber-channel noise on the corpus).
+    //
+    // §0 (fail-closed) is preserved regardless of this filter's precision:
+    // suppressing the advisory for a circuit that IS reachable is safe because the
+    // walk still enters its body at the call site — a real leak there fires an
+    // `E3100`, never a silent green. See `reachable_circuits`.
+    if !excluded.is_empty() {
+        let reachable = reachable_circuits(ctx, tree, &roots);
+        for (range, name, idx) in excluded {
+            if reachable.contains(&idx) {
+                sink.emit_advisory(
+                    range,
+                    format!(
+                        "module-nested circuit `{name}` is not re-exported to the top level, so \
+                         it is not analyzed as a disclosing root (it is still analyzed through \
+                         its call sites)",
+                    ),
+                );
+            }
+        }
+    }
+
+    roots
+}
+
+/// The set of same-file circuit symbol indices REACHABLE from `roots` by
+/// following resolvable same-file circuit calls transitively — precisely the
+/// circuits the interprocedural walk (`classify_callee` → `CalleeClass::Circuit`)
+/// would enter when analyzing those roots. Used by `discover_roots` to decide
+/// whether an excluded module-nested circuit deserves its fail-closed advisory:
+/// a reachable one is analyzed through its call sites (advise, per §0
+/// conservatism); an unreachable one is dead code (suppress — pure noise).
+///
+/// Resolution mirrors `classify_callee` exactly (`resolve_query` on the call's
+/// name-token offset, then a same-file `SymbolKind::Circuit` check), so
+/// "reachable here" ⟺ "the walk enters this circuit's body". Method calls and
+/// cross-file / unresolved callees are skipped — the walk does not enter those as
+/// walkable circuit bodies either, and any witness flowing into such a call fires
+/// its own taint-gated advisory at that call site.
+///
+/// PRECISION vs SAFETY: this filter only tunes advisory noise. Under-approximating
+/// (dropping an advisory for a circuit that is in fact reachable) is §0-safe —
+/// the walk still enters that circuit at its call site and any leak fires an
+/// `E3100` there. Over-approximating only keeps a harmless extra advisory.
+fn reachable_circuits(ctx: &InterpCtx, tree: &ItemTree, roots: &[Root]) -> HashSet<u32> {
+    let mut reached: HashSet<u32> = HashSet::new();
+    let mut worklist: Vec<Root> = roots.to_vec();
+    while let Some(root) = worklist.pop() {
+        let Some(body) = root_body(ctx, &root) else {
+            continue;
+        };
+        for call in body.syntax().descendants().filter_map(CallExpr::cast) {
+            if is_method_call(&call) {
+                continue;
+            }
+            let Some(name_tok) = call.name() else {
+                continue;
+            };
+            let Some(Definition::Item { file: df, index }) = resolve_query(
+                ctx.db,
+                ctx.file,
+                ctx.src,
+                ctx.fd,
+                ctx.ws,
+                name_tok.text_range().start(),
+            ) else {
+                continue;
+            };
+            if df != ctx.file {
+                continue;
+            }
+            let Some(sym) = tree.symbols.get(index as usize) else {
+                continue;
+            };
+            if sym.kind == SymbolKind::Circuit && reached.insert(index) {
+                worklist.push(Root::Circuit {
+                    name: sym.name.clone(),
+                    symbol: index,
+                });
+            }
+        }
+    }
+    reached
 }
 
 /// The set of symbol indices of module-nested circuits that a TOP-LEVEL
@@ -2840,13 +2927,15 @@ mod tests {
     }
 
     #[test]
-    fn module_nested_circuit_not_a_root() {
-        // Fix (a): a module-nested `export circuit` that writes its arg to a
-        // ledger is NOT a disclosing root — compactc reaches it only through its
-        // import/export chain, so it accepts the file. v3a excludes it and
-        // records an amber advisory (§0), emitting NO E-leak. WITHOUT the
-        // exclusion `leak` would be seeded as a root and `c = x` would flag a
-        // false-positive `E3100` (corpus FP #2, the test3a/base_func pattern).
+    fn module_nested_unreachable_circuit_no_advisory() {
+        // A module-nested `export circuit` that writes its arg to a ledger is NOT
+        // a disclosing root — compactc reaches it only through its import/export
+        // chain, so it accepts the file. It is excluded from roots (WITHOUT the
+        // exclusion `leak` would be seeded and `c = x` would flag a false-positive
+        // `E3100`, corpus FP #2). Here nothing calls `leak`, so it is UNREACHABLE
+        // from any analyzed root — dead code from the disclosure standpoint. The
+        // structural reachability filter suppresses its advisory entirely (it is
+        // pure noise: no witness can ever flow through an uncalled circuit).
         let (db, src, fd, ws, file) = walk_setup(
             "import CompactStandardLibrary;\n\
              module M {\n\
@@ -2879,10 +2968,72 @@ mod tests {
             "module-nested circuit must not emit a confirmed leak"
         );
         assert!(
+            !sink
+                .advisories()
+                .iter()
+                .any(|a| a.reason.contains("module-nested circuit `leak`")),
+            "an UNREACHABLE excluded module circuit is dead code — no advisory (noise gone)"
+        );
+    }
+
+    #[test]
+    fn module_nested_reachable_circuit_advises_and_leak_is_caught() {
+        // The reachable counterpart of `module_nested_unreachable_circuit_no_advisory`.
+        // A re-exported root (`caller`) calls a module-nested-not-re-exported
+        // circuit (`leak`), so `leak` IS reachable from an analyzed root. Two
+        // properties must hold together:
+        //   (1) `leak` still records its excluded-root advisory (it is reachable,
+        //       so the structural filter keeps the fail-closed heads-up), and
+        //   (2) §0 is intact: because `caller` passes an UN-disclosed witness into
+        //       `leak`, the interprocedural walk enters `leak`'s body and its
+        //       `stored = x` write fires a confirmed `E3100` — the exclusion from
+        //       ROOTING never turns a real leak silent.
+        let (db, src, fd, ws, file) = walk_setup(
+            "import CompactStandardLibrary;\n\
+             module Inner {\n\
+             export ledger stored: Field;\n\
+             export circuit leak(x: Field): [] { stored = x; }\n\
+             export circuit caller(x: Field): [] { leak(x); }\n\
+             }\n\
+             import { caller as c } from Inner;\n\
+             export { c };\n",
+        );
+        let base = InterpCtx {
+            db: &db,
+            file,
+            src,
+            fd,
+            ws,
+            disclosing_fn: None,
+        };
+        let tree = item_tree(&db, src);
+        let mut sink = DisclosureSink::new();
+        let roots = discover_roots(&base, &tree, &mut sink);
+        assert!(
+            roots
+                .iter()
+                .any(|r| matches!(r, Root::Circuit { name, .. } if name == "caller")),
+            "the re-exported `caller` must be a root"
+        );
+        assert!(
+            !roots
+                .iter()
+                .any(|r| matches!(r, Root::Circuit { name, .. } if name == "leak")),
+            "the un-re-exported `leak` must still be excluded from roots"
+        );
+        assert!(
             sink.advisories()
                 .iter()
                 .any(|a| a.reason.contains("module-nested circuit `leak`")),
-            "excluded module circuit must record an amber advisory (never silent green)"
+            "a REACHABLE excluded module circuit must still record its advisory"
+        );
+        for root in &roots {
+            interp_root(&base, &mut sink, root);
+        }
+        assert!(
+            !sink.drain_leaks().is_empty(),
+            "§0: the reachable excluded circuit's arg->ledger write must be caught \
+             through its call site (exclusion from rooting is never a silent green)"
         );
     }
 

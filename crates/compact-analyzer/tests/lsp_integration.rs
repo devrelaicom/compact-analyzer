@@ -269,7 +269,7 @@ fn code_action_offers_minimal_scope_disclose_quickfix() {
 fn code_action_respects_disclosure_diagnostics_toggle_off() {
     let (_dir, uri) = temp_doc();
     let mut client = Client::start();
-    client.initialize_with_options(json!({ "disclosureDiagnostics": false }));
+    client.initialize_with_options(json!({ "disclosureDiagnostics": "off" }));
 
     did_open(&mut client, &uri, 1, LEAK_FIXTURE);
     let params = client.wait_for_notification("textDocument/publishDiagnostics");

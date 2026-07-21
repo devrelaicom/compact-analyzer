@@ -603,14 +603,14 @@ impl GlobalState {
             }
             "textDocument/codeAction" => {
                 // v3c C3: the `disclose()` minimal-scope quick-fix. Respects
-                // the `disclosureDiagnostics` toggle (C1) — off means no
+                // the `disclosureDiagnostics` level (C1) — off means no
                 // disclosure diagnostics are published, so offering a fix
                 // for one would be actively misleading; empty array (not
                 // null) mirrors `format_document`'s toggle-off idiom.
                 let result = serde_json::from_value::<lsp_types::CodeActionParams>(req.params)
                     .ok()
                     .and_then(|params| {
-                        if !self.toolchain_config.disclosure_diagnostics {
+                        if self.toolchain_config.disclosure_level == DisclosureLevel::Off {
                             return Some(Vec::new());
                         }
                         let file = *self.open_files.get(&params.text_document.uri)?;
@@ -1008,7 +1008,7 @@ impl GlobalState {
         for d in self.host.resolution_diagnostics(file) {
             native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
         }
-        if self.toolchain_config.disclosure_diagnostics {
+        if self.toolchain_config.disclosure_level != DisclosureLevel::Off {
             // §0 fail-closed applied to mid-edit: an unparseable source makes
             // the disclosure query return an empty root set, which would
             // otherwise blank this channel to green — read as "safe" exactly
@@ -1017,15 +1017,18 @@ impl GlobalState {
             // disclosure set. Retain-and-replay of the last-known
             // diagnostics was rejected: their ranges would drift off the
             // edited source, which is dishonest in a different way.
+            let level = self.toolchain_config.disclosure_level;
             if has_parse_errors {
-                native.push(lsp_utils::diagnostic_to_lsp(
-                    &disclosure_paused_diagnostic(),
-                    line_index,
-                    uri,
-                ));
+                // The "paused" notice is a U-family advisory → shown only under All.
+                let paused = disclosure_paused_diagnostic();
+                if keep_disclosure(level, &paused) {
+                    native.push(lsp_utils::diagnostic_to_lsp(&paused, line_index, uri));
+                }
             } else {
                 for d in self.host.disclosure_diagnostics(file) {
-                    native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+                    if keep_disclosure(level, &d) {
+                        native.push(lsp_utils::diagnostic_to_lsp(&d, line_index, uri));
+                    }
                 }
             }
         }
@@ -1579,6 +1582,18 @@ fn workspace_roots_from_params(params: &serde_json::Value) -> Vec<PathBuf> {
     roots
 }
 
+/// Reporting level for native disclosure (WPP) diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisclosureLevel {
+    /// Publish confirmed leaks (E3100) AND fail-closed advisories (U3100).
+    #[default]
+    All,
+    /// Publish only confirmed leaks (E3100); drop the U-family advisories.
+    LeaksOnly,
+    /// Publish no live disclosure diagnostics (compiler surfaces them on save).
+    Off,
+}
+
 /// v1 toolchain configuration surface (design §4), read from
 /// `initializationOptions`. `toolchain_path`, `compile_on_save`, and
 /// `formatting` are forward-declared here for Tasks 6/7/9, which will read
@@ -1593,11 +1608,11 @@ pub(crate) struct ToolchainConfig {
     /// live native type checking; `false` = suppress them and rely on
     /// compile-on-save's `compactc` type errors. Read once at startup.
     pub type_diagnostics: bool,
-    /// Whether native disclosure (WPP) diagnostics are published. `true` =
-    /// live native disclosure analysis; `false` = suppress the channel
-    /// entirely and rely on compile-on-save's `compactc` disclosure errors.
-    /// Read once at startup.
-    pub disclosure_diagnostics: bool,
+    /// Reporting level for native disclosure (WPP) diagnostics. `All` = leaks +
+    /// advisories (fail-closed default); `LeaksOnly` = confirmed E3100 leaks
+    /// only; `Off` = suppress the channel and rely on compile-on-save. Read once
+    /// at startup.
+    pub disclosure_level: DisclosureLevel,
 }
 
 impl Default for ToolchainConfig {
@@ -1607,7 +1622,7 @@ impl Default for ToolchainConfig {
             compile_on_save: true,
             formatting: true,
             type_diagnostics: true,
-            disclosure_diagnostics: true,
+            disclosure_level: DisclosureLevel::All,
         }
     }
 }
@@ -1629,10 +1644,27 @@ fn toolchain_config_from(options: Option<&serde_json::Value>) -> ToolchainConfig
     if let Some(flag) = opts.get("typeDiagnostics").and_then(|v| v.as_bool()) {
         config.type_diagnostics = flag;
     }
-    if let Some(flag) = opts.get("disclosureDiagnostics").and_then(|v| v.as_bool()) {
-        config.disclosure_diagnostics = flag;
+    if let Some(s) = opts.get("disclosureDiagnostics").and_then(|v| v.as_str()) {
+        config.disclosure_level = match s {
+            "leaks-only" => DisclosureLevel::LeaksOnly,
+            "off" => DisclosureLevel::Off,
+            // "all" and any unknown string → All (fail-safe: show everything).
+            _ => DisclosureLevel::All,
+        };
     }
     config
+}
+
+/// Whether a disclosure diagnostic is published at `level`. `All` keeps
+/// everything; `LeaksOnly` keeps only confirmed leaks (E-family, E3100+) and
+/// drops the U-family advisories (including the "analysis paused" notice);
+/// `Off` keeps nothing (defensive — `Off` also skips the publish block).
+fn keep_disclosure(level: DisclosureLevel, diag: &Diagnostic) -> bool {
+    match level {
+        DisclosureLevel::All => true,
+        DisclosureLevel::LeaksOnly => diag.code.prefix == "E",
+        DisclosureLevel::Off => false,
+    }
 }
 
 fn import_search_path_from(options: Option<&serde_json::Value>) -> Vec<PathBuf> {
@@ -1708,16 +1740,69 @@ mod tests {
     }
 
     #[test]
-    fn toolchain_config_reads_disclosure_diagnostics_flag() {
-        let opts = json!({ "disclosureDiagnostics": false });
-        let config = toolchain_config_from(Some(&opts));
-        assert!(!config.disclosure_diagnostics);
+    fn toolchain_config_reads_disclosure_level() {
+        assert_eq!(
+            toolchain_config_from(Some(&json!({ "disclosureDiagnostics": "all" })))
+                .disclosure_level,
+            DisclosureLevel::All
+        );
+        assert_eq!(
+            toolchain_config_from(Some(&json!({ "disclosureDiagnostics": "leaks-only" })))
+                .disclosure_level,
+            DisclosureLevel::LeaksOnly
+        );
+        assert_eq!(
+            toolchain_config_from(Some(&json!({ "disclosureDiagnostics": "off" })))
+                .disclosure_level,
+            DisclosureLevel::Off
+        );
     }
 
     #[test]
-    fn toolchain_config_disclosure_diagnostics_defaults_true() {
-        assert!(toolchain_config_from(Some(&json!({}))).disclosure_diagnostics);
-        assert!(toolchain_config_from(None).disclosure_diagnostics);
+    fn toolchain_config_disclosure_level_defaults_and_tolerates_garbage() {
+        // Missing key, empty options, and None all default to All.
+        assert_eq!(
+            toolchain_config_from(Some(&json!({}))).disclosure_level,
+            DisclosureLevel::All
+        );
+        assert_eq!(
+            toolchain_config_from(None).disclosure_level,
+            DisclosureLevel::All
+        );
+        // Unknown string and a wrong-typed (legacy bool) value → All (fail-safe).
+        assert_eq!(
+            toolchain_config_from(Some(&json!({ "disclosureDiagnostics": "bogus" })))
+                .disclosure_level,
+            DisclosureLevel::All
+        );
+        assert_eq!(
+            toolchain_config_from(Some(&json!({ "disclosureDiagnostics": false })))
+                .disclosure_level,
+            DisclosureLevel::All
+        );
+    }
+
+    #[test]
+    fn keep_disclosure_filters_by_level() {
+        let e = Diagnostic::error(
+            DiagnosticCode::new("E", 3100),
+            "leak".to_string(),
+            TextRange::empty(TextSize::new(0)),
+        );
+        let u = Diagnostic::warning(
+            DiagnosticCode::new("U", 3100),
+            "advisory".to_string(),
+            TextRange::empty(TextSize::new(0)),
+        );
+        // All keeps both.
+        assert!(keep_disclosure(DisclosureLevel::All, &e));
+        assert!(keep_disclosure(DisclosureLevel::All, &u));
+        // LeaksOnly keeps the E leak, drops the U advisory.
+        assert!(keep_disclosure(DisclosureLevel::LeaksOnly, &e));
+        assert!(!keep_disclosure(DisclosureLevel::LeaksOnly, &u));
+        // Off drops both (defensive — Off skips the block, but the helper is total).
+        assert!(!keep_disclosure(DisclosureLevel::Off, &e));
+        assert!(!keep_disclosure(DisclosureLevel::Off, &u));
     }
 
     #[test]
@@ -2100,7 +2185,10 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<Message>();
         let (_keep_tx, keep_rx) = crossbeam_channel::unbounded::<Message>();
         let mut state = GlobalState::new(tx, keep_rx);
-        assert!(state.toolchain_config.disclosure_diagnostics);
+        assert_eq!(
+            state.toolchain_config.disclosure_level,
+            DisclosureLevel::All
+        );
 
         // Unparseable garbage: no valid item, so `parsed(db, src).errors` is
         // non-empty and the disclosure query would otherwise find no roots
@@ -2125,7 +2213,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<Message>();
         let (_keep_tx, keep_rx) = crossbeam_channel::unbounded::<Message>();
         let mut state = GlobalState::new(tx, keep_rx);
-        state.toolchain_config.disclosure_diagnostics = false;
+        state.toolchain_config.disclosure_level = DisclosureLevel::Off;
 
         let params = open_and_publish(&mut state, &rx, "c6_broken_off.compact", "@@@");
 
@@ -2167,6 +2255,87 @@ mod tests {
                 .iter()
                 .all(|d| !d.message.contains("disclosure analysis paused")),
             "a well-formed source must never show the paused advisory, got {:#?}",
+            params.diagnostics
+        );
+    }
+
+    /// A single file producing BOTH a confirmed `E3100` leak (`f`, a direct
+    /// witness -> ledger write) AND a `U3100` fail-closed advisory (`g`, a
+    /// witness-carrying call to an unresolved callee `mf` — deferred amber
+    /// per spec §0, never conduit-tainted into a confirmed leak). Exercises
+    /// the `leaks-only` filter's E-keep/U-drop behavior end-to-end, not just
+    /// through the `keep_disclosure` unit test.
+    const DUAL_DIAGNOSTIC_FIXTURE: &str = "import CompactStandardLibrary;\n\
+         export ledger c: Uint<8>;\n\
+         export ledger d: Field;\n\
+         witness getW(): Uint<8>;\n\
+         witness getW2(): Field;\n\
+         export circuit f(): [] { c = getW(); }\n\
+         export circuit g(): [] { d = mf(getW2()); }\n";
+
+    #[test]
+    fn leaks_only_drops_u_family_keeps_e_family() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Message>();
+        let (_keep_tx, keep_rx) = crossbeam_channel::unbounded::<Message>();
+        let mut state = GlobalState::new(tx, keep_rx);
+        state.toolchain_config.disclosure_level = DisclosureLevel::LeaksOnly;
+
+        let params = open_and_publish(
+            &mut state,
+            &rx,
+            "c1_dual_leaks_only.compact",
+            DUAL_DIAGNOSTIC_FIXTURE,
+        );
+
+        assert!(
+            params
+                .diagnostics
+                .iter()
+                .any(|d| d.code == Some(lsp_types::NumberOrString::String("E3100".to_string()))),
+            "leaks-only must still publish the confirmed E3100 leak, got {:#?}",
+            params.diagnostics
+        );
+        assert!(
+            params
+                .diagnostics
+                .iter()
+                .all(|d| d.code != Some(lsp_types::NumberOrString::String("U3100".to_string()))),
+            "leaks-only must drop the U3100 advisory, got {:#?}",
+            params.diagnostics
+        );
+    }
+
+    #[test]
+    fn all_level_publishes_both_e_and_u_family() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Message>();
+        let (_keep_tx, keep_rx) = crossbeam_channel::unbounded::<Message>();
+        let mut state = GlobalState::new(tx, keep_rx);
+        assert_eq!(
+            state.toolchain_config.disclosure_level,
+            DisclosureLevel::All
+        );
+
+        let params = open_and_publish(
+            &mut state,
+            &rx,
+            "c1_dual_all.compact",
+            DUAL_DIAGNOSTIC_FIXTURE,
+        );
+
+        assert!(
+            params
+                .diagnostics
+                .iter()
+                .any(|d| d.code == Some(lsp_types::NumberOrString::String("E3100".to_string()))),
+            "expected the E3100 leak under All, got {:#?}",
+            params.diagnostics
+        );
+        assert!(
+            params
+                .diagnostics
+                .iter()
+                .any(|d| d.code == Some(lsp_types::NumberOrString::String("U3100".to_string()))),
+            "expected the U3100 advisory under All, got {:#?}",
             params.diagnostics
         );
     }

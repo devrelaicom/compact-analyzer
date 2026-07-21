@@ -856,7 +856,12 @@ fn interp_call(
         // interpreted (for their own nested sinks/advisories).
         CalleeClass::DeferredCircuit => {
             interp_args_for_effect(ctx, sink, state, env, control, call);
-            sink.emit_advisory(src, "cross-circuit call not interpreted (v3b)".to_string());
+            sink.emit_advisory(
+                src,
+                "cross-circuit call not interpreted (unresolved callee, or a bodyless \
+                 signature / cross-contract circuit)"
+                    .to_string(),
+            );
             Abs::Atomic(Vec::new())
         }
         CalleeClass::Native => {
@@ -938,7 +943,7 @@ fn interp_circuit_call(
         interp_args_for_effect(ctx, sink, state, env, control, call);
         sink.emit_advisory(
             src,
-            "cross-circuit call target could not be resolved (cross-module deferred to v3b)"
+            "cross-file circuit call not analyzed (the callee is defined in another file)"
                 .to_string(),
         );
         return Abs::Atomic(Vec::new());

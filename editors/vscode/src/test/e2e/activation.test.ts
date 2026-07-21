@@ -366,7 +366,7 @@ suite("Compact Analyzer activation smoke", () => {
     assert.ok(leakRestored, "the E3100 leak should be republished once the document is reverted");
   });
 
-  test("scenario 1i: disclosureDiagnostics=false removes disclosure diagnostics while parse diagnostics remain", async function () {
+  test("scenario 1i: disclosureDiagnostics=\"off\" removes disclosure diagnostics while parse diagnostics remain", async function () {
     this.timeout(60_000);
     assert.strictEqual(api.serverStatus(), "running", "server should be running for the toggle check");
 
@@ -393,7 +393,7 @@ suite("Compact Analyzer activation smoke", () => {
     );
 
     const config = vscode.workspace.getConfiguration("compact-analyzer");
-    await config.update("disclosureDiagnostics", false, vscode.ConfigurationTarget.Workspace);
+    await config.update("disclosureDiagnostics", "off", vscode.ConfigurationTarget.Workspace);
     // "Changing this setting requires restarting the language server"
     // (package.json markdownDescription) — mirror scenario 2's restart idiom.
     await vscode.commands.executeCommand(RESTART_COMMAND);
@@ -413,7 +413,7 @@ suite("Compact Analyzer activation smoke", () => {
       }
       assert.ok(
         leakGone,
-        `expected the E3100 disclosure diagnostic to be gone once disclosureDiagnostics=false, got ${JSON.stringify(
+        `expected the E3100 disclosure diagnostic to be gone once disclosureDiagnostics="off", got ${JSON.stringify(
           vscode.languages.getDiagnostics(leakUri).map((d) => ({ source: d.source, code: d.code })),
         )}`,
       );
@@ -430,7 +430,7 @@ suite("Compact Analyzer activation smoke", () => {
       );
     } finally {
       // Restore the default so later scenarios (and re-runs) start clean.
-      await config.update("disclosureDiagnostics", true, vscode.ConfigurationTarget.Workspace);
+      await config.update("disclosureDiagnostics", "all", vscode.ConfigurationTarget.Workspace);
       await vscode.commands.executeCommand(RESTART_COMMAND);
       assert.strictEqual(api.serverStatus(), "running", "server should come back up after restoring the toggle");
     }

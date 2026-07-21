@@ -24,7 +24,7 @@ export interface InitOptions {
   compileOnSave?: boolean;
   formatting?: boolean;
   typeDiagnostics?: boolean;
-  disclosureDiagnostics?: boolean;
+  disclosureDiagnostics?: "all" | "leaks-only" | "off";
 }
 
 /**
@@ -80,9 +80,14 @@ export function buildInitOptions(read: ConfigReader): InitOptions {
   options.formatting = typeof formatting === "boolean" ? formatting : true;
   const typeDiagnostics: unknown = read("typeDiagnostics");
   options.typeDiagnostics = typeof typeDiagnostics === "boolean" ? typeDiagnostics : true;
+  // Reporting level: pass the three known values through; anything else
+  // (unset, a legacy boolean, a typo) falls back to "all" — the fail-closed
+  // full view, matching the server's own tolerant default.
   const disclosureDiagnostics: unknown = read("disclosureDiagnostics");
   options.disclosureDiagnostics =
-    typeof disclosureDiagnostics === "boolean" ? disclosureDiagnostics : true;
+    disclosureDiagnostics === "leaks-only" || disclosureDiagnostics === "off"
+      ? disclosureDiagnostics
+      : "all";
 
   return options;
 }

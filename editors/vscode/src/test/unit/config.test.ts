@@ -23,7 +23,7 @@ describe("buildInitOptions", () => {
     ]);
     expect(result).toEqual({
       compileOnSave: true,
-      disclosureDiagnostics: true,
+      disclosureDiagnostics: "all",
       formatting: true,
       typeDiagnostics: true,
     });
@@ -37,7 +37,7 @@ describe("buildInitOptions", () => {
       importSearchPath: ["a", "b"],
       toolchainPath: "/x",
       compileOnSave: true,
-      disclosureDiagnostics: true,
+      disclosureDiagnostics: "all",
       formatting: true,
       typeDiagnostics: true,
     });
@@ -106,14 +106,22 @@ describe("buildInitOptions", () => {
     expect(result.typeDiagnostics).toBe(true);
   });
 
-  it("preserves a configured disclosureDiagnostics=false", () => {
-    const result = buildInitOptions(fakeReader({ disclosureDiagnostics: false }));
-    expect(result.disclosureDiagnostics).toBe(false);
+  it("maps disclosureDiagnostics enum values through unchanged", () => {
+    for (const level of ["all", "leaks-only", "off"] as const) {
+      const opts = buildInitOptions(fakeReader({ disclosureDiagnostics: level }));
+      expect(opts.disclosureDiagnostics).toBe(level);
+    }
   });
 
-  it("defaults a non-boolean disclosureDiagnostics to true", () => {
-    const result = buildInitOptions(fakeReader({ disclosureDiagnostics: "yes" }));
-    expect(result.disclosureDiagnostics).toBe(true);
+  it("defaults disclosureDiagnostics to 'all' when unset or mistyped", () => {
+    expect(buildInitOptions(fakeReader({})).disclosureDiagnostics).toBe("all");
+    // Legacy boolean and any other garbage → 'all'.
+    expect(buildInitOptions(fakeReader({ disclosureDiagnostics: true })).disclosureDiagnostics).toBe(
+      "all",
+    );
+    expect(
+      buildInitOptions(fakeReader({ disclosureDiagnostics: "bogus" })).disclosureDiagnostics,
+    ).toBe("all");
   });
 });
 

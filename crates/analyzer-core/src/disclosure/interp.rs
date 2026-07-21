@@ -2270,7 +2270,14 @@ fn fail_closed_expr(
         let a = interp_expr(ctx, sink, state, env, control, &child);
         ws = merge_witnesses(&ws, &witnesses_of(&a));
     }
-    sink.emit_advisory(expr.syntax().text_range(), reason.to_string());
+    // Taint-gate (TG): an unhandled expression form is only a disclosure risk
+    // if a witness actually flows through it. Every child is interpreted above
+    // (their own sinks fire regardless), so suppressing the advisory when `ws`
+    // is empty drops noise (`Unary`/`Slice`/`Pad`/`Spread`/lambda on public
+    // data) without ever hiding a leak — §0-safe.
+    if !ws.is_empty() {
+        sink.emit_advisory(expr.syntax().text_range(), reason.to_string());
+    }
     Abs::Atomic(ws)
 }
 
@@ -2344,7 +2351,7 @@ fn unresolved_callee_class(name: &str) -> CalleeClass {
 }
 
 /// The declared return `TyKind` of a same-file witness, else `Unknown`
-/// (fail-closed; `abs_of_type` then advisory-seeds an `Atomic`).
+/// (fail-closed; `abs_of_type` then seeds an `Atomic`).
 fn witness_return_ty(ctx: &InterpCtx, def_file: crate::FileId, sym: &crate::Symbol) -> TyKind {
     if def_file != ctx.file {
         return TyKind::Unknown;

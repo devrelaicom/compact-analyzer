@@ -15,7 +15,7 @@
 /**
  * The EXACT set of keys the server reads from `initializationOptions` (G1).
  *
- * The server reads ONLY these five keys, so the client sends nothing else. The
+ * The server reads ONLY these six keys, so the client sends nothing else. The
  * client-only settings (`serverPath`, `trace.server`) are deliberately absent.
  */
 export interface InitOptions {
@@ -24,6 +24,7 @@ export interface InitOptions {
   compileOnSave?: boolean;
   formatting?: boolean;
   typeDiagnostics?: boolean;
+  disclosureDiagnostics?: "all" | "leaks-only" | "off";
 }
 
 /**
@@ -79,6 +80,14 @@ export function buildInitOptions(read: ConfigReader): InitOptions {
   options.formatting = typeof formatting === "boolean" ? formatting : true;
   const typeDiagnostics: unknown = read("typeDiagnostics");
   options.typeDiagnostics = typeof typeDiagnostics === "boolean" ? typeDiagnostics : true;
+  // Reporting level: pass the three known values through; anything else
+  // (unset, a legacy boolean, a typo) falls back to "all" — the fail-closed
+  // full view, matching the server's own tolerant default.
+  const disclosureDiagnostics: unknown = read("disclosureDiagnostics");
+  options.disclosureDiagnostics =
+    disclosureDiagnostics === "leaks-only" || disclosureDiagnostics === "off"
+      ? disclosureDiagnostics
+      : "all";
 
   return options;
 }

@@ -42,6 +42,12 @@ pub struct DisclosureLeak {
     /// e.g. `"ledger operation"`, `"the value returned from exported circuit f"`.
     pub nature: String,
     pub witnesses: Vec<Witness>,
+    /// `Some(callee_name)` iff this leak fired inside a CROSS-FILE callee walk
+    /// (XF1): its `src` is the call-site anchor in the analyzed file (pragmatic
+    /// single-file model), and `leak_to_diagnostic` renders it primary-only,
+    /// naming the callee. `None` for an ordinary same-file leak (rendered with
+    /// the full witness/path trail as today).
+    pub cross_file: Option<String>,
 }
 
 /// Mutable state threaded through source seeding (A2) and the interpreter walk
@@ -112,7 +118,7 @@ impl DisclosureSink {
         if let Some(existing) = self
             .leaks
             .iter_mut()
-            .find(|l| l.src == src && l.nature == nature)
+            .find(|l| l.src == src && l.nature == nature && l.cross_file.is_none())
         {
             existing.witnesses = merge_witnesses(&existing.witnesses, &witnesses);
         } else {
@@ -120,6 +126,42 @@ impl DisclosureSink {
                 src,
                 nature,
                 witnesses,
+                cross_file: None,
+            });
+        }
+    }
+
+    /// Records a confirmed CROSS-FILE leak (XF1): a sink fired inside a callee
+    /// defined in another file, so the leak is anchored at `anchor` — the
+    /// call-site range in the file under analysis (the pragmatic single-file
+    /// diagnostic model, per task-XF1) — and tagged with `callee`'s name for
+    /// rendering. Deduped by `(anchor, nature)` among cross-file entries, with
+    /// witnesses unioned on collision (two sinks in the same callee anchored at
+    /// one call site collapse to one diagnostic). A no-op when `witnesses` is
+    /// empty (a `disclose()`d or witness-free flow leaks nothing).
+    pub fn record_cross_file_leak(
+        &mut self,
+        anchor: TextRange,
+        nature: impl Into<String>,
+        witnesses: Vec<Witness>,
+        callee: String,
+    ) {
+        if witnesses.is_empty() {
+            return;
+        }
+        let nature = nature.into();
+        if let Some(existing) = self
+            .leaks
+            .iter_mut()
+            .find(|l| l.src == anchor && l.nature == nature && l.cross_file.is_some())
+        {
+            existing.witnesses = merge_witnesses(&existing.witnesses, &witnesses);
+        } else {
+            self.leaks.push(DisclosureLeak {
+                src: anchor,
+                nature,
+                witnesses,
+                cross_file: Some(callee),
             });
         }
     }
@@ -150,7 +192,11 @@ impl DisclosureSink {
 pub fn advisory_to_diagnostic(a: &Advisory) -> Diagnostic {
     Diagnostic::warning(
         DiagnosticCode::new("U", 3100),
-        format!("unverified: {}", a.reason),
+        format!(
+            "unverified (advisory — a clean editor is not a proof of privacy; \
+             compile is authoritative): {}",
+            a.reason
+        ),
         a.src,
     )
 }
@@ -252,6 +298,10 @@ mod tests {
         assert_eq!(diag.code.prefix, "U");
         assert_eq!(diag.code.number, 3100);
         assert_eq!(diag.primary_span, src);
+        // The wrapper conveys the advisory contract: a clean editor is not a
+        // proof of privacy, compile is authoritative — not just "unverified".
+        assert!(diag.message.contains("advisory"));
+        assert!(diag.message.contains("compile is authoritative"));
         assert!(diag.message.contains("Unknown declared type"));
         assert!(diag.secondary_spans.is_empty());
     }

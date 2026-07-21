@@ -22,6 +22,7 @@ mod workspace;
 pub use analysis::{AnalysisHost, FileAnalysis};
 pub use compactp_diagnostics::{Diagnostic, DiagnosticCode, LabeledSpan, Severity};
 pub use compactp_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
+pub use disclosure::{PINNED_COMPILER_VERSION, version_mismatch};
 pub use item_tree::{ItemTree, Symbol, SymbolKind};
 pub use ledger_adts::LedgerMethod;
 pub use line_index::{LineCol, LineIndex};

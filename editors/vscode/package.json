@@ -97,6 +97,17 @@
           "default": true,
           "markdownDescription": "Publish native type diagnostics (as-you-type type checking) in the Problems panel, sent to the server as `initializationOptions.typeDiagnostics`. When disabled, only parse and name-resolution diagnostics are shown live and type errors are surfaced by the compiler on save (via `compileOnSave`). Changing this setting requires restarting the language server."
         },
+        "compact-analyzer.disclosureDiagnostics": {
+          "type": "string",
+          "enum": ["all", "leaks-only", "off"],
+          "enumDescriptions": [
+            "Show all disclosure diagnostics: confirmed witness-disclosure leaks and the fail-closed 'unverified' advisories.",
+            "Show only confirmed leaks; hide the fail-closed advisories. The advisories flag code the analyzer cannot verify, so hiding them means the editor no longer warns about unverifiable code — a clean editor is not a proof of privacy. The compiler on save (compileOnSave) remains authoritative.",
+            "Publish no live disclosure diagnostics; disclosure is surfaced by the compiler on save (compileOnSave)."
+          ],
+          "default": "all",
+          "markdownDescription": "Reporting level for native disclosure (WPP) diagnostics (as-you-type witness-disclosure analysis), sent to the server as `initializationOptions.disclosureDiagnostics`. `all` shows confirmed leaks and fail-closed advisories; `leaks-only` shows only confirmed leaks (hiding the 'unverified' advisories — note that a clean editor is then not a proof of privacy); `off` relies on the compiler on save (via `compileOnSave`). Changing this setting requires restarting the language server."
+        },
         "compact-analyzer.trace.server": {
           "type": "string",
           "enum": [

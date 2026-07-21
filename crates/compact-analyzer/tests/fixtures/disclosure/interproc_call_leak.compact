@@ -1,0 +1,8 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+export ledger store: Field;
+
+circuit stash(v: Field): [] { store = v; }
+
+export circuit leak(secret: Field): [] { stash(secret); }

@@ -27,13 +27,18 @@ fn publishes_diagnostics_then_clears_after_fix() {
     assert_eq!(params["uri"], json!(uri));
     assert_eq!(params["version"], 1);
     let diags = params["diagnostics"].as_array().unwrap();
-    assert_eq!(diags.len(), 1);
-    assert_eq!(diags[0]["message"], "expected COLON");
-    assert_eq!(diags[0]["source"], "compact-analyzer");
-    assert_eq!(diags[0]["severity"], 1); // Error
-    assert_eq!(diags[0]["code"], "E0001");
+    // A parse error also has disclosure results unavailable (v3c C6), so this
+    // publishes alongside a paused U3100 advisory — find the parse error
+    // itself rather than assume it's the only diagnostic.
+    let parse_err = diags
+        .iter()
+        .find(|d| d["code"] == "E0001")
+        .unwrap_or_else(|| panic!("expected an E0001 parse error, got {diags:#?}"));
+    assert_eq!(parse_err["message"], "expected COLON");
+    assert_eq!(parse_err["source"], "compact-analyzer");
+    assert_eq!(parse_err["severity"], 1); // Error
     assert_eq!(
-        diags[0]["range"]["start"],
+        parse_err["range"]["start"],
         json!({"line": 0, "character": 12})
     );
 
@@ -61,9 +66,15 @@ fn positions_are_utf16_code_units() {
     did_open(&mut client, &uri, 1, "/* \u{1F600} */ ledger count Field;");
     let params = client.wait_for_notification("textDocument/publishDiagnostics");
     let diags = params["diagnostics"].as_array().unwrap();
-    assert_eq!(diags.len(), 1);
+    // A parse error also has disclosure results unavailable (v3c C6), so this
+    // publishes alongside a paused U3100 advisory — find the parse error
+    // itself rather than assume it's the only diagnostic.
+    let parse_err = diags
+        .iter()
+        .find(|d| d["code"] == "E0001")
+        .unwrap_or_else(|| panic!("expected an E0001 parse error, got {diags:#?}"));
     assert_eq!(
-        diags[0]["range"]["start"],
+        parse_err["range"]["start"],
         json!({"line": 0, "character": 21})
     );
 
@@ -179,6 +190,117 @@ fn publishes_disclosure_leak_diagnostic_on_open() {
     client.shutdown();
 }
 
+const LEAK_FIXTURE: &str = "import CompactStandardLibrary;\n\
+     export ledger c: Uint<8>;\n\
+     witness getW(): Uint<8>;\n\
+     export circuit f(): [] { c = getW(); }\n";
+
+/// v3c C3 (security-sensitive): a `textDocument/codeAction` at the
+/// confirmed leak's range returns exactly one `quickfix` that wraps the
+/// MINIMAL tainted expression (`getW()`) in `disclose(...)` — never the
+/// whole `c = getW();` statement. Differential-verified separately (see the
+/// task report) that applying this exact edit produces source `compactc`
+/// 0.31.1 accepts.
+#[test]
+fn code_action_offers_minimal_scope_disclose_quickfix() {
+    let (_dir, uri) = temp_doc();
+    let mut client = Client::start();
+    client.initialize();
+
+    did_open(&mut client, &uri, 1, LEAK_FIXTURE);
+    let params = client.wait_for_notification("textDocument/publishDiagnostics");
+    let diags = params["diagnostics"].as_array().unwrap();
+    let leak = diags
+        .iter()
+        .find(|d| d["code"] == "E3100")
+        .unwrap_or_else(|| panic!("expected an E3100 disclosure leak, got {diags:#?}"));
+    let leak_range = leak["range"].clone();
+
+    let response = client.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri},
+            "range": leak_range,
+            "context": {"diagnostics": [leak]},
+        }),
+    );
+    let actions = response["result"].as_array().expect("actions array");
+    assert_eq!(
+        actions.len(),
+        1,
+        "expected exactly one quickfix, got {actions:#?}"
+    );
+    let action = &actions[0];
+    assert_eq!(action["title"], "Reveal this value with disclose()");
+    assert_eq!(action["kind"], "quickfix");
+    assert_eq!(action["isPreferred"], false);
+
+    let edits = action["edit"]["changes"][uri.as_str()]
+        .as_array()
+        .expect("edits for the document");
+    assert_eq!(edits.len(), 2, "an insert-open + insert-close pair");
+    assert_eq!(edits[0]["newText"], "disclose(");
+    assert_eq!(edits[1]["newText"], ")");
+    assert_eq!(
+        edits[0]["range"]["start"], edits[0]["range"]["end"],
+        "the open-paren insertion must be zero-width"
+    );
+    assert_eq!(
+        edits[1]["range"]["start"], edits[1]["range"]["end"],
+        "the close-paren insertion must be zero-width"
+    );
+
+    // The COMBINED range the edit touches (earliest start, latest end)
+    // must equal the diagnostic's own range EXACTLY — not the whole
+    // statement. This is the security property the quick-fix exists to
+    // uphold: a wider wrap could silently sanitize a second, unrelated leak
+    // sharing the same statement.
+    assert_eq!(edits[0]["range"]["start"], leak_range["start"]);
+    assert_eq!(edits[1]["range"]["end"], leak_range["end"]);
+
+    client.shutdown();
+}
+
+/// The C1 `disclosureDiagnostics` toggle governs the quick-fix too: with
+/// disclosure diagnostics off, no disclosure quick-fix is ever offered
+/// (there's no published leak to attach it to, and offering one anyway
+/// would contradict the toggle).
+#[test]
+fn code_action_respects_disclosure_diagnostics_toggle_off() {
+    let (_dir, uri) = temp_doc();
+    let mut client = Client::start();
+    client.initialize_with_options(json!({ "disclosureDiagnostics": "off" }));
+
+    did_open(&mut client, &uri, 1, LEAK_FIXTURE);
+    let params = client.wait_for_notification("textDocument/publishDiagnostics");
+    let diags = params["diagnostics"].as_array().unwrap();
+    assert!(
+        diags.iter().all(|d| d["code"] != "E3100"),
+        "toggle off: no E3100 should publish, got {diags:#?}"
+    );
+
+    // Request a code action over the (unpublished) leak's source range.
+    let (line, col) = lsp_position(LEAK_FIXTURE, "getW(); }");
+    let response = client.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri},
+            "range": {
+                "start": {"line": line, "character": col},
+                "end": {"line": line, "character": col + 6},
+            },
+            "context": {"diagnostics": []},
+        }),
+    );
+    let actions = response["result"].as_array().expect("actions array");
+    assert!(
+        actions.is_empty(),
+        "no disclosure quickfix with the toggle off, got {actions:#?}"
+    );
+
+    client.shutdown();
+}
+
 #[test]
 fn publishes_disclosure_advisory_diagnostic_on_open() {
     let (_dir, uri) = temp_doc();
@@ -189,7 +311,11 @@ fn publishes_disclosure_advisory_diagnostic_on_open() {
     // `module_nested_circuit_renders_amber_advisory_not_a_leak`): a
     // module-nested `export circuit` is excluded from the root set, so the
     // analyzer can't decide it and records an amber U3100 advisory rather
-    // than silently reporting no leak.
+    // than silently reporting no leak. Post reachability-gating (HEAD
+    // `reachability-gate the module-nested root advisory`), the advisory only
+    // fires when the module-nested circuit is REACHABLE from an analyzed root,
+    // so a re-exported `caller` calls `leak` (passing a `disclose()`d arg, so
+    // no confirmed E-leak is manufactured — the advisory renders alone).
     did_open(
         &mut client,
         &uri,
@@ -197,8 +323,11 @@ fn publishes_disclosure_advisory_diagnostic_on_open() {
         "import CompactStandardLibrary;\n\
          module M {\n\
          export ledger c: Field;\n\
-         export circuit leak(x: Field): Field { c = x; return x; }\n\
-         }\n",
+         export circuit leak(x: Field): [] { c = x; }\n\
+         export circuit caller(x: Field): [] { leak(disclose(x)); }\n\
+         }\n\
+         import { caller as cc } from M;\n\
+         export { cc };\n",
     );
     let params = client.wait_for_notification("textDocument/publishDiagnostics");
     let diags = params["diagnostics"].as_array().unwrap();

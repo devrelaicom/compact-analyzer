@@ -189,8 +189,16 @@ fn open_without_save_publishes_only_native_diagnostics() {
     let diags = diagnostics(&params);
     assert!(!diags.is_empty(), "expected at least one native diagnostic");
     for d in diags {
-        assert_eq!(
-            d["source"], "compact-analyzer",
+        // Native diagnostics carry either the confirmed-diagnostic source or
+        // (v3c C6: the parse error here also means disclosure results are
+        // unavailable) the U-family "unverified" advisory source — never
+        // the compiler's own `"compactc"` source, which only a save
+        // produces.
+        assert!(
+            matches!(
+                d["source"].as_str(),
+                Some("compact-analyzer") | Some("compact-analyzer (unverified)")
+            ),
             "no compiler diagnostics without a save: {d}"
         );
     }

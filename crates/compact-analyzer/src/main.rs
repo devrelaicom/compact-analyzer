@@ -1,3 +1,4 @@
+mod code_action;
 mod lsp_utils;
 mod semantic_tokens_legend;
 mod server;

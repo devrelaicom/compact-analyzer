@@ -1,0 +1,9 @@
+pragma language_version >= 0.23;
+
+module libB {
+  export ledger store: Field;
+
+  export circuit stash(v: Field): [] {
+    store = v;
+  }
+}

@@ -27,7 +27,7 @@ use crate::ty::TyKind;
 
 use super::abs::{
     Abs, PathPoint, Witness, WitnessInfo, abs_equal, combine_abs, disclose, merge_witnesses,
-    witnesses_of,
+    taint_present, witnesses_of,
 };
 use super::leaks::DisclosureSink;
 use super::tables;
@@ -290,37 +290,32 @@ fn is_module_nested(tree: &ItemTree, i: u32) -> bool {
 /// sees a `TyKind` there is no alias left to recurse through.
 ///
 /// `Unknown` fails closed (spec §0): the shape can't be known, so this seeds
-/// `Atomic` — never a silently untainted result — AND records an advisory
-/// via `sink`. The advisory is anchored at the first seed witness's
-/// declaration site; `seed` is empty only in a hypothetical direct call
-/// (every real caller in this module threads a non-empty seed), so the
-/// `TextRange::empty(0.into())` fallback is defensive, not a real path.
-pub fn abs_of_type(sink: &mut DisclosureSink, kind: &TyKind, seed: &[Witness]) -> Abs {
+/// `Atomic` — never a silently untainted result. Task TG removed the former
+/// shape-precision advisory here: the conservative seed over-taints (never
+/// under-taints — corpus proves 0 FP), so it is orthogonal to §0; any imprecise
+/// USE of the resulting `Atomic` fires its own taint-gated advisory downstream.
+pub fn abs_of_type(kind: &TyKind, seed: &[Witness]) -> Abs {
     match kind {
         TyKind::Struct { fields, .. } => Abs::Multiple(
             fields
                 .iter()
-                .map(|(_, field_ty)| abs_of_type(sink, field_ty, seed))
+                .map(|(_, field_ty)| abs_of_type(field_ty, seed))
                 .collect(),
         ),
         TyKind::Tuple(elems) => Abs::Multiple(
             elems
                 .iter()
-                .map(|elem_ty| abs_of_type(sink, elem_ty, seed))
+                .map(|elem_ty| abs_of_type(elem_ty, seed))
                 .collect(),
         ),
-        TyKind::Vector(_, elem) => Abs::Single(Box::new(abs_of_type(sink, elem, seed))),
+        TyKind::Vector(_, elem) => Abs::Single(Box::new(abs_of_type(elem, seed))),
         TyKind::Unknown => {
-            let src = seed
-                .first()
-                .map(|w| w.src)
-                .unwrap_or_else(|| TextRange::empty(0.into()));
-            sink.emit_advisory(
-                src,
-                "parameter type could not be resolved to a known shape (an Unknown v2b \
-                 type); treated as tainted rather than silently clean"
-                    .to_string(),
-            );
+            // §0: no advisory here. The conservative `Atomic(seed)` seed is
+            // fail-closed-safe (over-taints, never under-taints — corpus proves
+            // 0 FP), so the advisory is orthogonal to §0 (a shape-precision /
+            // false-positive concern, not a silent-green one). If the
+            // imprecisely-shaped value is later USED imprecisely, THAT site's
+            // taint-gated advisory fires with better location.
             Abs::Atomic(seed.to_vec())
         }
         TyKind::Boolean
@@ -404,7 +399,7 @@ pub fn seed_sources(
             info,
             path: Vec::new(),
         };
-        let abs = abs_of_type(sink, &kind, std::slice::from_ref(&witness));
+        let abs = abs_of_type(&kind, std::slice::from_ref(&witness));
         env.insert(name, abs);
     }
     env
@@ -599,7 +594,7 @@ pub fn interp_expr(
             Some(t) => {
                 let kind =
                     crate::infer::type_kind_resolved(ctx.db, ctx.file, ctx.src, ctx.fd, ctx.ws, &t);
-                abs_of_type(sink, &kind, &[])
+                abs_of_type(&kind, &[])
             }
             None => Abs::Atomic(Vec::new()),
         },
@@ -757,8 +752,11 @@ fn interp_binary(
             Abs::Atomic(merge_witnesses(&witnesses_of(&lhs), &witnesses_of(&rhs)))
         }
         _ => {
-            sink.emit_advisory(src, "binary operator not modeled".to_string());
-            Abs::Atomic(merge_witnesses(&witnesses_of(&lhs), &witnesses_of(&rhs)))
+            let union = merge_witnesses(&witnesses_of(&lhs), &witnesses_of(&rhs));
+            if !union.is_empty() {
+                sink.emit_advisory(src, "binary operator not modeled".to_string());
+            }
+            Abs::Atomic(union)
         }
     }
 }
@@ -848,7 +846,7 @@ fn interp_call(
                 info: WitnessInfo::WitnessReturn { function: name },
                 path: Vec::new(),
             };
-            abs_of_type(sink, &ret, std::slice::from_ref(&w))
+            abs_of_type(&ret, std::slice::from_ref(&w))
         }
         // A cross-circuit call to a resolved user circuit (v3b B2): interpret
         // the callee body under the interpreted arg shapes so witness taint flows
@@ -865,13 +863,15 @@ fn interp_call(
         // §0 says fail-closed is *amber*, not red. Arguments are still
         // interpreted (for their own nested sinks/advisories).
         CalleeClass::DeferredCircuit => {
-            interp_args_for_effect(ctx, sink, state, env, control, call);
-            sink.emit_advisory(
-                src,
-                "cross-circuit call not interpreted (unresolved callee, or a bodyless \
-                 signature / cross-contract circuit)"
-                    .to_string(),
-            );
+            let args_tainted = interp_args_for_effect(ctx, sink, state, env, control, call);
+            if args_tainted || !control.is_empty() {
+                sink.emit_advisory(
+                    src,
+                    "cross-circuit call not interpreted (unresolved callee, or a bodyless \
+                     signature / cross-contract circuit)"
+                        .to_string(),
+                );
+            }
             Abs::Atomic(Vec::new())
         }
         CalleeClass::Native => {
@@ -948,11 +948,13 @@ fn interp_circuit_call(
         // `secret` to a ledger) must still record its own sink even though THIS
         // call is un-walkable. Interpret args for effect before the advisory,
         // exactly as the sibling `DeferredCircuit` arm does.
-        interp_args_for_effect(ctx, sink, state, env, control, call);
-        sink.emit_advisory(
-            src,
-            "recursive or deeply-nested circuit call not analyzed".to_string(),
-        );
+        let args_tainted = interp_args_for_effect(ctx, sink, state, env, control, call);
+        if args_tainted || !control.is_empty() {
+            sink.emit_advisory(
+                src,
+                "recursive or deeply-nested circuit call not analyzed".to_string(),
+            );
+        }
         return Abs::Atomic(Vec::new());
     }
     // Locate the callee's params + body, plus the callee file's own source
@@ -961,12 +963,14 @@ fn interp_circuit_call(
         // §0 fail-closed: the callee file is not reachable in the workspace map
         // (or its def/body can't be read). Realize any sink nested in an argument
         // before failing closed to amber — never a silent green, never a false red.
-        interp_args_for_effect(ctx, sink, state, env, control, call);
-        sink.emit_advisory(
-            src,
-            "cross-file circuit call not analyzed (the callee is defined in another file)"
-                .to_string(),
-        );
+        let args_tainted = interp_args_for_effect(ctx, sink, state, env, control, call);
+        if args_tainted || !control.is_empty() {
+            sink.emit_advisory(
+                src,
+                "cross-file circuit call not analyzed (the callee is defined in another file)"
+                    .to_string(),
+            );
+        }
         return Abs::Atomic(Vec::new());
     };
     // The callee's own cross-file edges (XF1): its nested resolution (`store` as a
@@ -980,13 +984,15 @@ fn interp_circuit_call(
         match ctx.ws.file_deps(ctx.db).get(&callee_file).copied() {
             Some(fd) => fd,
             None => {
-                interp_args_for_effect(ctx, sink, state, env, control, call);
-                sink.emit_advisory(
-                    src,
-                    "cross-file circuit call not analyzed (the callee file's dependencies are \
-                     unavailable in the workspace)"
-                        .to_string(),
-                );
+                let args_tainted = interp_args_for_effect(ctx, sink, state, env, control, call);
+                if args_tainted || !control.is_empty() {
+                    sink.emit_advisory(
+                        src,
+                        "cross-file circuit call not analyzed (the callee file's dependencies \
+                         are unavailable in the workspace)"
+                            .to_string(),
+                    );
+                }
                 return Abs::Atomic(Vec::new());
             }
         }
@@ -998,7 +1004,9 @@ fn interp_circuit_call(
         .map(|a| interp_expr(ctx, sink, state, env, control, a))
         .collect();
     if arg_shapes.len() != callee.params.len() {
-        sink.emit_advisory(src, "circuit call arity mismatch not analyzed".to_string());
+        if arg_shapes.iter().any(taint_present) || !control.is_empty() {
+            sink.emit_advisory(src, "circuit call arity mismatch not analyzed".to_string());
+        }
         return Abs::Atomic(Vec::new());
     }
     // B3 walk-local `call-ht` memo (B0 Q2, memoization ADR Option A). Key on the
@@ -1220,11 +1228,15 @@ fn interp_ledger_op(
 
     if !recv_is_ledger && known.is_none() {
         // Not a recognizable ledger op: fail closed (never silent green, §0),
-        // record no leak (no ledger field / op to key on).
-        sink.emit_advisory(
-            src,
-            "method call on a non-ledger receiver not modeled".to_string(),
-        );
+        // record no leak (no ledger field / op to key on). This arm returns
+        // before the control leak below, so a witness-carrying control set must
+        // still surface here — gate on both arg taint and control.
+        if args.iter().any(taint_present) || !control.is_empty() {
+            sink.emit_advisory(
+                src,
+                "method call on a non-ledger receiver not modeled".to_string(),
+            );
+        }
         return Abs::Atomic(Vec::new());
     }
 
@@ -1284,10 +1296,12 @@ fn interp_ledger_op(
         // witness arg (matches the L1 default: no clause ⇒ leaks) + advisory.
         None => {
             leak_all_ledger_args(sink, name, args, &arg_srcs, src, anchor);
-            sink.emit_advisory(
-                src,
-                format!("unknown ledger op `{name}`; leaking all witness args (fail-closed, may be stale)"),
-            );
+            if args.iter().any(taint_present) {
+                sink.emit_advisory(
+                    src,
+                    format!("unknown ledger op `{name}`; leaking all witness args (fail-closed, may be stale)"),
+                );
+            }
         }
     }
     Abs::Atomic(Vec::new())
@@ -1394,10 +1408,12 @@ fn unknown_native_result(
             &witnesses_of(&add_path_point(arg_abs.clone(), &pp)),
         );
     }
-    sink.emit_advisory(
-        src,
-        format!("unknown native `{name}` not in the conduit table; conduit-tainting all args (fail-closed, may be stale)"),
-    );
+    if !folded.is_empty() {
+        sink.emit_advisory(
+            src,
+            format!("unknown native `{name}` not in the conduit table; conduit-tainting all args (fail-closed, may be stale)"),
+        );
+    }
     Abs::Atomic(folded)
 }
 
@@ -1491,11 +1507,13 @@ fn interp_struct_literal(
                 .collect(),
         ),
         None => {
-            sink.emit_advisory(
-                src,
-                "struct literal type could not be resolved; fields kept in source order"
-                    .to_string(),
-            );
+            if inits.iter().any(|(_, a)| taint_present(a)) {
+                sink.emit_advisory(
+                    src,
+                    "struct literal type could not be resolved; fields kept in source order"
+                        .to_string(),
+                );
+            }
             Abs::Multiple(inits.into_iter().map(|(_, abs)| abs).collect())
         }
     }
@@ -1525,10 +1543,13 @@ fn interp_member(
     {
         return child.clone();
     }
-    sink.emit_advisory(
-        src,
-        "struct/tuple member projection could not be resolved; conservatively unioned".to_string(),
-    );
+    if taint_present(&base_abs) {
+        sink.emit_advisory(
+            src,
+            "struct/tuple member projection could not be resolved; conservatively unioned"
+                .to_string(),
+        );
+    }
     Abs::Atomic(witnesses_of(&base_abs))
 }
 
@@ -1566,11 +1587,14 @@ fn interp_index(
             for c in &children {
                 ws = merge_witnesses(&ws, &witnesses_of(c));
             }
-            sink.emit_advisory(
-                src,
-                "index into heterogeneous aggregate could not be resolved; conservatively unioned"
-                    .to_string(),
-            );
+            if !ws.is_empty() {
+                sink.emit_advisory(
+                    src,
+                    "index into heterogeneous aggregate could not be resolved; conservatively \
+                     unioned"
+                        .to_string(),
+                );
+            }
             Abs::Atomic(ws)
         }
         other => Abs::Atomic(merge_witnesses(&witnesses_of(&other), &idx_ws)),
@@ -2085,14 +2109,22 @@ pub fn interp_stmt(
         // `for` (R0 fixpoint — deferred to A7): fail closed. Interpret the body
         // once in a child scope with the loop var bound conservatively.
         Stmt::For(f) => {
-            sink.emit_advisory(
-                stmt.syntax().text_range(),
-                "for loop not modeled (fixpoint deferred to A7)".to_string(),
-            );
             let mut range_ws = Vec::new();
             for e in child_exprs(stmt.syntax()) {
                 let a = interp_expr(ctx, sink, state, env, control, &e);
                 range_ws = merge_witnesses(&range_ws, &witnesses_of(&a));
+            }
+            // §0 gate: the body is walked unconditionally below (a simple body
+            // leak still fires as an E-leak regardless of this advisory). The
+            // only under-report risk the advisory guards is fixpoint
+            // accumulator growth, which requires a witness already reachable —
+            // in the range, the threaded control, or the enclosing env.
+            let env_tainted = env.values().any(taint_present);
+            if !range_ws.is_empty() || !control.is_empty() || env_tainted {
+                sink.emit_advisory(
+                    stmt.syntax().text_range(),
+                    "for loop not modeled (fixpoint deferred to A7)".to_string(),
+                );
             }
             let mut scope = env.clone();
             if let Some(v) = f.var_name() {
@@ -2111,12 +2143,16 @@ pub fn interp_stmt(
         }
         // Reserved/unused grammar node — fail closed.
         Stmt::MultiConst(_) => {
-            sink.emit_advisory(
-                stmt.syntax().text_range(),
-                "multi-const statement not modeled".to_string(),
-            );
+            let mut child_ws = Vec::new();
             for e in child_exprs(stmt.syntax()) {
-                interp_expr(ctx, sink, state, env, control, &e);
+                let a = interp_expr(ctx, sink, state, env, control, &e);
+                child_ws = merge_witnesses(&child_ws, &witnesses_of(&a));
+            }
+            if !child_ws.is_empty() {
+                sink.emit_advisory(
+                    stmt.syntax().text_range(),
+                    "multi-const statement not modeled".to_string(),
+                );
             }
         }
     }
@@ -2163,10 +2199,13 @@ fn bind_pattern(
             for p in &elems {
                 bind_conservative(env, p, &ws);
             }
-            sink.emit_advisory(
-                tp.syntax().text_range(),
-                "tuple destructuring shape did not match value; conservatively unioned".to_string(),
-            );
+            if !ws.is_empty() {
+                sink.emit_advisory(
+                    tp.syntax().text_range(),
+                    "tuple destructuring shape did not match value; conservatively unioned"
+                        .to_string(),
+                );
+            }
         }
         Some(Pat::Struct(sp)) => {
             let ws = witnesses_of(&val);
@@ -2175,10 +2214,13 @@ fn bind_pattern(
                     env.insert(tok.text().to_string(), Abs::Atomic(ws.clone()));
                 }
             }
-            sink.emit_advisory(
-                sp.syntax().text_range(),
-                "struct destructuring not modeled positionally; conservatively unioned".to_string(),
-            );
+            if !ws.is_empty() {
+                sink.emit_advisory(
+                    sp.syntax().text_range(),
+                    "struct destructuring not modeled positionally; conservatively unioned"
+                        .to_string(),
+                );
+            }
         }
         None => {}
     }
@@ -2323,6 +2365,11 @@ fn witness_return_ty(ctx: &InterpCtx, def_file: crate::FileId, sym: &crate::Symb
 /// sinks + advisories), discarding the taint — the fail-closed circuit/native
 /// arms return a CLEAN result (the arg taint does not propagate through the
 /// unmodeled callee until A6's conduit table decides which args are conduits).
+///
+/// Returns whether ANY argument carried a witness value. The fail-closed arms
+/// use this to gate their §0 advisory (a call whose every argument is public
+/// cannot leak a witness through the unmodeled callee), while still always
+/// interpreting every argument for effect.
 fn interp_args_for_effect(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
@@ -2330,10 +2377,13 @@ fn interp_args_for_effect(
     env: &Env,
     control: &[Witness],
     call: &CallExpr,
-) {
+) -> bool {
+    let mut any_tainted = false;
     for arg in arg_exprs(call) {
-        interp_expr(ctx, sink, state, env, control, &arg);
+        let arg_abs = interp_expr(ctx, sink, state, env, control, &arg);
+        any_tainted |= taint_present(&arg_abs);
     }
+    any_tainted
 }
 
 /// The direct `Expr` children of a syntax node, in source order.
@@ -2622,11 +2672,11 @@ mod tests {
 
     #[test]
     fn abs_of_type_builds_struct_multiple_array_single() {
-        let mut sink = DisclosureSink::new();
+        let sink = DisclosureSink::new();
         let w = witness(0);
 
         // Scalar -> Atomic, seed at the leaf.
-        let scalar = abs_of_type(&mut sink, &TyKind::Field, std::slice::from_ref(&w));
+        let scalar = abs_of_type(&TyKind::Field, std::slice::from_ref(&w));
         assert_eq!(scalar, Abs::Atomic(vec![w.clone()]));
 
         // Struct -> Multiple, one child per field.
@@ -2637,7 +2687,7 @@ mod tests {
                 (Arc::from("y"), TyKind::Boolean),
             ]),
         };
-        let struct_abs = abs_of_type(&mut sink, &st, std::slice::from_ref(&w));
+        let struct_abs = abs_of_type(&st, std::slice::from_ref(&w));
         match struct_abs {
             Abs::Multiple(children) => {
                 assert_eq!(children.len(), 2);
@@ -2650,14 +2700,14 @@ mod tests {
         // Tuple -> Multiple too.
         let tup = TyKind::Tuple(Arc::from(vec![TyKind::Field, TyKind::Field]));
         assert!(matches!(
-            abs_of_type(&mut sink, &tup, std::slice::from_ref(&w)),
+            abs_of_type(&tup, std::slice::from_ref(&w)),
             Abs::Multiple(children) if children.len() == 2
         ));
 
         // Vector/array -> Single, the ELEMENT type's Abs (aggregated, not
         // one-per-index).
         let vec_ty = TyKind::Vector(3, Arc::new(TyKind::Field));
-        let vec_abs = abs_of_type(&mut sink, &vec_ty, std::slice::from_ref(&w));
+        let vec_abs = abs_of_type(&vec_ty, std::slice::from_ref(&w));
         match vec_abs {
             Abs::Single(inner) => assert_eq!(*inner, Abs::Atomic(vec![w])),
             other => panic!("expected Abs::Single, got {other:?}"),
@@ -2668,15 +2718,17 @@ mod tests {
     }
 
     #[test]
-    fn abs_of_type_unknown_emits_advisory() {
-        let mut sink = DisclosureSink::new();
+    fn abs_of_type_unknown_seeds_without_advisory() {
+        let sink = DisclosureSink::new();
         let w = witness(0);
-        let result = abs_of_type(&mut sink, &TyKind::Unknown, std::slice::from_ref(&w));
+        let result = abs_of_type(&TyKind::Unknown, std::slice::from_ref(&w));
         // Fails closed: still seeded (never silently untainted)...
         assert_eq!(result, Abs::Atomic(vec![w]));
-        // ...and the uncertainty is recorded exactly once.
-        assert_eq!(sink.advisories().len(), 1);
-        assert!(sink.advisories()[0].reason.contains("Unknown"));
+        // ...but Task TG removed this shape-precision advisory (§0): the
+        // conservative seed over-taints (never under-taints — corpus proves
+        // 0 FP), so it is orthogonal to §0. Any imprecise USE of the resulting
+        // Atomic fires its own taint-gated advisory with better location.
+        assert!(sink.advisories().is_empty());
     }
 
     #[test]
@@ -3958,6 +4010,46 @@ mod tests {
         assert!(
             had_advisory,
             "the deferred unresolved call records a fail-closed advisory (§0)"
+        );
+    }
+
+    #[test]
+    fn no_witness_unanalyzable_point_suppresses_advisory() {
+        // Task TG (§0 taint-gate): an unanalyzable point with NO witness in
+        // play cannot possibly disclose a witness, so its fail-closed advisory
+        // is pure noise and must be suppressed. Here the deferred/unresolved
+        // call `mysteryNative(1)` takes a PUBLIC constant — args carry no taint,
+        // control is empty — so no advisory fires. The interpretation is
+        // otherwise unchanged (args still walked, result still clean).
+        let (clean_leaks, clean_advisory) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Field;\n\
+             export circuit f(): [] { c = mysteryNative(1); }\n",
+        );
+        assert!(
+            clean_leaks.is_empty(),
+            "a witness-free unanalyzable point records no leak: {clean_leaks:?}"
+        );
+        assert!(
+            !clean_advisory,
+            "a witness-free unanalyzable point must emit NO advisory (noise)"
+        );
+
+        // The SAME form with a witness argument DOES surface the advisory —
+        // the gate suppresses only the demonstrably-clean case.
+        let (tainted_leaks, tainted_advisory) = walk_leaks(
+            "import CompactStandardLibrary;\n\
+             export ledger c: Field;\n\
+             witness getW(): Field;\n\
+             export circuit f(): [] { c = mysteryNative(getW()); }\n",
+        );
+        assert!(
+            tainted_leaks.is_empty(),
+            "an unresolved callee must not conduit-taint a witness into a leak"
+        );
+        assert!(
+            tainted_advisory,
+            "the same deferred call WITH a witness argument still advises (§0)"
         );
     }
 

@@ -215,6 +215,15 @@ pub fn witnesses_of(abs: &Abs) -> Vec<Witness> {
     }
 }
 
+/// Whether any witness value is present in an abstract value. Used to gate the
+/// §0 fail-closed advisories: at an unanalyzable point with demonstrably nothing
+/// private in play, the advisory is pure noise (it can never front a real leak),
+/// so it is suppressed. This does NOT change the interpretation — children are
+/// still walked, taint unions still built, leaks still recorded.
+pub fn taint_present(abs: &Abs) -> bool {
+    !witnesses_of(abs).is_empty()
+}
+
 /// Union of two witness lists, deduped by `uid` and kept sorted by `uid`
 /// (R0 F2 `merge-witnesses`: "dedup by uid, union"). On a duplicate uid the
 /// two entries are merged into one by unioning their `path`s (mirrors the

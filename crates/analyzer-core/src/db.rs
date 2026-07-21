@@ -719,7 +719,7 @@ fn field_of(
 /// depends only on `file_srcs`, not on every file's `FileDeps`). The current
 /// file and stdlib are checked first so a resolution that never leaves the
 /// current file takes no `Workspace` dependency at all.
-fn source_text_for(
+pub(crate) fn source_text_for(
     db: &dyn Db,
     target: crate::FileId,
     this_file: crate::FileId,

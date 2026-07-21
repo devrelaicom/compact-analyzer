@@ -98,6 +98,22 @@ pub fn disclosure_diagnostics_query(
 /// remapping only becomes necessary if a future change makes the interpreter
 /// walk stdlib circuit bodies -- add that remapping here if it ever does.
 fn leak_to_diagnostic(leak: DisclosureLeak) -> Diagnostic {
+    // XF1 cross-file leak: `leak.src` is the CALL SITE in the analyzed file (the
+    // pragmatic single-file model). Render primary-only, naming the callee — NO
+    // secondary spans: the witness/path trail points into the OTHER file, which
+    // has no FileId in the current single-file span model, so its ranges would be
+    // out-of-range on the analyzed file. Same-file leaks (`cross_file: None`)
+    // render with the full trail below, exactly as before.
+    if let Some(callee) = &leak.cross_file {
+        return Diagnostic::error(
+            DiagnosticCode::new("E", 3100),
+            format!(
+                "potential witness-value disclosure via cross-file call to `{callee}`: {}",
+                leak.nature
+            ),
+            leak.src,
+        );
+    }
     let mut diag = Diagnostic::error(
         DiagnosticCode::new("E", 3100),
         format!("potential witness-value disclosure: {}", leak.nature),
@@ -178,6 +194,150 @@ mod tests {
             Arc::new(std::collections::BTreeMap::new()),
             Arc::new(std::collections::BTreeMap::new()),
         )
+    }
+
+    /// Builds a two-file workspace: `main` (FileId 0) importing `libB`
+    /// (FileId 1) via `import "./libB";`, mirroring XF0's differential fixture.
+    /// Returns the inputs to drive `disclosure_diagnostics_query` on `main`.
+    /// `main`'s import edge always carries the callee target (so `classify_callee`
+    /// resolves `stash` to `libB`'s FileId); `register_lib` controls whether
+    /// `libB` is present in the workspace `file_srcs`/`file_deps` maps — set it
+    /// `false` to exercise the §0 fail-closed case (callee absent from the
+    /// workspace).
+    fn two_file_ws(
+        db: &CompactDatabase,
+        main_text: &str,
+        lib_text: &str,
+        register_lib: bool,
+    ) -> (crate::FileId, SourceText, FileDeps, Workspace) {
+        use crate::db::ResolvedDep;
+        let main_file = crate::FileId::from_raw_for_test(0);
+        let lib_file = crate::FileId::from_raw_for_test(1);
+        let main_src = SourceText::new(db, Arc::from(main_text));
+        let lib_src = SourceText::new(db, Arc::from(lib_text));
+        // main's resolved import edge `./libB` -> the libB file. Kept even in the
+        // fail-closed case so the NAME resolves (classification succeeds) while
+        // the workspace map lookup that `resolve_circuit_def` performs is what
+        // fails.
+        let main_fd = FileDeps::new(
+            db,
+            Arc::from(vec![ResolvedDep {
+                raw: "./libB".to_string(),
+                is_include: false,
+                target: Some((lib_file, lib_src)),
+            }]),
+        );
+        let lib_fd = FileDeps::new(db, Arc::from(Vec::new()));
+        let mut deps_map = std::collections::BTreeMap::new();
+        let mut srcs_map = std::collections::BTreeMap::new();
+        deps_map.insert(main_file, main_fd);
+        srcs_map.insert(main_file, main_src);
+        if register_lib {
+            deps_map.insert(lib_file, lib_fd);
+            srcs_map.insert(lib_file, lib_src);
+        }
+        let ws = Workspace::new(db, None, Arc::new(deps_map), Arc::new(srcs_map));
+        (main_file, main_src, main_fd, ws)
+    }
+
+    const LIB_STASH: &str = "module libB {\n\
+                             export ledger store: Field;\n\
+                             export circuit stash(v: Field): [] { store = v; }\n\
+                             }\n";
+
+    fn e_leaks(diags: &[Diagnostic]) -> Vec<&Diagnostic> {
+        diags
+            .iter()
+            .filter(|d| d.code.prefix == "E" && d.code.number >= 3100)
+            .collect()
+    }
+
+    /// XF1 test 1 — a witness flowing through a CROSS-FILE circuit call to a
+    /// ledger sink in the other file is CAUGHT, and (pragmatic call-site model)
+    /// anchored at the CALL SITE in the analyzed file, not at the sink in libB.
+    /// Ground truth: XF0 — compactc 0.31.1 REJECTs this exact two-file program.
+    #[test]
+    fn cross_file_call_leak_caught_and_anchored_at_call_site() {
+        let db = CompactDatabase::default();
+        let main_text = "import \"./libB\";\n\
+                         witness getW(): Field;\n\
+                         export circuit f(): [] { stash(getW()); }\n";
+        let (file, src, fd, ws) = two_file_ws(&db, main_text, LIB_STASH, true);
+
+        let diags = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        let leaks = e_leaks(&diags);
+        assert_eq!(
+            leaks.len(),
+            1,
+            "a witness crossing a cross-file circuit call to a ledger sink must confirm one leak: {diags:?}"
+        );
+        let leak = leaks[0];
+
+        // Primary span is the CALL SITE in main (`stash(getW())`), NOT a range
+        // inside libB.
+        let span_text = &main_text
+            [usize::from(leak.primary_span.start())..usize::from(leak.primary_span.end())];
+        assert_eq!(
+            span_text.trim(),
+            "stash(getW())",
+            "cross-file leak must anchor at the call site in the analyzed file"
+        );
+        assert!(
+            leak.message.contains("cross-file call to `stash`"),
+            "message must name the cross-file callee: {:?}",
+            leak.message
+        );
+        // Primary-only: the witness/path trail would point into libB (no FileId
+        // in the single-file span model), so no secondary spans are rendered.
+        assert!(
+            leak.secondary_spans.is_empty(),
+            "cross-file leak renders primary-only: {:?}",
+            leak.secondary_spans
+        );
+    }
+
+    /// XF1 test 2 — `disclose()` at the cross-file call argument sanitizes the
+    /// flow: no leak. Ground truth: XF0 Q4 — compactc 0.31.1 ACCEPTs it.
+    #[test]
+    fn cross_file_call_disclose_at_arg_sanitizes() {
+        let db = CompactDatabase::default();
+        let main_text = "import \"./libB\";\n\
+                         witness getW(): Field;\n\
+                         export circuit f(): [] { stash(disclose(getW())); }\n";
+        let (file, src, fd, ws) = two_file_ws(&db, main_text, LIB_STASH, true);
+
+        let diags = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        assert!(
+            e_leaks(&diags).is_empty(),
+            "disclose() at the cross-file call argument must sanitize the flow: {diags:?}"
+        );
+    }
+
+    /// XF1 test 3 — §0 fail-closed: the callee resolves to a FileId absent from
+    /// the workspace `file_srcs`, so `resolve_circuit_def` can't fetch its
+    /// source. The analyzer must fail closed to an amber advisory and NEVER
+    /// manufacture a false-positive E-leak nor silently report green.
+    #[test]
+    fn cross_file_callee_absent_from_workspace_fails_closed_amber() {
+        let db = CompactDatabase::default();
+        let main_text = "import \"./libB\";\n\
+                         witness getW(): Field;\n\
+                         export circuit f(): [] { stash(getW()); }\n";
+        let (file, src, fd, ws) = two_file_ws(&db, main_text, LIB_STASH, false);
+
+        let diags = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        assert!(
+            e_leaks(&diags).is_empty(),
+            "an unreachable callee must never manufacture a false-positive red: {diags:?}"
+        );
+        let advisories: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code.prefix == "U" && d.code.number == 3100)
+            .collect();
+        assert!(
+            !advisories.is_empty(),
+            "an unreachable cross-file callee must record an amber advisory (never silent green): {diags:?}"
+        );
     }
 
     /// End-to-end (A8): a module-nested `export circuit` is a fail-closed

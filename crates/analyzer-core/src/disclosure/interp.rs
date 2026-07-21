@@ -81,6 +81,16 @@ pub struct WalkState {
     /// around each `interp_circuit_call` so a callee's returns don't leak into
     /// the caller's accumulator.
     pub ret_ws: Vec<Witness>,
+    /// The cross-file call-site anchor (XF1). `Some((call_range, callee_name))`
+    /// while the walk is INSIDE a cross-file callee body: it is set on the FIRST
+    /// file crossing (always from within the analyzed file, so `call_range` is
+    /// guaranteed in-range there) and left set through any deeper same-file or
+    /// cross-file nesting, so every sink reached inside the callee anchors its
+    /// leak at the original call site (the pragmatic single-file model, per
+    /// task-XF1). `None` at top level and throughout a purely same-file walk, so
+    /// the same-file interprocedural path is byte-for-byte unchanged. Save/restore
+    /// in `interp_circuit_call` scopes it to the cross-file sub-walk.
+    pub cross_file_anchor: Option<(TextRange, String)>,
 }
 
 /// One analysis root (spec §3, R0 S2/S3): an exported circuit or the file's
@@ -878,7 +888,16 @@ fn interp_call(
                 .unwrap_or_default();
 
             if is_method_call(call) {
-                interp_ledger_op(ctx, sink, call, control, &name, &args, src)
+                interp_ledger_op(
+                    ctx,
+                    sink,
+                    call,
+                    control,
+                    &name,
+                    &args,
+                    src,
+                    state.cross_file_anchor.clone(),
+                )
             } else {
                 // A plain call classified Native is a stdlib/builtin primitive
                 // (natives don't resolve to a user symbol) — the N2 conduit
@@ -936,10 +955,12 @@ fn interp_circuit_call(
         );
         return Abs::Atomic(Vec::new());
     }
-    // Locate the callee's params + body (same-file for B2; cross-module is B4).
-    let Some(callee) = resolve_circuit_def(ctx, callee_file, callee_symbol) else {
-        // Same §0 guard as the recursion branch: realize any sink nested in an
-        // argument before failing closed (this cross-file path activates in B4).
+    // Locate the callee's params + body, plus the callee file's own source
+    // (same-file ⇒ `ctx.src`; cross-file ⇒ the workspace map, XF1).
+    let Some((callee, callee_src)) = resolve_circuit_def(ctx, callee_file, callee_symbol) else {
+        // §0 fail-closed: the callee file is not reachable in the workspace map
+        // (or its def/body can't be read). Realize any sink nested in an argument
+        // before failing closed to amber — never a silent green, never a false red.
         interp_args_for_effect(ctx, sink, state, env, control, call);
         sink.emit_advisory(
             src,
@@ -947,6 +968,28 @@ fn interp_circuit_call(
                 .to_string(),
         );
         return Abs::Atomic(Vec::new());
+    };
+    // The callee's own cross-file edges (XF1): its nested resolution (`store` as a
+    // ledger field, deeper calls) must run against the callee file's `FileDeps`,
+    // NOT the caller's. Same-file ⇒ `ctx.fd` (the callee's fd IS the caller's, and
+    // the workspace map may not even list `ctx.file` — the single-file test path);
+    // cross-file ⇒ the workspace `file_deps` map, `None` ⇒ fail closed to amber.
+    let callee_fd = if callee_file == ctx.file {
+        ctx.fd
+    } else {
+        match ctx.ws.file_deps(ctx.db).get(&callee_file).copied() {
+            Some(fd) => fd,
+            None => {
+                interp_args_for_effect(ctx, sink, state, env, control, call);
+                sink.emit_advisory(
+                    src,
+                    "cross-file circuit call not analyzed (the callee file's dependencies are \
+                     unavailable in the workspace)"
+                        .to_string(),
+                );
+                return Abs::Atomic(Vec::new());
+            }
+        }
     };
     // Interpret the arguments in the CALLER's env/control (keeping taint). Their
     // own nested sinks/advisories fire here regardless of the callee body.
@@ -997,14 +1040,27 @@ fn interp_circuit_call(
         };
         callee_env.insert(p.clone(), add_path_point(a.clone(), &pp));
     }
-    // Non-root callee: `disclosing_fn = None` (K7 disarmed, B0 Q3). `callee_file`
-    // is `ctx.file` for B2 (guaranteed by `resolve_circuit_def`'s same-file gate);
-    // threading it explicitly keeps B4's cross-module lift a one-line change.
+    // Non-root callee: `disclosing_fn = None` (K7 disarmed, B0 Q3). The callee's
+    // OWN `src`/`fd` (not the caller's — the pre-XF1 `..*ctx` bug kept the
+    // caller's): same-file ⇒ these equal `ctx.src`/`ctx.fd`, so the same-file
+    // path is unchanged; cross-file ⇒ they are the callee file's, so its ledger
+    // fields + nested calls resolve correctly.
     let callee_ctx = InterpCtx {
         file: callee_file,
+        src: callee_src,
+        fd: callee_fd,
         disclosing_fn: None,
         ..*ctx
     };
+    // XF1 cross-file anchor: on the FIRST file crossing, pin the call-site range
+    // + callee name so every sink reached inside the callee anchors its leak here
+    // (the pragmatic single-file model). Deeper nesting keeps the OUTERMOST anchor
+    // (`is_none()` guard); save/restore scopes it to this sub-walk only. Same-file
+    // calls never set it, so the same-file path stays anchor-free (unchanged).
+    let set_anchor = callee_file != ctx.file && state.cross_file_anchor.is_none();
+    if set_anchor {
+        state.cross_file_anchor = Some((src, callee.name.clone()));
+    }
     state.active.insert(key);
     state.depth += 1;
     let ret = interp_body_returning(
@@ -1017,6 +1073,9 @@ fn interp_circuit_call(
     );
     state.depth -= 1;
     state.active.remove(&key);
+    if set_anchor {
+        state.cross_file_anchor = None;
+    }
     // Cache the callee's return `Abs` under the 3-axis key so a later call with
     // identical `(uid, abs*, control)` HITs (above) instead of re-walking — the
     // performance bound (ADR Option A), leak-set-invariant by ADR case (c).
@@ -1037,23 +1096,28 @@ struct CircuitDef {
     body: compactp_ast::Block,
 }
 
-/// Resolves a callee circuit's params + body from its `(file, symbol)`. `None`
-/// (caller fails closed) when the callee is cross-file (B2 is same-file only;
-/// B4 adds cross-module by reading the target file's `SourceText`/item tree),
-/// its symbol index doesn't resolve, or the declaration has no body.
+/// Resolves a callee circuit's params + body from its `(file, symbol)`, plus the
+/// callee file's own `SourceText` (so the caller can build a context whose
+/// `src`/`fd` belong to the callee, not the caller). Same-file resolution is
+/// unchanged: `source_text_for` returns `ctx.src` when `callee_file == ctx.file`.
+/// A CROSS-FILE callee (XF1) is fetched via `source_text_for`, which recovers the
+/// target's `SourceText` from `Workspace.file_srcs`; its `CircuitDef` is located
+/// against the callee file's own item tree + green tree.
+///
+/// `None` (caller fails closed to amber, §0) when the callee file is not in the
+/// workspace map (`source_text_for` None — a genuinely unreachable file), its
+/// symbol index doesn't resolve, or the declaration has no body.
 fn resolve_circuit_def(
     ctx: &InterpCtx,
     callee_file: crate::FileId,
     callee_symbol: u32,
-) -> Option<CircuitDef> {
-    // B2: same-file only. A cross-file circuit needs the target file's source
-    // text + item tree threaded in — deferred to B4.
-    if callee_file != ctx.file {
-        return None;
-    }
-    let tree = item_tree(ctx.db, ctx.src);
+) -> Option<(CircuitDef, SourceText)> {
+    // Recover the callee file's source. Same-file ⇒ `ctx.src` (unchanged path);
+    // cross-file ⇒ the workspace map lookup, `None` when the file is unreachable.
+    let callee_src = crate::db::source_text_for(ctx.db, callee_file, ctx.file, ctx.src, ctx.ws)?;
+    let tree = item_tree(ctx.db, callee_src);
     let sym = tree.symbols.get(callee_symbol as usize)?;
-    let ast_root = SyntaxNode::new_root(crate::db::parsed(ctx.db, ctx.src).green);
+    let ast_root = SyntaxNode::new_root(crate::db::parsed(ctx.db, callee_src).green);
     let cd = ast_root
         .descendants()
         .filter_map(compactp_ast::CircuitDef::cast)
@@ -1063,11 +1127,14 @@ fn resolve_circuit_def(
         .filter_map(|p| param_name_and_type(p).map(|(name, _, _)| name))
         .collect();
     let body = cd.body()?;
-    Some(CircuitDef {
-        name: sym.name.clone(),
-        params,
-        body,
-    })
+    Some((
+        CircuitDef {
+            name: sym.name.clone(),
+            params,
+            body,
+        },
+        callee_src,
+    ))
 }
 
 /// Walks a callee circuit body (B2) and returns the `Abs` that flows back to the
@@ -1132,6 +1199,7 @@ fn interp_body_returning(
 /// control-flow leak; returns the op's `default-value` (clean). A method call
 /// that is NOT a recognizable ledger op fails closed to an amber advisory +
 /// clean result (defensive — Compact has no user-defined methods).
+#[allow(clippy::too_many_arguments)]
 fn interp_ledger_op(
     ctx: &InterpCtx,
     sink: &mut DisclosureSink,
@@ -1140,6 +1208,10 @@ fn interp_ledger_op(
     name: &str,
     args: &[Abs],
     src: TextRange,
+    // XF1: `Some((call_anchor, callee))` when this ledger op runs inside a
+    // cross-file callee — its leaks anchor at the call site (primary-only).
+    // `None` for a same-file op (unchanged: leaks anchor at their own ranges).
+    cross_file_anchor: Option<(TextRange, String)>,
 ) -> Abs {
     let recv_is_ledger = method_receiver(call)
         .map(|r| is_ledger_field(ctx, &r))
@@ -1159,8 +1231,17 @@ fn interp_ledger_op(
     // K2 (A5): performing a ledger op under witness control leaks the gating
     // witnesses (no-op when `control` is empty ⇒ a top-level op records none).
     // The CONTROL leak stays at the whole-call `src` (it is not wrappable — the
-    // gating witness lives in a branch condition elsewhere, not in this call).
-    sink.record_leak(src, "performing this ledger operation", control.to_vec());
+    // gating witness lives in a branch condition elsewhere, not in this call);
+    // inside a cross-file callee (XF1) it anchors at the call site instead.
+    match &cross_file_anchor {
+        Some((anchor, callee)) => sink.record_cross_file_leak(
+            *anchor,
+            "performing this ledger operation",
+            control.to_vec(),
+            callee.clone(),
+        ),
+        None => sink.record_leak(src, "performing this ledger operation", control.to_vec()),
+    }
 
     // Fix-wave #1: the per-arg DATA leaks record at EACH flagged arg's own
     // trimmed expression range — NOT the whole-call `src` — so C3's
@@ -1174,24 +1255,35 @@ fn interp_ledger_op(
         .map(|e| trimmed_range(e.syntax()))
         .collect();
 
+    let anchor = cross_file_anchor.as_ref();
     match known {
         // L2 container op: every argument leaks with exposure "" (L1 default).
         Some(tables::LedgerOp::AllArgsLeak) => {
-            leak_all_ledger_args(sink, name, args, &arg_srcs, src);
+            leak_all_ledger_args(sink, name, args, &arg_srcs, src, anchor);
         }
         // L3 Kernel op: per-arg `discloses?` flags (Some ⇒ leak; None ⇒ hidden).
         Some(tables::LedgerOp::PerArg(flags)) => {
             for (i, (flag, arg_abs)) in flags.iter().zip(args).enumerate() {
                 if let Some(exposure) = flag {
                     let data_src = arg_srcs.get(i).copied().unwrap_or(src);
-                    leak_ledger_arg(sink, name, i, flags.len(), exposure, arg_abs, data_src, src);
+                    leak_ledger_arg(
+                        sink,
+                        name,
+                        i,
+                        flags.len(),
+                        exposure,
+                        arg_abs,
+                        data_src,
+                        src,
+                        anchor,
+                    );
                 }
             }
         }
         // Unknown ledger op on a ledger field: fail-closed leak of every
         // witness arg (matches the L1 default: no clause ⇒ leaks) + advisory.
         None => {
-            leak_all_ledger_args(sink, name, args, &arg_srcs, src);
+            leak_all_ledger_args(sink, name, args, &arg_srcs, src, anchor);
             sink.emit_advisory(
                 src,
                 format!("unknown ledger op `{name}`; leaking all witness args (fail-closed, may be stale)"),
@@ -1212,10 +1304,11 @@ fn leak_all_ledger_args(
     args: &[Abs],
     arg_srcs: &[TextRange],
     src: TextRange,
+    anchor: Option<&(TextRange, String)>,
 ) {
     for (i, arg_abs) in args.iter().enumerate() {
         let data_src = arg_srcs.get(i).copied().unwrap_or(src);
-        leak_ledger_arg(sink, op, i, args.len(), "", arg_abs, data_src, src);
+        leak_ledger_arg(sink, op, i, args.len(), "", arg_abs, data_src, src, anchor);
     }
 }
 
@@ -1238,6 +1331,7 @@ fn leak_ledger_arg(
     arg_abs: &Abs,
     data_src: TextRange,
     src: TextRange,
+    anchor: Option<&(TextRange, String)>,
 ) {
     let pp = PathPoint {
         src,
@@ -1245,7 +1339,14 @@ fn leak_ledger_arg(
         exposure: exposure.to_string(),
     };
     let witnesses = witnesses_of(&add_path_point(arg_abs.clone(), &pp));
-    sink.record_leak(data_src, "ledger operation", witnesses);
+    // XF1: inside a cross-file callee, anchor at the call site (primary-only);
+    // otherwise at the arg's own range (fix-wave #1, minimal-scope quick-fix).
+    match anchor {
+        Some((a, callee)) => {
+            sink.record_cross_file_leak(*a, "ledger operation", witnesses, callee.clone())
+        }
+        None => sink.record_leak(data_src, "ledger operation", witnesses),
+    }
 }
 
 /// N2 native conduit result: a native records NO leak — it folds each flagged
@@ -1845,7 +1946,21 @@ pub fn interp_stmt(
                     // span here would let a quick-fix built on it silently
                     // sanitize a second, unrelated leak in the same statement.
                     let value_range = trimmed_range(value.syntax());
-                    sink.record_leak(value_range, "ledger operation", witnesses_of(&value_abs));
+                    // XF1: inside a cross-file callee, anchor at the call site in
+                    // the analyzed file (primary-only render); otherwise the RHS.
+                    match &state.cross_file_anchor {
+                        Some((anchor, callee)) => sink.record_cross_file_leak(
+                            *anchor,
+                            "ledger operation",
+                            witnesses_of(&value_abs),
+                            callee.clone(),
+                        ),
+                        None => sink.record_leak(
+                            value_range,
+                            "ledger operation",
+                            witnesses_of(&value_abs),
+                        ),
+                    }
                     // A5 (K2): conditioning a ledger op on a witness discloses
                     // that witness as a SEPARATE control-flow leak — a distinct
                     // nature ⇒ a distinct table entry (never merged into the data
@@ -1856,11 +1971,19 @@ pub fn interp_stmt(
                     // the branch condition elsewhere), so it is never offered
                     // the `disclose()` quick-fix.
                     let stmt_range = a.syntax().text_range();
-                    sink.record_leak(
-                        stmt_range,
-                        "performing this ledger operation",
-                        control.to_vec(),
-                    );
+                    match &state.cross_file_anchor {
+                        Some((anchor, callee)) => sink.record_cross_file_leak(
+                            *anchor,
+                            "performing this ledger operation",
+                            control.to_vec(),
+                            callee.clone(),
+                        ),
+                        None => sink.record_leak(
+                            stmt_range,
+                            "performing this ledger operation",
+                            control.to_vec(),
+                        ),
+                    }
                 }
             }
             // Defensive (unexpected shape): realize taint, record no sink.

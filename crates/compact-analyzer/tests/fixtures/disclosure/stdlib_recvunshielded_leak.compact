@@ -1,0 +1,6 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+witness secret(): Bytes<32>;
+export circuit run(amt: Uint<128>): [] {
+  receiveUnshielded(secret(), amt);
+}

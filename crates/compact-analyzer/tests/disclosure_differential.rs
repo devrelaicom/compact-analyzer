@@ -224,6 +224,37 @@ const FIXTURES: &[Fixture] = &[
         discloses: false,
         native_confirms: false,
     },
+    // --- M6 stdlib-circuit disclosure (conduits + sinks + sanitizer) ---
+    Fixture {
+        name: "stdlib_some_leak.compact",
+        rule: "M6 stdlib CONDUIT (`some`) → downstream ledger sink",
+        discloses: true,
+        native_confirms: true,
+    },
+    Fixture {
+        name: "stdlib_some_disclosed.compact",
+        rule: "M6 stdlib CONDUIT (`some`) + D1 disclose sanitizer",
+        discloses: false,
+        native_confirms: false,
+    },
+    Fixture {
+        name: "stdlib_tokentype_ok.compact",
+        rule: "M6 stdlib SANITIZER (`tokenType` persistentCommit hides both args) — §0 FP guard",
+        discloses: false,
+        native_confirms: false,
+    },
+    Fixture {
+        name: "stdlib_recvunshielded_leak.compact",
+        rule: "M6 stdlib SINK (`receiveUnshielded`) leaks each param at the call",
+        discloses: true,
+        native_confirms: true,
+    },
+    Fixture {
+        name: "stdlib_recvunshielded_ok.compact",
+        rule: "M6 stdlib SINK (`receiveUnshielded`) + D1 disclose sanitizer",
+        discloses: false,
+        native_confirms: false,
+    },
 ];
 
 fn fixtures_dir() -> PathBuf {

@@ -985,10 +985,25 @@ fn interp_call(
                     src,
                     state.cross_file_anchor.clone(),
                 )
+            } else if let Some(flags) = tables::stdlib_sink(&name) {
+                // M6 stdlib CIRCUIT that is a SINK (its body calls a leaking
+                // `kernel.<op>`): leaks each param at THIS call site. A name is
+                // only ever in ONE table, so dispatch the sink first.
+                stdlib_sink_result(
+                    sink,
+                    &name,
+                    flags,
+                    call,
+                    &args,
+                    control,
+                    src,
+                    state.cross_file_anchor.clone(),
+                )
             } else {
                 // A plain call classified Native is a stdlib/builtin primitive
                 // (natives don't resolve to a user symbol) — the N2 conduit
-                // table, or the fail-closed unknown-native default.
+                // table (incl. M6 stdlib conduits/sanitizer), or the fail-closed
+                // unknown-native default.
                 match tables::native_conduit(&name) {
                     Some(flags) => native_conduit_result(&name, flags, &args, src),
                     None => unknown_native_result(sink, &name, &args, src),
@@ -1470,6 +1485,59 @@ fn native_conduit_result(name: &str, flags: tables::ArgFlags, args: &[Abs], src:
         }
     }
     Abs::Atomic(folded)
+}
+
+/// A stdlib CIRCUIT that is a SINK (its body calls a leaking `kernel.<op>`):
+/// leaks each flagged param at the CALL SITE (all params leak — `flags` has no
+/// `None`), plus the K2 control leak when called under witness control. Returns a
+/// CLEAN result: the disclosure already fired on the args, and the op's result
+/// (a coin/commitment/balance) is not witness-tainted in compactc's model, so a
+/// clean result never double-leaks (§0: verdict parity — the file already rejects
+/// via the arg leak). `flags` and the per-param exposures are compiler-confirmed
+/// (`tables::stdlib_sink`, task-M6a). Cross-file anchor threaded like ledger ops.
+#[allow(clippy::too_many_arguments)]
+fn stdlib_sink_result(
+    sink: &mut DisclosureSink,
+    name: &str,
+    flags: tables::ArgFlags,
+    call: &CallExpr,
+    args: &[Abs],
+    control: &[Witness],
+    src: TextRange,
+    cross_file_anchor: Option<(TextRange, String)>,
+) -> Abs {
+    let anchor = cross_file_anchor.as_ref();
+    // K2 control leak (no-op when control is empty), like interp_ledger_op.
+    match anchor {
+        Some((a, callee)) => sink.record_cross_file_leak(
+            *a,
+            "performing this ledger operation",
+            control.to_vec(),
+            callee.clone(),
+        ),
+        None => sink.record_leak(src, "performing this ledger operation", control.to_vec()),
+    }
+    let arg_srcs: Vec<TextRange> = arg_exprs(call)
+        .iter()
+        .map(|e| trimmed_range(e.syntax()))
+        .collect();
+    for (i, (flag, arg_abs)) in flags.iter().zip(args).enumerate() {
+        if let Some(exposure) = flag {
+            let data_src = arg_srcs.get(i).copied().unwrap_or(src);
+            leak_ledger_arg(
+                sink,
+                name,
+                i,
+                flags.len(),
+                exposure,
+                arg_abs,
+                data_src,
+                src,
+                anchor,
+            );
+        }
+    }
+    Abs::Atomic(Vec::new())
 }
 
 /// Fail-closed unknown-native default (R0 N1, spec §0): a plain call that is
@@ -2429,8 +2497,14 @@ fn classify_callee(ctx: &InterpCtx, call: &CallExpr) -> CalleeClass {
 /// conduit-taint default survives only for a name that resolves to a non-
 /// circuit/witness symbol (the `_ => Native` arm above) — the genuine
 /// version-drift case.
+///
+/// M6: stdlib CIRCUITS (`some`/`sendShielded`/…) also never resolve to a
+/// same-file symbol, so a name in EITHER the N2 conduit table or the M6
+/// `stdlib_sink` table joins the natives on this name-keyed `Native` path — the
+/// `interp_call` Native arm then dispatches conduit vs sink. Any other unresolved
+/// name stays a deferred CIRCUIT (amber).
 fn unresolved_callee_class(name: &str) -> CalleeClass {
-    if tables::native_conduit(name).is_some() {
+    if tables::native_conduit(name).is_some() || tables::stdlib_sink(name).is_some() {
         CalleeClass::Native
     } else {
         CalleeClass::DeferredCircuit

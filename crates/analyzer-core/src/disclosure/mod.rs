@@ -667,4 +667,105 @@ mod tests {
             leak.secondary_spans
         );
     }
+
+    /// M6 CONDUIT: a witness flowing through the stdlib constructor `some`
+    /// carries its taint into the `Maybe<Field>` result, which then leaks at the
+    /// downstream ledger write. Ground truth (task-M6a): compactc 0.31.1 REJECTs
+    /// `m = some<Field>(getW())` and ACCEPTs the `disclose()`d variant.
+    #[test]
+    fn stdlib_conduit_some_leaks_at_downstream_ledger_sink() {
+        let db = CompactDatabase::default();
+        let text = "import CompactStandardLibrary;\n\
+                     export ledger m: Maybe<Field>;\n\
+                     witness getW(): Field;\n\
+                     export circuit f(): [] { m = some<Field>(getW()); }\n";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = empty_ws(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+
+        let diags = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        assert_eq!(
+            e_leaks(&diags).len(),
+            1,
+            "a witness flowing through `some` into a ledger write must confirm one leak: {diags:?}"
+        );
+
+        // Disclosed variant ACCEPTs: `disclose()` sanitizes the flow.
+        let text_ok = "import CompactStandardLibrary;\n\
+                        export ledger m: Maybe<Field>;\n\
+                        witness getW(): Field;\n\
+                        export circuit f(): [] { m = disclose(some<Field>(getW())); }\n";
+        let src_ok = SourceText::new(&db, Arc::from(text_ok));
+        let fd_ok = FileDeps::new(&db, Arc::from(Vec::new()));
+        let diags_ok = disclosure_diagnostics_query(&db, file, src_ok, fd_ok, ws);
+        assert!(
+            e_leaks(&diags_ok).is_empty(),
+            "disclose() around `some` must sanitize the conduit flow: {diags_ok:?}"
+        );
+    }
+
+    /// M6 SANITIZER (§0 false-positive guard): `tokenType`'s body is a single
+    /// `persistentCommit`, which hides both args AND the result. compactc 0.31.1
+    /// ACCEPTs witness data through it written straight to a ledger cell — so the
+    /// analyzer must emit NO E-leak AND no U-advisory naming `tokenType`. A leak
+    /// here would be a false positive on a compactc-accepted file.
+    #[test]
+    fn stdlib_sanitizer_tokentype_is_not_a_sink() {
+        let db = CompactDatabase::default();
+        let text = "import CompactStandardLibrary;\n\
+                     export ledger c: Bytes<32>;\n\
+                     witness getW(): Bytes<32>;\n\
+                     export circuit f(ca: ContractAddress): [] { c = tokenType(getW(), ca); }\n";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = empty_ws(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+
+        let diags = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        assert!(
+            e_leaks(&diags).is_empty(),
+            "tokenType is a sanitizer — no confirmed leak may fire (false positive): {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("tokenType")),
+            "tokenType must not raise an advisory naming it (compactc ACCEPTs): {diags:?}"
+        );
+    }
+
+    /// M6 SINK: the stdlib circuit `receiveUnshielded` leaks each param at the
+    /// call site. Ground truth (task-M6a): compactc 0.31.1 REJECTs
+    /// `receiveUnshielded(getW(), getA())` and ACCEPTs the fully-`disclose()`d
+    /// variant.
+    #[test]
+    fn stdlib_sink_receive_unshielded_leaks_at_call() {
+        let db = CompactDatabase::default();
+        let text = "import CompactStandardLibrary;\n\
+                     witness getW(): Bytes<32>;\n\
+                     witness getA(): Uint<128>;\n\
+                     export circuit f(): [] { receiveUnshielded(getW(), getA()); }\n";
+        let src = SourceText::new(&db, Arc::from(text));
+        let fd = FileDeps::new(&db, Arc::from(Vec::new()));
+        let ws = empty_ws(&db);
+        let file = crate::FileId::from_raw_for_test(0);
+
+        let diags = disclosure_diagnostics_query(&db, file, src, fd, ws);
+        assert!(
+            !e_leaks(&diags).is_empty(),
+            "a witness passed to the `receiveUnshielded` sink must confirm a leak: {diags:?}"
+        );
+
+        // Disclosed variant ACCEPTs: both args `disclose()`d.
+        let text_ok = "import CompactStandardLibrary;\n\
+                        witness getW(): Bytes<32>;\n\
+                        witness getA(): Uint<128>;\n\
+                        export circuit f(): [] { receiveUnshielded(disclose(getW()), disclose(getA())); }\n";
+        let src_ok = SourceText::new(&db, Arc::from(text_ok));
+        let fd_ok = FileDeps::new(&db, Arc::from(Vec::new()));
+        let diags_ok = disclosure_diagnostics_query(&db, file, src_ok, fd_ok, ws);
+        assert!(
+            e_leaks(&diags_ok).is_empty(),
+            "disclose() on both sink args must clear the leak: {diags_ok:?}"
+        );
+    }
 }

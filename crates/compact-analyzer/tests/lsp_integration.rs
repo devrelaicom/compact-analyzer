@@ -311,7 +311,11 @@ fn publishes_disclosure_advisory_diagnostic_on_open() {
     // `module_nested_circuit_renders_amber_advisory_not_a_leak`): a
     // module-nested `export circuit` is excluded from the root set, so the
     // analyzer can't decide it and records an amber U3100 advisory rather
-    // than silently reporting no leak.
+    // than silently reporting no leak. Post reachability-gating (HEAD
+    // `reachability-gate the module-nested root advisory`), the advisory only
+    // fires when the module-nested circuit is REACHABLE from an analyzed root,
+    // so a re-exported `caller` calls `leak` (passing a `disclose()`d arg, so
+    // no confirmed E-leak is manufactured — the advisory renders alone).
     did_open(
         &mut client,
         &uri,
@@ -319,8 +323,11 @@ fn publishes_disclosure_advisory_diagnostic_on_open() {
         "import CompactStandardLibrary;\n\
          module M {\n\
          export ledger c: Field;\n\
-         export circuit leak(x: Field): Field { c = x; return x; }\n\
-         }\n",
+         export circuit leak(x: Field): [] { c = x; }\n\
+         export circuit caller(x: Field): [] { leak(disclose(x)); }\n\
+         }\n\
+         import { caller as cc } from M;\n\
+         export { cc };\n",
     );
     let params = client.wait_for_notification("textDocument/publishDiagnostics");
     let diags = params["diagnostics"].as_array().unwrap();
